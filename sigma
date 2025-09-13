@@ -1,0 +1,730 @@
+-- JUJUTSU AI - STABLE WASD VERSION (Pathfinding 1s, WASD movement, stuck detection, many actions)
+-- Локальный скрипт. Перед запуском сделай бэкап.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local LocalPlayer = Players.LocalPlayer
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+-- =========================
+-- ====  CONFIG  ==========
+-- =========================
+local CONFIG = {
+    pathUpdateInterval = 1.0,      -- пересчет пути каждую секунду
+    pathAgent = {
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentJumpHeight = 12,
+        AgentMaxSlope = 45
+    },
+    stuckCheckInterval = 1.0,
+    stuckWindow = 3,               -- сколько сохранений позиции смотреть
+    stuckDistanceThreshold = 1.0,  -- если суммарно за окно меньше — считаем застрялым
+    teleportFallback = true,       -- если путь не строится — телепорт (вкл/выкл)
+    teleportAfterFails = 2,        -- сколько подряд неудач => телепорт
+    waypointReachRadius = 1.2,     -- считать waypoint достигнутым
+    wasdHoldReleaseDelay = 0.16,   -- отпустить WASD после выполнения действия
+    stepInterval = 0.28            -- основной шаг ИИ
+}
+
+-- =========================
+-- ====  INPUT HELPERS  ===
+-- =========================
+local Input = {}
+
+local function sendKeyRaw(down, key)
+    -- sends raw key event via VIM
+    VirtualInputManager:SendKeyEvent(down, key, false, game)
+end
+
+local function sendMouseRaw(button, down)
+    VirtualInputManager:SendMouseButtonEvent(0, 0, button, down, game, 1)
+end
+
+function Input.pressKeyOnce(keyCode, hold)
+    hold = hold or 0.08
+    sendKeyRaw(true, keyCode)
+    task.wait(hold)
+    sendKeyRaw(false, keyCode)
+end
+
+function Input.holdKey(keyCode, hold)
+    hold = hold or 0.18
+    sendKeyRaw(true, keyCode)
+    task.wait(hold)
+    sendKeyRaw(false, keyCode)
+end
+
+function Input.startHold(keyCode)
+    sendKeyRaw(true, keyCode)
+end
+
+function Input.stopHold(keyCode)
+    sendKeyRaw(false, keyCode)
+end
+
+function Input.sendMouseClick(button, hold_time)
+    hold_time = hold_time or 0.06
+    button = button or 0
+    sendMouseRaw(button, true)
+    task.wait(hold_time)
+    sendMouseRaw(button, false)
+end
+
+function Input.jump()
+    Input.pressKeyOnce(Enum.KeyCode.Space, 0.09)
+end
+
+function Input.rightClickTap()
+    sendMouseRaw(1, true)
+    task.wait(0.05)
+    sendMouseRaw(1, false)
+end
+
+-- release movement keys helper
+local function releaseMovementKeys()
+    sendKeyRaw(false, Enum.KeyCode.W)
+    sendKeyRaw(false, Enum.KeyCode.S)
+    sendKeyRaw(false, Enum.KeyCode.A)
+    sendKeyRaw(false, Enum.KeyCode.D)
+end
+
+local function pressDirectional(w, s, a, d)
+    -- set states for movement keys (down/up)
+    sendKeyRaw(w and true or false, Enum.KeyCode.W)
+    sendKeyRaw(s and true or false, Enum.KeyCode.S)
+    sendKeyRaw(a and true or false, Enum.KeyCode.A)
+    sendKeyRaw(d and true or false, Enum.KeyCode.D)
+end
+
+-- =========================
+-- ====  PATHFINDING  =====
+-- =========================
+local function computeNextWaypoint(hrp, targetHrpp)
+    if not hrp or not targetHrpp then return nil, "no-target" end
+    local path = PathfindingService:CreatePath(CONFIG.pathAgent)
+    -- FIXED: use ComputeAsync then check enum statuses robustly
+    path:ComputeAsync(hrp.Position, targetHrpp.Position)
+    local status = path.Status
+    if status == Enum.PathStatus.Success or status == Enum.PathStatus.Complete then
+        local wps = path:GetWaypoints()
+        if #wps >= 2 then
+            return wps[2].Position, wps[2].Action
+        elseif #wps == 1 then
+            return wps[1].Position, wps[1].Action
+        else
+            return nil, "empty"
+        end
+    else
+        return nil, "no-path"
+    end
+end
+
+-- move toward point using WASD orientation
+local function moveToPointWASD(hrp, point)
+    if not hrp or not point then return end
+    local diff = point - hrp.Position
+    if diff.Magnitude <= CONFIG.waypointReachRadius then
+        releaseMovementKeys()
+        return
+    end
+    local dir = diff.Unit
+    local forward = hrp.CFrame.LookVector
+    local right = hrp.CFrame.RightVector
+    local f = forward:Dot(dir)
+    local r = right:Dot(dir)
+    local w = f > 0.28
+    local s = f < -0.28
+    local d = r > 0.28
+    local a = r < -0.28
+    pressDirectional(w, s, a, d)
+end
+
+-- teleport near target (randomized offsets)
+local function teleportNear(targetHrpp)
+    if not targetHrpp then return end
+    local offsets = {
+        Vector3.new(0,0,-3), Vector3.new(3,0,0), Vector3.new(-3,0,0),
+        Vector3.new(0,0,3), Vector3.new(2,0,-2), Vector3.new(-2,0,2),
+        Vector3.new(4,0,-4), Vector3.new(-4,0,4)
+    }
+    local off = offsets[math.random(1,#offsets)]
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        -- FIXED: set Y carefully (use target Y)
+        local targetCFrame = targetHrpp.CFrame * CFrame.new(off.X, 0, off.Z)
+        local newPos = Vector3.new(targetCFrame.Position.X, targetHrpp.Position.Y + 1.5, targetCFrame.Position.Z)
+        char.HumanoidRootPart.CFrame = CFrame.new(newPos)
+        warn("AI: Teleported near target")
+    end
+end
+
+-- =========================
+-- ====  ACTIONS LIST  =====
+-- =========================
+local ACTIONS = {
+    "ATTACK","HEAVY_ATTACK","QUICK_ATTACK","BLOCK_TAP","BLOCK_HOLD",
+    "DASH","DASH_ATTACK","ATTACK_MOVE","MOVE_FORWARD","MOVE_LEFT","MOVE_RIGHT","MOVE_BACK",
+    "SPECIAL","SPECIAL_CHAIN","EVADE_LEFT","EVADE_RIGHT","JUMP_ATTACK","JUMP_DASH_ATTACK",
+    "CHARGE_ATTACK","FEINT","SPIN","STRAFE_ATTACK_LEFT","STRAFE_ATTACK_RIGHT",
+    "CHARGE_SPECIAL","TAP_RIGHT_CLICK","BACKSTEP","CIRCLE_STRAFE","RAPID_FIRE","TAUNT",
+    "PRECISE_STAB","FLANK_LEFT","FLANK_RIGHT","AMBUSH","BACKSTAB","HEAL_IF_LOW",
+    "SUMMON_SHIELD","APPEAR_PRESSURE","FAKE_RETREAT","BULL_RUSH","SNARE","STUN_CHAIN",
+    "LOW_SWING","HIGH_SWING","MID_SWING","QUICK_COMBO","POWER_COMBO","RANGED_SHOT"
+}
+local NUM_ACTIONS = #ACTIONS
+
+-- map name->index for safe lookups (FIXED)
+local ACTION_INDEX = {}
+for i,name in ipairs(ACTIONS) do ACTION_INDEX[name] = i end
+
+-- =========================
+-- ====  SIMPLE NETWORK  ===
+-- =========================
+local NeuralNetwork = {}
+NeuralNetwork.input_size = 14
+NeuralNetwork.hidden_size = 64
+NeuralNetwork.output_size = NUM_ACTIONS
+NeuralNetwork.learning_rate = 0.03
+NeuralNetwork.weights1 = {}
+NeuralNetwork.weights2 = {}
+NeuralNetwork.bias1 = {}
+NeuralNetwork.bias2 = {}
+NeuralNetwork.total_samples = 0
+NeuralNetwork.total_reward = 0
+NeuralNetwork.episodes = 0
+
+local function relu(x) return x > 0 and x or 0 end
+local function drelu(x) return x > 0 and 1 or 0 end
+local function softmax(vec, temperature)
+    temperature = temperature or 1
+    local maxv = -1e9
+    for i=1,#vec do if vec[i] > maxv then maxv = vec[i] end end
+    local exps = {}
+    local s = 0
+    for i=1,#vec do
+        local v = math.exp((vec[i] - maxv) / math.max(1e-6, temperature))
+        exps[i] = v; s = s + v
+    end
+    for i=1,#vec do exps[i] = exps[i] / (s + 1e-9) end
+    return exps
+end
+
+function NeuralNetwork:init()
+    math.randomseed(tick() % 100000 + os.time())
+    for i=1,self.input_size do
+        self.weights1[i] = {}
+        for j=1,self.hidden_size do
+            self.weights1[i][j] = (math.random() - 0.5) * 1.2
+        end
+    end
+    for i=1,self.hidden_size do
+        self.weights2[i] = {}
+        self.bias1[i] = (math.random() - 0.5) * 0.2
+        for j=1,self.output_size do
+            self.weights2[i][j] = (math.random() - 0.5) * 1.2
+        end
+    end
+    for j=1,self.output_size do self.bias2[j] = (math.random() - 0.5) * 0.2 end
+end
+
+function NeuralNetwork:forward(inputs)
+    local hidden = {}
+    for j=1,self.hidden_size do
+        local s = self.bias1[j]
+        for i=1,self.input_size do s = s + (inputs[i] or 0) * self.weights1[i][j] end
+        hidden[j] = relu(s)
+    end
+    local outs = {}
+    for j=1,self.output_size do
+        local s = self.bias2[j]
+        for i=1,self.hidden_size do s = s + hidden[i] * self.weights2[i][j] end
+        outs[j] = s
+    end
+    return outs, hidden
+end
+
+-- simple REINFORCE-ish update (approx)
+function NeuralNetwork:learn(inputs, chosen_index, advantage)
+    local logits, hidden = self:forward(inputs)
+    local grads = {}
+    for i=1,#logits do grads[i] = 0 end
+    grads[chosen_index] = advantage
+    for j=1,self.output_size do
+        local g = grads[j]
+        self.bias2[j] = self.bias2[j] + self.learning_rate * g
+        for i=1,self.hidden_size do
+            self.weights2[i][j] = self.weights2[i][j] + self.learning_rate * g * hidden[i]
+        end
+    end
+    for i=1,self.hidden_size do
+        local total = 0
+        for j=1,self.output_size do total = total + grads[j] * self.weights2[i][j] end
+        local hgrad = total * drelu(hidden[i])
+        self.bias1[i] = self.bias1[i] + self.learning_rate * hgrad
+        for k=1,self.input_size do
+            self.weights1[k][i] = self.weights1[k][i] + self.learning_rate * hgrad * (inputs[k] or 0)
+        end
+    end
+    self.total_samples = self.total_samples + 1
+end
+
+NeuralNetwork:init()
+
+-- =========================
+-- ====  AI state  =========
+-- =========================
+local AI = {
+    network = NeuralNetwork,
+    epsilon = 0.20,
+    epsilon_decay = 0.995,
+    epsilon_min = 0.02,
+    temperature = 0.9,
+    temp_decay = 0.9995,
+    last_state = nil,
+    last_action = nil,
+    last_health = 100,
+    last_position = nil,
+    last_enemy_health = nil,
+    episode_reward = 0,
+    successful_actions = 0,
+    total_actions = 0,
+    actions = ACTIONS
+}
+
+-- =========================
+-- ====  SENSORS / STATE ===
+-- =========================
+local function getClosestEnemyCharacter()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil, math.huge end
+    local hrp = char.HumanoidRootPart
+    local closest, dist = nil, math.huge
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and p.Character:FindFirstChild("Humanoid") then
+            local h = p.Character.Humanoid
+            if h.Health > 0 then
+                local d = (p.Character.HumanoidRootPart.Position - hrp.Position).Magnitude
+                if d < dist then dist = d; closest = p.Character end
+            end
+        end
+    end
+    return closest, dist
+end
+
+local function getState()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("Humanoid") or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local humanoid = char.Humanoid
+    local hrp = char.HumanoidRootPart
+    local enemy, dist = getClosestEnemyCharacter()
+    local enemyHP, enemyVel, enemyAngle = 0, 0, 0
+    if enemy and enemy:FindFirstChild("Humanoid") and enemy:FindFirstChild("HumanoidRootPart") then
+        enemyHP = enemy.Humanoid.Health
+        enemyVel = math.min(enemy.HumanoidRootPart.Velocity.Magnitude / 50, 1)
+        local lookVec = hrp.CFrame.LookVector
+        local toEnemy = (enemy.HumanoidRootPart.Position - hrp.Position)
+        if toEnemy.Magnitude > 0 then
+            toEnemy = toEnemy.Unit
+            local dot = math.clamp(lookVec:Dot(toEnemy), -1, 1)
+            enemyAngle = (dot + 1) / 2
+        end
+    end
+
+    local state = {
+        math.max(0, math.min(1, humanoid.Health / 100)),     -- 1
+        math.max(0, math.min(1, dist / 120)),                -- 2
+        math.max(0, math.min(1, enemyHP / 100)),             -- 3
+        math.max(0, math.min(1, hrp.Velocity.Magnitude / 50)),-- 4
+        enemyVel,                                             -- 5
+        (math.sin(tick()) + 1) / 2,                           -- 6
+        (enemy and 1 or 0),                                   -- 7
+        enemyAngle,                                           -- 8
+        math.max(0, math.min(1, math.abs(AI.episode_reward or 0) / 100)), --9
+        math.max(0, math.min(1, (AI.last_enemy_health or 0) / 100)), --10
+        0,0,0,0 -- reserves
+    }
+    return state, enemy, dist
+end
+
+-- =========================
+-- ====  ACTION EXECUTOR  ==
+-- =========================
+local function genericComboFallback(enemy)
+    -- safe fallback if action unknown
+    if math.random() < 0.7 then Input.sendMouseClick(0, 0.05) end
+    if math.random() < 0.4 then Input.pressKeyOnce(Enum.KeyCode.Q, 0.06) end
+end
+
+local function executeActionByName(name, enemy)
+    if not name then return false end
+    local executed = false
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+    -- aim a bit to enemy if exists
+    if enemy and enemy:FindFirstChild("HumanoidRootPart") and hrp then
+        hrp.CFrame = CFrame.new(hrp.Position, enemy.HumanoidRootPart.Position)
+    end
+
+    -- implement many macros – safe and deterministic
+    if name == "ATTACK" or name == "QUICK_ATTACK" then
+        Input.sendMouseClick(0, 0.05); executed = true
+
+    elseif name == "HEAVY_ATTACK" then
+        Input.sendMouseClick(0,0.06); task.wait(0.06); Input.sendMouseClick(0,0.06); executed = true
+
+    elseif name == "BLOCK_TAP" then
+        Input.pressKeyOnce(Enum.KeyCode.F, 0.12); executed = true
+
+    elseif name == "BLOCK_HOLD" then
+        Input.startHold(Enum.KeyCode.F); task.spawn(function() task.wait(0.35); Input.stopHold(Enum.KeyCode.F) end); executed = true
+
+    elseif name == "DASH" then
+        Input.pressKeyOnce(Enum.KeyCode.Q, 0.08); executed = true
+
+    elseif name == "DASH_ATTACK" then
+        Input.pressKeyOnce(Enum.KeyCode.Q,0.07); task.wait(0.03); Input.sendMouseClick(0,0.05); executed = true
+
+    elseif name == "ATTACK_MOVE" then
+        Input.startHold(Enum.KeyCode.W); task.wait(0.12); Input.sendMouseClick(0,0.05); Input.stopHold(Enum.KeyCode.W); executed = true
+
+    elseif name == "JUMP_ATTACK" then
+        Input.jump(); task.wait(0.06); Input.sendMouseClick(0,0.05); executed = true
+
+    elseif name == "JUMP_DASH_ATTACK" then
+        Input.jump(); task.wait(0.04); Input.pressKeyOnce(Enum.KeyCode.Q,0.06); task.wait(0.02); Input.sendMouseClick(0,0.05); executed = true
+
+    elseif name == "SPECIAL" or name == "SPECIAL_CHAIN" then
+        Input.pressKeyOnce(Enum.KeyCode.R, 0.06); if name == "SPECIAL_CHAIN" then task.wait(0.06); Input.pressKeyOnce(Enum.KeyCode.R,0.06) end; executed = true
+
+    elseif name == "EVADE_LEFT" then
+        Input.pressKeyOnce(Enum.KeyCode.Q,0.07); task.wait(0.02); Input.pressKeyOnce(Enum.KeyCode.A,0.12); executed = true
+
+    elseif name == "EVADE_RIGHT" then
+        Input.pressKeyOnce(Enum.KeyCode.Q,0.07); task.wait(0.02); Input.pressKeyOnce(Enum.KeyCode.D,0.12); executed = true
+
+    elseif name == "RAPID_FIRE" then
+        for i=1,5 do Input.sendMouseClick(0,0.04); task.wait(0.04) end; executed = true
+
+    elseif name == "SPIN" then
+        for i=1,4 do Input.sendMouseClick(0,0.05); task.wait(0.06) end; executed = true
+
+    elseif name == "FEINT" then
+        Input.pressKeyOnce(Enum.KeyCode.F,0.08); task.wait(0.06); Input.sendMouseClick(0,0.05); executed = true
+
+    elseif name == "BACKSTEP" then
+        Input.startHold(Enum.KeyCode.S); Input.pressKeyOnce(Enum.KeyCode.Q,0.06); task.wait(0.08); Input.stopHold(Enum.KeyCode.S); executed = true
+
+    elseif name == "TAP_RIGHT_CLICK" then
+        Input.rightClickTap(); executed = true
+
+    elseif name == "TAUNT" then
+        Input.pressKeyOnce(Enum.KeyCode.D,0.06); task.wait(0.04); Input.pressKeyOnce(Enum.KeyCode.A,0.06); executed = true
+
+    else
+        genericComboFallback(enemy); executed = true
+    end
+
+    -- safety: ensure movement keys won't hang
+    task.spawn(function() task.wait(CONFIG.wasdHoldReleaseDelay); releaseMovementKeys() end)
+    return executed
+end
+
+-- =========================
+-- ====  POLICY SELECT  ====
+-- =========================
+function AI:selectAction(state, enemy, distance)
+    self.total_actions = self.total_actions + 1
+
+    -- PRIORITY: if enemy far — approach
+    if enemy and distance and distance > 16 then
+        -- prefer ATTACK_MOVE if available
+        local idx = ACTION_INDEX["ATTACK_MOVE"]
+        if idx then
+            if math.random() < 0.78 then return idx end
+        end
+        local fwd = ACTION_INDEX["MOVE_FORWARD"]
+        if fwd then return fwd end
+    end
+
+    -- exploration
+    if math.random() < self.epsilon then
+        return math.random(1, #self.actions)
+    end
+
+    local logits,_ = self.network:forward(state)
+    local probs = softmax(logits, self.temperature)
+    local r = math.random()
+    local acc = 0
+    for i=1,#probs do
+        acc = acc + probs[i]
+        if r <= acc then return i end
+    end
+    return #probs
+end
+
+-- =========================
+-- ====  REWARD FUNC  =====
+-- =========================
+function AI:calculateReward(oldHealth, newHealth, oldPos, newPos, enemy, distance, oldEnemyHP, currentEnemyHP)
+    local reward = 0
+    local selfDiff = newHealth - oldHealth
+    reward = reward + (selfDiff * 6)
+    if enemy then
+        local dmg = (oldEnemyHP or 0) - (currentEnemyHP or 0)
+        if dmg > 0 then reward = reward + dmg * 7 end
+        if currentEnemyHP <= 0 and (oldEnemyHP or 0) > 0 then reward = reward + 20 end
+        if distance >= 6 and distance <= 16 then reward = reward + 2.2
+        elseif distance < 3 then reward = reward - 1.8
+        elseif distance > 32 then reward = reward - 1.2 end
+    else
+        reward = reward - 0.2
+    end
+    if oldPos and newPos then
+        local moved = (newPos - oldPos).Magnitude
+        if moved > 0.9 then reward = reward + 0.6 else reward = reward - 0.25 end
+    end
+    if newHealth <= 0 then reward = reward - 28 end
+    return reward
+end
+
+-- =========================
+-- ====  PATH LOOP  =======
+-- =========================
+local enabled = false
+local lastPathUpdate = 0
+local pathFailCount = 0
+local nextWaypointPos = nil
+local nextWaypointAction = nil
+
+-- stuck detection storage
+local lastPositions = {}
+local stuckCounter = 0
+
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        if not enabled then
+            releaseMovementKeys()
+            task.wait(0.3)
+            goto cont
+        end
+
+        local state, enemy, dist = getState()
+        if not state then goto cont end
+        local char = LocalPlayer.Character
+        if not char or not char:FindFirstChild("HumanoidRootPart") then goto cont end
+        local hrp = char.HumanoidRootPart
+
+        -- STUCK check at interval
+        if tick() - (AI._lastStuckCheck or 0) >= CONFIG.stuckCheckInterval then
+            AI._lastStuckCheck = tick()
+            table.insert(lastPositions, hrp.Position)
+            if #lastPositions > CONFIG.stuckWindow then table.remove(lastPositions, 1) end
+            if #lastPositions == CONFIG.stuckWindow then
+                local moved = 0
+                for i=2,#lastPositions do moved = moved + (lastPositions[i] - lastPositions[i-1]).Magnitude end
+                if moved < CONFIG.stuckDistanceThreshold then
+                    stuckCounter = stuckCounter + 1
+                    warn("AI: possible stuck detected, moved=", moved, "counter=", stuckCounter)
+                    if stuckCounter >= 3 then
+                        stuckCounter = 0
+                        pathFailCount = pathFailCount + 1
+                        if CONFIG.teleportFallback and enemy and enemy:FindFirstChild("HumanoidRootPart") then
+                            teleportNear(enemy.HumanoidRootPart)
+                            pathFailCount = 0
+                        end
+                    end
+                else
+                    stuckCounter = 0
+                end
+            end
+        end
+
+        -- replan every pathUpdateInterval
+        if tick() - lastPathUpdate >= CONFIG.pathUpdateInterval then
+            lastPathUpdate = tick()
+            if enemy and enemy:FindFirstChild("HumanoidRootPart") then
+                local pos, action = computeNextWaypoint(hrp, enemy.HumanoidRootPart)
+                if pos then
+                    nextWaypointPos = pos
+                    nextWaypointAction = action
+                    pathFailCount = 0
+                else
+                    pathFailCount = pathFailCount + 1
+                    nextWaypointPos = nil
+                    nextWaypointAction = nil
+                    warn("AI: computeNextWaypoint failed -> count=", pathFailCount)
+                    if CONFIG.teleportFallback and pathFailCount >= CONFIG.teleportAfterFails then
+                        teleportNear(enemy.HumanoidRootPart)
+                        pathFailCount = 0
+                    end
+                end
+            else
+                nextWaypointPos = nil
+                nextWaypointAction = nil
+            end
+        end
+
+        -- follow waypoint if present (WASD)
+        if nextWaypointPos and char and char:FindFirstChild("HumanoidRootPart") then
+            moveToPointWASD(char.HumanoidRootPart, nextWaypointPos)
+            if nextWaypointAction == Enum.PathWaypointAction.Jump then Input.jump() end
+        else
+            releaseMovementKeys()
+        end
+
+        ::cont::
+    end
+end)
+
+-- =========================
+-- ====  MAIN LOOP  =======
+-- =========================
+AI._lastStep = 0
+RunService.Heartbeat:Connect(function()
+    if not enabled then return end
+    if tick() - AI._lastStep < CONFIG.stepInterval then return end
+    AI._lastStep = tick()
+
+    local state, enemy, dist = getState()
+    if not state then return end
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("Humanoid") or not char:FindFirstChild("HumanoidRootPart") then return end
+    local humanoid = char.Humanoid
+    local hrp = char.HumanoidRootPart
+    local currentHealth = humanoid.Health
+    local currentPos = hrp.Position
+    local currentEnemyHP = 0
+    if enemy and enemy:FindFirstChild("Humanoid") then currentEnemyHP = enemy.Humanoid.Health end
+
+    -- initialize if first step
+    if not AI.last_state then
+        AI.last_state = state
+        AI.last_action = AI:selectAction(state, enemy, dist)
+        AI.last_health = currentHealth
+        AI.last_position = currentPos
+        AI.last_enemy_health = currentEnemyHP
+        executeActionByName(AI.actions[AI.last_action], enemy)
+        return
+    end
+
+    -- reward and learn for previous transition
+    local reward = AI:calculateReward(AI.last_health, currentHealth, AI.last_position, currentPos, enemy, dist, AI.last_enemy_health, currentEnemyHP)
+    AI.episode_reward = AI.episode_reward + reward
+    if reward > 0 then AI.successful_actions = AI.successful_actions + 1 end
+
+    AI.network:learn(AI.last_state, AI.last_action, reward)
+
+    -- death / reset
+    if currentHealth <= 0 then
+        AI.network.episodes = AI.network.episodes + 1
+        AI.episode_reward = 0
+        AI.last_state = nil; AI.last_action = nil; AI.last_enemy_health = nil
+        return
+    end
+
+    -- finishing low hp enemy with priority
+    if enemy and currentEnemyHP > 0 and currentEnemyHP <= 22 then
+        local prefer = ACTION_INDEX["SPECIAL"] or ACTION_INDEX["RAPID_FIRE"] or ACTION_INDEX["SPECIAL_CHAIN"]
+        if prefer then
+            executeActionByName(AI.actions[prefer], enemy)
+            AI.network:learn(state, prefer, 6)
+            AI.last_action = prefer
+            -- update last state and continue (skip normal selection)
+            AI.last_state = state
+            AI.last_health = currentHealth
+            AI.last_position = currentPos
+            AI.last_enemy_health = currentEnemyHP
+            return
+        end
+    end
+
+    -- normal selection
+    local nextAction = AI:selectAction(state, enemy, dist)
+    executeActionByName(AI.actions[nextAction], enemy)
+
+    -- update memory
+    AI.last_state = state
+    AI.last_action = nextAction
+    AI.last_health = currentHealth
+    AI.last_position = currentPos
+    AI.last_enemy_health = currentEnemyHP
+    AI.total_actions = AI.total_actions + 1
+
+    -- decay exploration
+    if AI.epsilon > AI.epsilon_min then AI.epsilon = AI.epsilon * AI.epsilon_decay end
+    AI.temperature = math.max(0.05, AI.temperature * AI.temp_decay)
+end)
+
+-- =========================
+-- ====  GUI / HOTKEYS ====
+-- =========================
+local function createGUI()
+    local old = LocalPlayer.PlayerGui:FindFirstChild("AIControlGUI")
+    if old then old:Destroy() end
+    local screen = Instance.new("ScreenGui", LocalPlayer.PlayerGui); screen.Name = "AIControlGUI"; screen.ResetOnSpawn = false
+    local frame = Instance.new("Frame", screen); frame.Size = UDim2.new(0,380,0,320); frame.Position = UDim2.new(1,-390,0,12); frame.BackgroundColor3 = Color3.fromRGB(18,18,24)
+    local title = Instance.new("TextLabel", frame); title.Size = UDim2.new(1,0,0,34); title.BackgroundColor3 = Color3.fromRGB(30,100,220); title.Text = "🤖 JUJUTSU AI - STABLE WASD"; title.Font = Enum.Font.SourceSansBold; title.TextScaled = true
+    local stats = Instance.new("TextLabel", frame); stats.Size = UDim2.new(1,-20,0,200); stats.Position = UDim2.new(0,10,0,44); stats.BackgroundTransparency = 1; stats.Font = Enum.Font.SourceSans; stats.TextColor3 = Color3.fromRGB(230,230,230)
+    local toggle = Instance.new("TextButton", frame); toggle.Size = UDim2.new(1,-20,0,36); toggle.Position = UDim2.new(0,10,1,-56); toggle.Text = "▶ START AI"; toggle.Font = Enum.Font.SourceSansBold; toggle.TextScaled = true; toggle.BackgroundColor3 = Color3.fromRGB(60,190,80)
+    toggle.MouseButton1Click:Connect(function() enabled = not enabled; if enabled then toggle.Text = "⏸ STOP AI"; toggle.BackgroundColor3 = Color3.fromRGB(210,60,60) else toggle.Text = "▶ START AI"; toggle.BackgroundColor3 = Color3.fromRGB(60,190,80) end end)
+    spawn(function()
+        while screen.Parent do
+            task.wait(0.25)
+            local wp = nextWaypointPos and "yes" or "no"
+            stats.Text = string.format([[
+Status: %s
+Episodes: %d  Samples: %d
+Epsilon: %.3f  Temp: %.3f
+Actions total: %d  Successes: %d
+NextWaypoint: %s  PathFails: %d
+StuckCounter: %d
+Actions count: %d
+]],
+                enabled and "ACTIVE" or "OFF",
+                NeuralNetwork.episodes,
+                NeuralNetwork.total_samples or 0,
+                AI.epsilon,
+                AI.temperature,
+                AI.total_actions or 0,
+                AI.successful_actions or 0,
+                wp,
+                pathFailCount or 0,
+                stuckCounter or 0,
+                #AI.actions
+            )
+        end
+    end)
+end
+createGUI()
+
+-- hotkeys
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F1 then
+        enabled = not enabled
+        print("AI", enabled and "ON" or "OFF")
+    elseif input.KeyCode == Enum.KeyCode.F2 then
+        print("Episodes", NeuralNetwork.episodes, "Samples", NeuralNetwork.total_samples)
+        print("Epsilon", AI.epsilon, "Temp", AI.temperature)
+    elseif input.KeyCode == Enum.KeyCode.F3 then
+        NeuralNetwork:init()
+        NeuralNetwork.total_samples = 0
+        NeuralNetwork.total_reward = 0
+        NeuralNetwork.episodes = 0
+        AI.epsilon = 0.20
+        AI.temperature = 0.9
+        AI.episode_reward = 0
+        print("AI reset")
+    end
+end)
+
+print("🤖 JUJUTSU AI - STABLE WASD loaded.")
+print("Pathfinding updates every", CONFIG.pathUpdateInterval, "s. Teleport fallback:", CONFIG.teleportFallback)
