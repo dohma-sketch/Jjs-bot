@@ -1,19 +1,20 @@
--- jjs_agent_v4_final.lua
--- v4 final: hybrid learning agent for Jujutsu Shenanigans
--- Hardened: safe IO, protected calls, improved movement (no PathfindingService),
--- improved raycast-based steering, anti-stuck, replay, bandit, Q/SARSA, diagnostics.
+-- jjs_agent_v4_hardened_safe.lua
+-- Hardened final: defensive guards, nil-safe calls, fixed collectgarbage usage,
+-- safer VIM usage, stable Move/BodyVelocity fallback, robust raycasts, safe IO.
 
--- ===== Services & locals =====
+-- Services
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local Debris = game:GetService("Debris")
+local Workspace = workspace
 
+-- VIM safe
 local okVIM, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
 if not okVIM then VIM = nil end
 
+-- Locals
 local LocalPlayer = Players.LocalPlayer
-
 local function getCharacter()
     if not LocalPlayer then return nil end
     return LocalPlayer.Character or (LocalPlayer.CharacterAdded and LocalPlayer.CharacterAdded:Wait())
@@ -21,17 +22,18 @@ end
 
 local char = getCharacter()
 local humanoid, hrp
-local camera = workspace.CurrentCamera
+local camera = Workspace.CurrentCamera
 
+-- safe bind
 local function bindCharacterParts()
     char = getCharacter()
-    if not char then return end
+    if not char then return false end
     humanoid = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChild("Humanoid")
     hrp = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or hrp
-    camera = workspace.CurrentCamera or camera
+    camera = Workspace.CurrentCamera or camera
+    return (humanoid ~= nil and hrp ~= nil)
 end
 pcall(bindCharacterParts)
-
 if LocalPlayer and LocalPlayer.CharacterAdded then
     LocalPlayer.CharacterAdded:Connect(function()
         task.wait(0.08)
@@ -39,7 +41,7 @@ if LocalPlayer and LocalPlayer.CharacterAdded then
     end)
 end
 
--- ===== Config =====
+-- Config
 local CFG = {
     alpha = 0.55,
     gamma = 0.9,
@@ -70,32 +72,42 @@ local CFG = {
     debug = false,
 }
 
--- ===== Safe IO =====
+-- Safe file IO detection
 local function hasFileIO()
     return type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
 end
 
+local function safeJSONDecode(s)
+    if type(s) ~= "string" then return nil end
+    local ok, res = pcall(HttpService.JSONDecode, HttpService, s)
+    return ok and res or nil
+end
+local function safeJSONEncode(obj)
+    local ok, res = pcall(HttpService.JSONEncode, HttpService, obj)
+    return ok and res or nil
+end
+
 local function safeLoadJSON(name)
     if not hasFileIO() then return nil end
-    local tries, back = 3, 0.06
+    local tries, back = 3, 0.05
     for i = 1, tries do
         local ok, txt = pcall(readfile, name)
         if ok and type(txt) == "string" and #txt > 0 then
-            local ok2, obj = pcall(HttpService.JSONDecode, HttpService, txt)
-            if ok2 and type(obj) == "table" then return obj end
+            local obj = safeJSONDecode(txt)
+            if type(obj) == "table" then return obj end
         end
         task.wait(back); back = back * 1.8
     end
     return nil
 end
 
-local function safeSaveJSONAtomic(name, obj)
+local function safeSaveJSON(name, obj)
     if not hasFileIO() then return false end
-    local okEnc, enc = pcall(HttpService.JSONEncode, HttpService, obj)
-    if not okEnc or type(enc) ~= "string" then return false end
+    local enc = safeJSONEncode(obj)
+    if not enc then return false end
     local tmp = name .. ".tmp"
-    local tries, back = 3, 0.06
-    for i = 1, tries do
+    local tries, back = 3, 0.05
+    for i=1,tries do
         local okW = pcall(writefile, tmp, enc)
         if okW then
             local okMv = pcall(writefile, name, enc)
@@ -106,12 +118,12 @@ local function safeSaveJSONAtomic(name, obj)
     return false
 end
 
--- ===== Load persisted =====
+-- Load persisted
 local Q = safeLoadJSON(CFG.qFile) or {}
 local bandit = safeLoadJSON(CFG.banditFile) or {}
 local meta = safeLoadJSON(CFG.metaFile) or {version=4, created=os.time(), lastSave=os.time()}
 
--- ===== Replay Memory (simple prioritized) =====
+-- Replay memory (safe)
 local Replay = {}
 Replay.__index = Replay
 function Replay.new(capacity)
@@ -120,7 +132,7 @@ end
 function Replay:add(s,a,r,ns,done)
     if not s or not a then return end
     local priority = math.min(100, math.abs((r or 0)) + 0.0001)
-    self.mem[self.idx] = {s = s, a = a, r = r or 0, ns = ns or s, done = done or false, p = priority}
+    self.mem[self.idx] = {s = s, a = a, r = (r or 0), ns = (ns or s), done = (done or false), p = priority}
     self.idx = (self.idx % self.cap) + 1
     if self.sz < self.cap then self.sz = self.sz + 1 end
 end
@@ -131,57 +143,54 @@ function Replay:sample(n)
         local total = 0
         for i=1,self.sz do total = total + (self.mem[i].p or 0) end
         if total <= 0 then
-            local res = {}
-            for i=1,n do res[#res+1] = self.mem[math.random(1,self.sz)] end
-            return res
+            local out = {}
+            for i=1,n do out[#out+1] = self.mem[math.random(1,self.sz)] end
+            return out
         end
         local out = {}
         for k=1,n do
             local pick = math.random() * total
             local acc = 0
-            for i=1,self.sz do
-                acc = acc + (self.mem[i].p or 0)
+            for i=1,self.sz do acc = acc + (self.mem[i].p or 0)
                 if acc >= pick then out[#out+1] = self.mem[i]; break end
             end
         end
         return out
     else
-        local res={}
-        for i=1,n do res[#res+1] = self.mem[math.random(1,self.sz)] end
-        return res
+        local out = {}
+        for i=1,n do out[#out+1] = self.mem[math.random(1,self.sz)] end
+        return out
     end
 end
 local replay = Replay.new(CFG.replayCapacity)
 
--- ===== Utils =====
+-- Utilities
 local function now() return tick() end
 local function clamp(v, lo, hi) if v < lo then return lo end if v > hi then return hi end return v end
-local function safePcall(f, ...) if type(f)~="function" then return false end; local ok,res = pcall(f, ...); return ok and res or nil end
 local function safeMag(a,b)
     if not a or not b then return math.huge end
     local ok, v = pcall(function() return (a - b).Magnitude end)
     if ok and v then return v end
     return math.huge
 end
+local function isFunction(f) return type(f) == "function" end
 
--- ===== Sensors & map memory =====
-local mapMemory = {} -- posKey -> {kind="free"/"blocked", t=..., c=confidence}
-local function posKey(vec)
-    if not vec then return "nil" end
-    local x = math.floor(vec.X + 0.5)
-    local y = math.floor(vec.Y + 0.5)
-    local z = math.floor(vec.Z + 0.5)
-    return x.."|"..y.."|"..z
-end
-
-local function raycastFrom(origin, dir, length, filterList)
-    if not origin or not dir then return nil end
+-- Raycast wrapper
+local function safeRaycast(origin, direction, dist, blacklist)
+    if not origin or not direction then return nil end
     local rp = RaycastParams.new()
-    rp.FilterDescendantsInstances = filterList or {char}
+    rp.FilterDescendantsInstances = blacklist or (char and {char}) or {}
     rp.FilterType = Enum.RaycastFilterType.Blacklist
     rp.IgnoreWater = true
-    local ok, res = pcall(function() return workspace:Raycast(origin + Vector3.new(0,1.5,0), dir.Unit * (length or CFG.sensorDist), rp) end)
-    if ok then return res else return nil end
+    local ok, res = pcall(function() return Workspace:Raycast(origin, direction, rp) end)
+    return ok and res or nil
+end
+
+-- Map memory (coarse)
+local mapMemory = {}
+local function posKey(vec)
+    if not vec then return "nil" end
+    return tostring(math.floor(vec.X+0.5)).."|"..tostring(math.floor(vec.Y+0.5)).."|"..tostring(math.floor(vec.Z+0.5))
 end
 
 local function scanRing(origin, rays)
@@ -191,8 +200,8 @@ local function scanRing(origin, rays)
     for i=0, rays-1 do
         local ang = (i / math.max(1, rays)) * math.pi * 2
         local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
-        local res = raycastFrom(origin, dir, CFG.sensorDist)
-        out[#out+1] = {dir=dir, hit=(res~=nil), dist=(res and safeMag(res.Position, origin)) or CFG.sensorDist, inst=(res and res.Instance) or nil}
+        local res = safeRaycast(origin + Vector3.new(0,1.5,0), dir, CFG.sensorDist)
+        out[#out+1] = {dir=dir, hit=(res~=nil), pos=(res and res.Position) or nil, inst=(res and res.Instance) or nil}
     end
     return out
 end
@@ -203,11 +212,10 @@ local function updateMapOnce()
     local scan = scanRing(origin, CFG.sensorRays)
     for i=1,#scan do
         local s = scan[i]
-        local dist = s.dist or CFG.sensorDist
-        local samplePos = origin + s.dir * math.min(dist * 0.5, CFG.sensorDist)
+        local samplePos = origin + s.dir * math.min((s.pos and (s.pos - origin).Magnitude) or CFG.sensorDist, CFG.sensorDist)
         local key = posKey(samplePos)
-        if key and key ~= "nil" then
-            local nowt = tick()
+        if key ~= "nil" then
+            local nowt = now()
             local prev = mapMemory[key]
             if s.hit then
                 mapMemory[key] = {kind="blocked", t = nowt, c = (prev and math.min(1, (prev.c or 0) + 0.4)) or 0.6}
@@ -218,7 +226,6 @@ local function updateMapOnce()
     end
 end
 
--- periodic map updater
 task.spawn(function()
     while true do
         task.wait(CFG.mapUpdateInterval or 0.5)
@@ -226,7 +233,47 @@ task.spawn(function()
     end
 end)
 
--- ===== Movement helpers (raycast steering and BV fallback) =====
+-- Movement helpers (BV fallback)
+local function ensureBV()
+    if not hrp then return nil end
+    local existing = hrp:FindFirstChild(CFG.BVName)
+    if existing and existing:IsA("BodyVelocity") then return existing end
+    local ok, obj = pcall(function()
+        local b = Instance.new("BodyVelocity")
+        b.Name = CFG.BVName
+        b.MaxForce = Vector3.new(1e5,0,1e5)
+        b.P = 3000
+        b.Velocity = Vector3.new(0,0,0)
+        b.Parent = hrp
+        return b
+    end)
+    return ok and obj or nil
+end
+
+local function clearBV()
+    if not hrp then return end
+    local b = hrp:FindFirstChild(CFG.BVName)
+    if b and b.Parent then pcall(function() b:Destroy() end) end
+end
+
+local function setVelocity(vec)
+    if not hrp then return end
+    if type(vec) ~= "Vector3" then return end
+    local bv = ensureBV()
+    if not bv then
+        local dest = hrp.Position + Vector3.new(vec.X,0,vec.Z)
+        if humanoid and isFunction(humanoid.MoveTo) then
+            pcall(function() humanoid:MoveTo(dest) end)
+        end
+        return
+    end
+    local cur = bv.Velocity or Vector3.new(0,0,0)
+    local s = 0.6
+    local v = Vector3.new(cur.X * (1-s) + vec.X * s, 0, cur.Z * (1-s) + vec.Z * s)
+    pcall(function() bv.Velocity = v end)
+end
+
+-- Steering
 local function rotateYUnit(vec, deg)
     if not vec or vec.Magnitude < 1e-6 then return nil end
     local cf = CFrame.Angles(0, math.rad(deg), 0)
@@ -238,7 +285,7 @@ end
 local function isPathClearSimple(fromPos, dirUnit, length)
     if not fromPos or not dirUnit or dirUnit.Magnitude < 1e-6 then return false end
     length = length or math.min(CFG.sensorDist, 16)
-    local res = raycastFrom(fromPos, dirUnit, length)
+    local res = safeRaycast(fromPos + Vector3.new(0,1.5,0), dirUnit, length, {char})
     return res == nil
 end
 
@@ -255,103 +302,49 @@ local function steerTo(desiredUnit)
     return nil
 end
 
-local function ensureBV()
-    if not hrp then return nil end
-    local existing = hrp:FindFirstChild(CFG.BVName)
-    if existing and existing:IsA("BodyVelocity") then return existing end
-    local ok, obj = pcall(function()
-        local b = Instance.new("BodyVelocity")
-        b.Name = CFG.BVName
-        b.MaxForce = Vector3.new(1e5,0,1e5)
-        b.P = 3000
-        b.Parent = hrp
-        return b
-    end)
-    return ok and obj or nil
+-- Input helpers safe
+local function safeSendMouse(x,y,down,instance,delay)
+    if not VIM or not isFunction(VIM.SendMouseButtonEvent) then return false end
+    pcall(function() VIM:SendMouseButtonEvent(x,y,0,down,instance,0) end)
+    if delay and delay > 0 then task.wait(delay) end
+    return true
+end
+local function safeSendKey(key, down)
+    if not VIM or not isFunction(VIM.SendKeyEvent) then return false end
+    pcall(function() VIM:SendKeyEvent(down, key, false, game) end)
+    return true
 end
 
-local function setVelocity(vec)
-    if not hrp then return end
-    local bv = ensureBV()
-    if not bv then
-        -- fallback to MoveTo if BV not allowed
-        local dest = hrp.Position + Vector3.new(vec.X,0,vec.Z)
-        pcall(function() humanoid:MoveTo(dest) end)
-        return
-    end
-    local cur = bv.Velocity or Vector3.new(0,0,0)
-    local s = 0.6
-    local v = Vector3.new(cur.X * (1-s) + vec.X * s, 0, cur.Z * (1-s) + vec.Z * s)
-    bv.Velocity = v
-end
-
-local function clearBV()
-    if not hrp then return end
-    local b = hrp:FindFirstChild(CFG.BVName)
-    if b and b.Parent then pcall(function() b:Destroy() end) end
-end
-
--- Anti-stuck helpers
-local lastPositions = {}
-local function recordPosition()
-    if not hrp then return end
-    table.insert(lastPositions, 1, hrp.Position)
-    if #lastPositions > 20 then table.remove(lastPositions) end
-end
-local function isStuck()
-    if #lastPositions < 6 then return false end
-    local sum = 0
-    for i=1,5 do
-        local a = lastPositions[i]; local b = lastPositions[i+1]
-        if a and b then sum = sum + (a - b).Magnitude end
-    end
-    return sum < 0.6
-end
-
--- ===== Input helpers =====
 local function doClick()
-    if not VIM or not camera then return false end
+    if not camera then camera = Workspace.CurrentCamera end
+    if not camera then return false end
     local ok, size = pcall(function() return camera.ViewportSize end)
     if not ok or not size then return false end
     local x,y = size.X/2, size.Y/2
-    pcall(function()
-        if VIM and type(VIM.SendMouseButtonEvent) == "function" then
-            VIM:SendMouseButtonEvent(x,y,0,true,game,0)
-            task.wait(0.04)
-            VIM:SendMouseButtonEvent(x,y,0,false,game,0)
-        end
-    end)
+    safeSendMouse(x,y,true,game,0.04)
+    safeSendMouse(x,y,false,game,0)
     return true
 end
 local function doHeavyClick()
-    if not VIM or not camera then return false end
+    if not camera then camera = Workspace.CurrentCamera end
+    if not camera then return false end
     local ok, size = pcall(function() return camera.ViewportSize end)
     if not ok or not size then return false end
     local x,y = size.X/2, size.Y/2
-    pcall(function()
-        if VIM and type(VIM.SendMouseButtonEvent) == "function" then
-            VIM:SendMouseButtonEvent(x,y,0,true,game,0)
-            task.wait(0.12)
-            VIM:SendMouseButtonEvent(x,y,0,false,game,0)
-        end
-    end)
-    return true
-end
-local skillKeys = {Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four}
-local function pressSkill(idx)
-    local key = skillKeys[idx]
-    if not VIM or not key then return false end
-    pcall(function()
-        if VIM and type(VIM.SendKeyEvent) == "function" then
-            VIM:SendKeyEvent(true,key,false,game)
-            task.wait(0.06)
-            VIM:SendKeyEvent(false,key,false,game)
-        end
-    end)
+    safeSendMouse(x,y,true,game,0.12)
+    safeSendMouse(x,y,false,game,0)
     return true
 end
 
--- ===== Targeting & state =====
+local skillKeys = {Enum.KeyCode.One,Enum.KeyCode.Two,Enum.KeyCode.Three,Enum.KeyCode.Four}
+local function pressSkill(idx)
+    local key = skillKeys[idx]
+    if not key then return false end
+    safeSendKey(key, true); task.wait(0.06); safeSendKey(key, false)
+    return true
+end
+
+-- Targeting & state
 local function findNearestTarget()
     if not hrp then pcall(bindCharacterParts) end
     local nearest, nd = nil, math.huge
@@ -385,18 +378,15 @@ local function getState(target, lastActions)
     if not ok or not dist then dist = 9999 end
     local range = (dist < 6 and "close") or (dist < 15 and "mid") or "far"
 
-    local rayP = RaycastParams.new()
-    rayP.FilterDescendantsInstances = {char}
-    rayP.FilterType = Enum.RaycastFilterType.Blacklist
-    rayP.IgnoreWater = true
+    local rayP = RaycastParams.new(); rayP.FilterDescendantsInstances = {char}; rayP.FilterType = Enum.RaycastFilterType.Blacklist; rayP.IgnoreWater = true
     local vis = "novis"
     if target:FindFirstChild("Head") then
-        local ok2, r = pcall(function() return workspace:Raycast(hrp.Position, (target.Head.Position - hrp.Position), rayP) end)
+        local ok2, r = pcall(function() return Workspace:Raycast(hrp.Position, (target.Head.Position - hrp.Position), rayP) end)
         if ok2 and (r == nil or (r.Instance and r.Instance:IsDescendantOf(target))) then vis = "vis" end
     end
 
     local okhp, th = pcall(function()
-        local H = target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").Health
+        local H = (target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").Health) or 0
         local M = math.max((target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").MaxHealth) or 1,1)
         return (H and (H / M)) or 1
     end)
@@ -409,7 +399,7 @@ local function getState(target, lastActions)
     return state
 end
 
--- ===== Q-table & combo data =====
+-- Q-table and actions
 local actions = {
     "move_forward","move_backward","move_left","move_right",
     "jump","idle",
@@ -419,7 +409,6 @@ local actions = {
 local function initState(s)
     if not s then return end
     if not Q[s] then
-        -- prune if Q too large
         local count = 0 for _ in pairs(Q) do count = count + 1 end
         if count > CFG.maxStates then
             local toRemove = {}
@@ -437,7 +426,7 @@ end
 
 local function chooseAction(s)
     initState(s)
-    if math.random() < CFG.epsilon then
+    if math.random() < (CFG.epsilon or 0.5) then
         return math.random(1,#actions)
     else
         local bestVal, bestIdx = -math.huge, 1
@@ -446,7 +435,7 @@ local function chooseAction(s)
     end
 end
 
--- ===== Bandit (attacks) =====
+-- bandit (attacks)
 local baseAttacks = {"click","heavy","skill1","skill2","skill3","skill4"}
 local function ensureContext(ctx)
     if not ctx then return end
@@ -500,7 +489,7 @@ local function pruneBandit()
     end
 end
 
--- ===== Health monitor (safe) =====
+-- Health monitoring
 local lastMyHealth = (humanoid and humanoid.Health) or 100
 local function monitorSelfDamage()
     if not humanoid then return false end
@@ -535,7 +524,7 @@ local function monitorTargetDamage(target, startHP, window, callback)
     end)
 end
 
--- ===== Reward logic =====
+-- Reward logic
 local lastActionIdx = nil
 local lastSkillUsed = nil
 local idleLoops = 0
@@ -545,7 +534,7 @@ local function computeReward(actionIdx, target, oldDist, collidedWithWall, gotDa
     if target then
         local ok, newDist = pcall(function() return (hrp.Position - target.HumanoidRootPart.Position).Magnitude end)
         if ok and newDist then
-            if newDist < oldDist then r = r + 0.6 else r = r - 0.35 end
+            if newDist < (oldDist or math.huge) then r = r + 0.6 else r = r - 0.35 end
             if targetMovedAway then r = r - 0.9 end
         else r = r - 0.5 end
     else r = r - 0.6 end
@@ -563,7 +552,7 @@ local function computeReward(actionIdx, target, oldDist, collidedWithWall, gotDa
     return r
 end
 
--- ===== Q/SARSA update & replay training =====
+-- Q update / replay
 local function safeMax(tbl)
     if not tbl or type(tbl) ~= "table" then return 0 end
     local m = -math.huge
@@ -596,7 +585,7 @@ local function replayTrain()
     end
 end
 
--- ===== Prune & garbage =====
+-- Prune & garbage
 local function pruneQ()
     local count = 0 for _ in pairs(Q) do count = count + 1 end
     if count <= CFG.maxStates then return end
@@ -625,16 +614,16 @@ local function pruneBanditAndGarbage()
     pcall(function() collectgarbage("collect") end)
 end
 
--- ===== Diagnostics & _G API =====
+-- Diagnostics api
 local metrics = {loops=0,collisions=0,hits=0,damageTaken=0,avgReward=0,samples=0}
 _G.JJS_AGENT = _G.JJS_AGENT or {}
 _G.JJS_AGENT.reset = function()
     Q = {}; bandit = {}; replay = Replay.new(CFG.replayCapacity)
-    safeSaveJSONAtomic(CFG.qFile,Q); safeSaveJSONAtomic(CFG.banditFile,bandit)
+    safeSaveJSON(CFG.qFile,Q); safeSaveJSON(CFG.banditFile,bandit)
     print("[JJS_AGENT] reset done")
 end
 _G.JJS_AGENT.dump = function()
-    safeSaveJSONAtomic("jjs_q_dump.json",Q); safeSaveJSONAtomic("jjs_bandit_dump.json",bandit)
+    safeSaveJSON("jjs_q_dump.json",Q); safeSaveJSON("jjs_bandit_dump.json",bandit)
     print("[JJS_AGENT] dump saved")
 end
 _G.JJS_AGENT.prune = function()
@@ -653,7 +642,7 @@ local function logMetrics()
         metrics.loops, metrics.collisions, metrics.hits, metrics.damageTaken, avg, CFG.epsilon))
 end
 
--- ===== Main loop =====
+-- Main loop
 local lastSave = now()
 local loopTick = 0
 local recentActions = {}
@@ -663,7 +652,7 @@ task.spawn(function()
     while true do
         loopTick = loopTick + 1
         metrics.loops = metrics.loops + 1
-        recordPosition()
+        pcall(recordPosition)
 
         if not (char and char.Parent and humanoid and hrp) then
             pcall(bindCharacterParts)
@@ -679,15 +668,19 @@ task.spawn(function()
         local actionIdx = chooseAction(state)
         local actionName = actions[actionIdx] or "idle"
 
-        -- visibility ray
-        local rayP = RaycastParams.new(); rayP.FilterDescendantsInstances = {char}; rayP.FilterType = Enum.RaycastFilterType.Blacklist; rayP.IgnoreWater = true
+        -- visibility
         local visible = false
-        if target and target:FindFirstChild("Head") then
-            local ok,r = pcall(function() return workspace:Raycast(hrp.Position, (target.Head.Position - hrp.Position), rayP) end)
+        if target and target:FindFirstChild("Head") and hrp then
+            local ok,r = pcall(function()
+                local rp = RaycastParams.new()
+                rp.FilterDescendantsInstances = {char}
+                rp.FilterType = Enum.RaycastFilterType.Blacklist
+                rp.IgnoreWater = true
+                return Workspace:Raycast(hrp.Position, (target.Head.Position - hrp.Position), rp)
+            end)
             if ok and (r == nil or (r.Instance and r.Instance:IsDescendantOf(target))) then visible = true end
         end
 
-        -- execute action
         local collided=false; local attackName=nil; local targetStartHP=nil
         if actionName == "move_forward" and target and target:FindFirstChild("HumanoidRootPart") then
             local dir = (target.HumanoidRootPart.Position - hrp.Position)
@@ -708,17 +701,18 @@ task.spawn(function()
         elseif actionName == "move_right" and target and target:FindFirstChild("HumanoidRootPart") then
             local dir=(target.HumanoidRootPart.Position-hrp.Position); local right=Vector3.new(dir.Z,0,-dir.X)
             if right and right.Magnitude > 0 then local steer = steerTo(right.Unit); if steer then setVelocity(steer * CFG.moveStep) else collided=true; metrics.collisions=metrics.collisions+1; clearBV() end end
-        elseif actionName == "jump" then pcall(function() humanoid.Jump = true end); task.wait(0.12); pcall(function() humanoid.Jump = false end)
+        elseif actionName == "jump" then pcall(function() if humanoid then humanoid.Jump = true end end); task.wait(0.12); pcall(function() if humanoid then humanoid.Jump = false end end)
         elseif actionName == "idle" then clearBV(); task.wait(0.06)
         elseif actionName == "click_attack" then
             if target and target:FindFirstChildOfClass("Humanoid") then
-                attackName="click"; targetStartHP = target:FindFirstChildOfClass("Humanoid").Health; doClick()
+                attackName="click"; targetStartHP = (target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").Health) or nil
+                doClick()
                 monitorTargetDamage(target,targetStartHP,CFG.damageWindow,function(success) if success then metrics.hits=metrics.hits+1 end registerAttack(state,attackName,success) end)
             else task.wait(0.05) end
         elseif actionName:match("^skill_") then
             local idx = tonumber(actionName:match("skill_(%d)"))
             if idx and idx>=1 and idx<=#skillKeys then
-                attackName="skill"..tostring(idx); if target and target:FindFirstChildOfClass("Humanoid") then targetStartHP=target:FindFirstChildOfClass("Humanoid").Health end
+                attackName="skill"..tostring(idx); if target and target:FindFirstChildOfClass("Humanoid") then targetStartHP=(target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").Health) or nil end
                 pressSkill(idx)
                 monitorTargetDamage(target,targetStartHP,CFG.damageWindow,function(success) if success then metrics.hits=metrics.hits+1 end registerAttack(state,attackName,success) end)
             end
@@ -730,14 +724,14 @@ task.spawn(function()
         if gotDamage then metrics.damageTaken = metrics.damageTaken + 1 end
 
         local targetMovedAway = false
-        if target and target.Parent and target:FindFirstChild("HumanoidRootPart") then
+        if target and target.Parent and target:FindFirstChild("HumanoidRootPart") and oldDist then
             local ok, newD = pcall(function() return (hrp.Position - target.HumanoidRootPart.Position).Magnitude end)
-            if ok and newD and oldDist and newD > oldDist + 0.4 then targetMovedAway = true end
+            if ok and newD and newD > oldDist + 0.4 then targetMovedAway = true end
         end
 
         local didDamageHeuristic = false
         if target and target:FindFirstChildOfClass("Humanoid") and targetStartHP then
-            local ok, cur = pcall(function() return target:FindFirstChildOfClass("Humanoid").Health end)
+            local ok, cur = pcall(function() return (target:FindFirstChildOfClass("Humanoid") and target:FindFirstChildOfClass("Humanoid").Health) end)
             if ok and cur and cur < targetStartHP then didDamageHeuristic = true end
         end
 
@@ -760,10 +754,10 @@ task.spawn(function()
 
         if now() - lastSave > CFG.saveInterval then
             pcall(function()
-                safeSaveJSONAtomic(CFG.qFile, Q)
-                safeSaveJSONAtomic(CFG.banditFile, bandit)
+                safeSaveJSON(CFG.qFile, Q)
+                safeSaveJSON(CFG.banditFile, bandit)
                 meta.lastSave = os.time()
-                safeSaveJSONAtomic(CFG.metaFile, meta)
+                safeSaveJSON(CFG.metaFile, meta)
             end)
             lastSave = now()
         end
@@ -787,5 +781,4 @@ task.spawn(function()
     end
 end)
 
--- ===== End of file =====
-print("[JJS_AGENT] v4 final loaded (hardened)")
+print("[JJS_AGENT] v4 hardened safe loaded")
