@@ -1,2 +1,2 @@
-# Jjs-bot
-Uhhh just a auto play
+# jjs bot for delta
+im working on it guys
