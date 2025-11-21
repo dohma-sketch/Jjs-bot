@@ -23,17 +23,28 @@ if not PlayersLocal then
     return 
 end
 
--- БАГ #87: Отсутствует проверка на коннект к сети
-local isConnected = true
+-- БАГ #87: Правильная проверка коннекта к серверу
+local isConnected = false
 pcall(function()
-    if not game:FindFirstChildOfClass("NetworkReplicator") then
-        isConnected = false
+    -- Правильный способ проверить коннект
+    if PlayersLocal.Parent == Players then
+        isConnected = true
     end
 end)
 
+-- Даём второй шанс если первая проверка не сработала
 if not isConnected then
-    warn("❌ Игрок не подключен к серверу!")
-    return
+    task.wait(1)
+    pcall(function()
+        if PlayersLocal.Parent == Players then
+            isConnected = true
+        end
+    end)
+end
+
+-- БАГ #138: Только выводим предупреждение, но продолжаем работу
+if not isConnected then
+    warn("⚠️ Внимание: проблемы с соединением, но продолжаем работу...")
 end
 
 local PlayerGui = nil
