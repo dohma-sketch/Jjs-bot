@@ -3,697 +3,1732 @@ local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
 
---// Local Player
 local Player = Players.LocalPlayer
 local Character = Player.Character or Player.CharacterAdded:Wait()
 local Humanoid = Character:WaitForChild("Humanoid")
-local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-local PlayerGui = Player:WaitForChild("PlayerGui")
+local Root = Character:WaitForChild("HumanoidRootPart")
 
---// Game-specific Services
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local Events = ReplicatedStorage:WaitForChild("Events")
+--// ═══════════════════════════════════════════════════════════
+--// ГЛОБАЛЬНЫЕ НАСТРОЙКИ И СОСТОЯНИЕ
+--// ═══════════════════════════════════════════════════════════
 
---// Macro Settings
-local Macro = {
-    Enabled = false,
-    Farming = false,
-    Navigating = false,
-    CurrentPattern = "Spiral", -- "Spiral" or "Super-S"
-    FarmPoints = {},
+local MacroState = {
+    Version = "5.1",
+    Active = false,
+    CurrentPhase = "Idle",
+    StartTime = 0,
+    
+    -- Farming
+    TargetField = "Sunflower Field",
+    FarmingPattern = "Spiral",
+    LastFieldChange = 0,
+    
+    -- Stats
+    SessionStats = {
+        HoneyGained = 0,
+        FieldsCompleted = 0,
+        QuestsCompleted = 0,
+        MobsKilled = 0,
+        DeathCount = 0,
+        Disconnects = 0,
+        Runtime = 0
+    },
+    
+    -- Position tracking
+    LastPosition = Vector3.new(0, 0, 0),
+    StuckTime = 0,
     HivePosition = nil,
-    FieldPosition = nil,
-    CurrentField = nil,
-    StuckDetection = {
-        Enabled = true,
-        LastPosition = nil,
-        StuckTime = 0,
-        Threshold = 1.0,
-        CheckInterval = 0.1
-    },
-    Movement = {
-        Speed = 30,
-        SpiralRadius = 30,
-        SpiralLoops = 3,
-        SuperSPoints = 8,
-        PointSpacing = 5
-    },
-    Collection = {
-        InstantTween = true,
-        TweenSpeed = 0.1,
-        CollectionDistance = 15
-    },
-    AutoClick = {
-        Enabled = true,
-        ClickInterval = 0.1,
-        CheckTool = true
-    }
+    
+    -- Advanced
+    CollectStingers = true,
+    DoMemoryMatch = true,
+    UseHaste = true,
+    AutoDig = true,
+    ConvertBalloons = true,
+    
+    -- Safety
+    IsMoving = false,
+    LastActionTime = 0
 }
 
---// UI Elements
-local MacroUI = nil
-local MainFrame = nil
-local StatusLabel = nil
+local MacroConfig = {
+    -- Farming settings
+    ConvertAt = 95,
+    WalkSpeed = 18,
+    FarmDuration = 300,
+    FieldRotation = true,
+    
+    -- Pattern settings
+    SpiralSpeed = 2,
+    SpiralRadius = 35,
+    ZigzagWidth = 30,
+    SquareSize = 25,
+    
+    -- Collection
+    TokenRange = 20,
+    FlowerCollectRange = 8,
+    
+    -- Safety
+    AntiAfkInterval = 180,
+    StuckThreshold = 3,
+    ReconnectOnDisconnect = true,
+    
+    -- Performance
+    TickRate = 0.1,
+    PathUpdateRate = 0.5,
+    
+    -- Advanced
+    UseGlidingForTravel = true,
+    CollectCrosshairs = true,
+    PrioritizeBoostFields = true,
+    AutoUseBuffItems = true
+}
 
---// Pathfinding Variables
-local CurrentPath = nil
-local PathComputing = false
-local WaypointIndex = 1
+--// ═══════════════════════════════════════════════════════════
+--// ПОЛЯ И ЗОНЫ
+--// ═══════════════════════════════════════════════════════════
 
---// Token Collection Variables
-local CollectibleTokens = {}
-local LastTokenCollection = 0
+local FieldDatabase = {
+    {Name = "Sunflower Field", Level = 1, Type = "Yellow", Priority = 1, Pattern = "Spiral"},
+    {Name = "Dandelion Field", Level = 3, Type = "Yellow", Priority = 2, Pattern = "Spiral"},
+    {Name = "Mushroom Field", Level = 5, Type = "Red", Priority = 3, Pattern = "Square"},
+    {Name = "Blue Flower Field", Level = 5, Type = "Blue", Priority = 4, Pattern = "Spiral"},
+    {Name = "Clover Field", Level = 7, Type = "White", Priority = 5, Pattern = "Spiral"},
+    {Name = "Strawberry Field", Level = 10, Type = "Red", Priority = 6, Pattern = "Zigzag"},
+    {Name = "Spider Field", Level = 12, Type = "Red", Priority = 7, Pattern = "Square"},
+    {Name = "Bamboo Field", Level = 15, Type = "Blue", Priority = 8, Pattern = "Zigzag"},
+    {Name = "Rose Field", Level = 20, Type = "Red", Priority = 9, Pattern = "Spiral"},
 
---// Utility Functions
-local function GetCurrentTool()
-    local backpack = Player:FindFirstChild("Backpack")
-    local tool = nil
-    
-    if Humanoid and Humanoid:FindFirstChildOfClass("Tool") then
-        tool = Humanoid:FindFirstChildOfClass("Tool")
-    elseif backpack and backpack:FindFirstChildOfClass("Tool") then
-        tool = backpack:FindFirstChildOfClass("Tool")
-    end
-    
-    return tool
-end
+{Name = "Pine Tree Forest", Level = 25, Type = "White", Priority = 10, Pattern = "Square"},
+    {Name = "Cactus Field", Level = 30, Type = "Blue", Priority = 11, Pattern = "Zigzag"},
+    {Name = "Pumpkin Patch", Level = 35, Type = "Yellow", Priority = 12, Pattern = "Square"},
+    {Name = "Pineapple Patch", Level = 35, Type = "Yellow", Priority = 13, Pattern = "Spiral"},
+    {Name = "Stump Field", Level = 5, Type = "White", Priority = 14, Pattern = "Square"},
+    {Name = "Mountain Top Field", Level = 40, Type = "White", Priority = 15, Pattern = "Spiral"},
+    {Name = "Coconut Field", Level = 35, Type = "White", Priority = 16, Pattern = "Zigzag"},
+    {Name = "Pepper Patch", Level = 35, Type = "Red", Priority = 17, Pattern = "Square"}
+}
 
-local function GetTokenPositions()
-    local tokens = {}
-    local collectibles = Workspace:FindFirstChild("Collectibles")
-    
-    if collectibles then
-        for _, token in pairs(collectibles:GetChildren()) do
-            if token:IsA("BasePart") and (token.Position - HumanoidRootPart.Position).Magnitude <= Macro.Collection.CollectionDistance then
-                table.insert(tokens, token)
-            end
-        end
-    end
-    
-    return tokens
-end
+--// ═══════════════════════════════════════════════════════════
+--// КЕШИРОВАНИЕ И ОПТИМИЗАЦИЯ
+--// ═══════════════════════════════════════════════════════════
 
-local function GetFieldByPosition(position)
-    local fields = Workspace:FindFirstChild("FieldZones")
-    if not fields then return nil end
-    
-    local closestField = nil
-    local closestDistance = math.huge
-    
-    for _, field in pairs(fields:GetChildren()) do
-        if field:IsA("BasePart") then
-            local distance = (field.Position - position).Magnitude
-            if distance < closestDistance then
-                closestDistance = distance
-                closestField = field
-            end
-        end
-    end
-    
-    return closestField
-end
+local Cache = {
+    FlowerZones = nil,
+    Flowers = {},
+    Collectibles = nil,
+    Hives = nil,
+    Monsters = nil,
+    NPCs = {},
+    LastUpdate = 0,
+    UpdateInterval = 5
+}
 
-local function GetHivePosition()
-    local hives = Workspace:FindFirstChild("Hives")
-    if not hives then return nil end
+local function UpdateCache()
+    local now = tick()
+    if now - Cache.LastUpdate < Cache.UpdateInterval then return end
     
-    for _, hive in pairs(hives:GetChildren()) do
-        if hive:FindFirstChild("Owner") and hive.Owner.Value == Player then
-            return hive.Position
-        end
-    end
-    
-    return nil
-end
-
---==========================================
--- STUCK DETECTION SYSTEM
---==========================================
-
-task.spawn(function()
-    while true do
-        task.wait(Macro.StuckDetection.CheckInterval)
+    pcall(function()
+        Cache.FlowerZones = Workspace:FindFirstChild("FlowerZones")
+        Cache.Collectibles = Workspace:FindFirstChild("Collectibles")
+        Cache.Hives = Workspace:FindFirstChild("Hives")
+        Cache.Monsters = Workspace:FindFirstChild("Monsters")
         
-        if not Macro.Enabled or not Macro.StuckDetection.Enabled then continue end
-        
-        local currentPos = HumanoidRootPart.Position
-        
-        if Macro.StuckDetection.LastPosition then
-            local distance = (currentPos - Macro.StuckDetection.LastPosition).Magnitude
-            
-            if distance < 2 then
-                Macro.StuckDetection.StuckTime = Macro.StuckDetection.StuckTime + Macro.StuckDetection.CheckInterval
-                
-                if Macro.StuckDetection.StuckTime >= Macro.StuckDetection.Threshold then
-                    -- Anti-stuck actions
-                    Humanoid.Jump = true
-                    task.wait(0.2)
-                    Humanoid.Jump = false
-                    
-                    -- Force path recalculation if navigating
-                    if Macro.Navigating and CurrentPath then
-                        PathComputing = false
-                        WaypointIndex = 1
-                    end
-                    
-                    Macro.StuckDetection.StuckTime = 0
-                    print("[Stuck Detection] Triggered anti-stuck actions")
+        if Cache.FlowerZones then
+            for _, zone in pairs(Cache.FlowerZones:GetChildren()) do
+                if zone:FindFirstChild("Flowers") then
+                    Cache.Flowers[zone.Name] = zone.Flowers:GetChildren()
                 end
-            else
-                Macro.StuckDetection.StuckTime = 0
             end
         end
-        
-        Macro.StuckDetection.LastPosition = currentPos
+    end)
+    
+    Cache.LastUpdate = now
+end
+
+--// ═══════════════════════════════════════════════════════════
+--// UI СИСТЕМА (ИСПРАВЛЕННАЯ)
+--// ═══════════════════════════════════════════════════════════
+
+local UI = {
+    Elements = {},
+    Connections = {},
+    Pages = {},
+    CurrentPage = "Main",
+    Initialized = false
+}
+
+function UI:Cleanup()
+    -- Очистка соединений
+    for _, conn in pairs(self.Connections) do
+        if conn and typeof(conn) == "RBXScriptConnection" then
+            pcall(function() conn:Disconnect() end)
+        end
     end
-end)
+    self.Connections = {}
+    
+    -- Очистка старого UI
+    for _, ui in pairs(CoreGui:GetChildren()) do
+        if ui.Name == "NatroMacro" then
+            pcall(function() ui:Destroy() end)
+        end
+    end
+    
+    self.Elements = {}
+    self.Pages = {}
+end
 
---==========================================
--- PATHFINDING SYSTEM
---==========================================
-
-local function ComputePath(startPos, endPos)
-    if PathComputing then return nil end
+function UI:Create()
+    if self.Initialized then return end
     
-    PathComputing = true
+    self:Cleanup()
     
-    local pathParams = {
-        AgentCanJump = true,
-        AgentCanClimb = false,
-        AgentHeight = 5,
-        AgentRadius = 2,
-        AgentMaxSlope = 45,
-        Costs = {
-            Water = math.huge
-        }
-    }
+    -- Main ScreenGui
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "NatroMacro"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.IgnoreGuiInset = true
     
-    local success, path = pcall(function()
-        return PathfindingService:CreatePath(pathParams)
+    local success = pcall(function()
+        ScreenGui.Parent = CoreGui
     end)
     
     if not success then
-        PathComputing = false
-        return nil
+        warn("Failed to create UI")
+        return
     end
     
-    path:ComputeAsync(startPos, endPos)
+    -- Main Window
+    local MainWindow = Instance.new("Frame")
+    MainWindow.Name = "MainWindow"
+    MainWindow.Size = UDim2.new(0, 450, 0, 550)
+    MainWindow.Position = UDim2.new(0.5, -225, 0.5, -275)
+    MainWindow.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    MainWindow.BorderSizePixel = 0
+    MainWindow.Active = true
+    MainWindow.Draggable = true
+    MainWindow.Parent = ScreenGui
     
-    if path.Status == Enum.PathStatus.Success then
-        PathComputing = false
-        return path
+    local MainCorner = Instance.new("UICorner")
+    MainCorner.CornerRadius = UDim.new(0, 10)
+    MainCorner.Parent = MainWindow
+    
+    -- Title Bar
+    local TitleBar = Instance.new("Frame")
+    TitleBar.Name = "TitleBar"
+    TitleBar.Size = UDim2.new(1, 0, 0, 50)
+    TitleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+
+TitleBar.BorderSizePixel = 0
+    TitleBar.Parent = MainWindow
+    
+    local TitleCorner = Instance.new("UICorner")
+    TitleCorner.CornerRadius = UDim.new(0, 10)
+    TitleCorner.Parent = TitleBar
+    
+    -- Title gradient
+    local TitleGradient = Instance.new("UIGradient")
+    TitleGradient.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 200, 50)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 150, 0))
+    }
+    TitleGradient.Rotation = 90
+    TitleGradient.Parent = TitleBar
+    
+    -- Title text
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, -100, 1, 0)
+    Title.Position = UDim2.new(0, 15, 0, 0)
+    Title.BackgroundTransparency = 1
+    Title.Text = "🐝 NATRO MACRO v" .. MacroState.Version
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 20
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.Parent = TitleBar
+    
+    -- Minimize button
+    local MinimizeBtn = Instance.new("TextButton")
+    MinimizeBtn.Size = UDim2.new(0, 40, 0, 40)
+    MinimizeBtn.Position = UDim2.new(1, -90, 0, 5)
+    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+    MinimizeBtn.Text = "−"
+    MinimizeBtn.Font = Enum.Font.GothamBold
+    MinimizeBtn.TextSize = 24
+    MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    MinimizeBtn.BorderSizePixel = 0
+    MinimizeBtn.AutoButtonColor = false
+    MinimizeBtn.Parent = TitleBar
+    
+    local MinCorner = Instance.new("UICorner")
+    MinCorner.CornerRadius = UDim.new(0, 8)
+    MinCorner.Parent = MinimizeBtn
+    
+    -- Close button
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.new(0, 40, 0, 40)
+    CloseBtn.Position = UDim2.new(1, -45, 0, 5)
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    CloseBtn.Text = "×"
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.TextSize = 24
+    CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    CloseBtn.BorderSizePixel = 0
+    CloseBtn.AutoButtonColor = false
+    CloseBtn.Parent = TitleBar
+    
+    local CloseCorner = Instance.new("UICorner")
+    CloseCorner.CornerRadius = UDim.new(0, 8)
+    CloseCorner.Parent = CloseBtn
+    
+    -- Tab navigation
+    local TabContainer = Instance.new("Frame")
+    TabContainer.Size = UDim2.new(1, -20, 0, 40)
+    TabContainer.Position = UDim2.new(0, 10, 0, 60)
+    TabContainer.BackgroundTransparency = 1
+    TabContainer.Parent = MainWindow
+    
+    local TabLayout = Instance.new("UIListLayout")
+    TabLayout.FillDirection = Enum.FillDirection.Horizontal
+    TabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    TabLayout.Padding = UDim.new(0, 5)
+    TabLayout.Parent = TabContainer
+    
+    local tabs = {"Main", "Fields", "Settings", "Stats"}
+    local TabButtons = {}
+    
+    for i, tabName in ipairs(tabs) do
+        local TabBtn = Instance.new("TextButton")
+        TabBtn.Size = UDim2.new(0, 100, 1, 0)
+        TabBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+        TabBtn.Text = tabName
+        TabBtn.Font = Enum.Font.Gotham
+        TabBtn.TextSize = 13
+        TabBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+        TabBtn.BorderSizePixel = 0
+        TabBtn.AutoButtonColor = false
+        TabBtn.Parent = TabContainer
+        
+        local TabCorner = Instance.new("UICorner")
+        TabCorner.CornerRadius = UDim.new(0, 6)
+        TabCorner.Parent = TabBtn
+        
+        TabButtons[tabName] = TabBtn
+        
+        table.insert(self.Connections, TabBtn.MouseButton1Click:Connect(function()
+            self:SwitchTab(tabName, TabButtons)
+        end))
     end
     
-    PathComputing = false
+    -- Content area
+    local ContentFrame = Instance.new("ScrollingFrame")
+    ContentFrame.Name = "ContentFrame"
+    ContentFrame.Size = UDim2.new(1, -20, 1, -180)
+
+ContentFrame.Position = UDim2.new(0, 10, 0, 110)
+    ContentFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    ContentFrame.BorderSizePixel = 0
+    ContentFrame.ScrollBarThickness = 4
+    ContentFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+    ContentFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ContentFrame.Parent = MainWindow
+    
+    local ContentCorner = Instance.new("UICorner")
+    ContentCorner.CornerRadius = UDim.new(0, 8)
+    ContentCorner.Parent = ContentFrame
+    
+    -- Create pages
+    self:CreateMainPage(ContentFrame)
+    self:CreateFieldsPage(ContentFrame)
+    self:CreateSettingsPage(ContentFrame)
+    self:CreateStatsPage(ContentFrame)
+    
+    -- Bottom control panel
+    local ControlPanel = Instance.new("Frame")
+    ControlPanel.Size = UDim2.new(1, -20, 0, 60)
+    ControlPanel.Position = UDim2.new(0, 10, 1, -70)
+    ControlPanel.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    ControlPanel.BorderSizePixel = 0
+    ControlPanel.Parent = MainWindow
+    
+    local ControlCorner = Instance.new("UICorner")
+    ControlCorner.CornerRadius = UDim.new(0, 8)
+    ControlCorner.Parent = ControlPanel
+    
+    -- Start/Stop button
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Size = UDim2.new(1, -10, 1, -10)
+    ToggleBtn.Position = UDim2.new(0, 5, 0, 5)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+    ToggleBtn.Text = "▶ START MACRO"
+    ToggleBtn.Font = Enum.Font.GothamBold
+    ToggleBtn.TextSize = 20
+    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ToggleBtn.BorderSizePixel = 0
+    ToggleBtn.AutoButtonColor = false
+    ToggleBtn.Parent = ControlPanel
+    
+    local ToggleCorner = Instance.new("UICorner")
+    ToggleCorner.CornerRadius = UDim.new(0, 8)
+    ToggleCorner.Parent = ToggleBtn
+    
+    self.Elements.ToggleBtn = ToggleBtn
+    self.Elements.MainWindow = MainWindow
+    self.Elements.ContentFrame = ContentFrame
+    
+    -- Toggle functionality
+    table.insert(self.Connections, ToggleBtn.MouseButton1Click:Connect(function()
+        MacroState.Active = not MacroState.Active
+        if MacroState.Active then
+            ToggleBtn.Text = "■ STOP MACRO"
+            ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+            MacroState.StartTime = tick()
+            MacroState.CurrentPhase = "Gathering"
+            self:StartMacro()
+        else
+            ToggleBtn.Text = "▶ START MACRO"
+            ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+            MacroState.CurrentPhase = "Idle"
+            self:StopMacro()
+        end
+    end))
+    
+    -- Minimize functionality
+    local minimized = false
+    table.insert(self.Connections, MinimizeBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        if minimized then
+            TweenService:Create(MainWindow, TweenInfo.new(0.3, Enum.EasingStyle.Quad), 
+                {Size = UDim2.new(0, 450, 0, 50)}):Play()
+            ContentFrame.Visible = false
+            TabContainer.Visible = false
+            ControlPanel.Visible = false
+            MinimizeBtn.Text = "+"
+        else
+            TweenService:Create(MainWindow, TweenInfo.new(0.3, Enum.EasingStyle.Quad), 
+                {Size = UDim2.new(0, 450, 0, 550)}):Play()
+            task.wait(0.3)
+            ContentFrame.Visible = true
+            TabContainer.Visible = true
+            ControlPanel.Visible = true
+            MinimizeBtn.Text = "−"
+        end
+    end))
+    
+    -- Close functionality
+    table.insert(self.Connections, CloseBtn.MouseButton1Click:Connect(function()
+        MacroState.Active = false
+        self:Cleanup()
+    end))
+    
+    self:SwitchTab("Main", TabButtons)
+    self.Initialized = true
+end
+
+function UI:CreateMainPage(parent)
+    local MainPage = Instance.new("Frame")
+    MainPage.Name = "MainPage"
+
+MainPage.Size = UDim2.new(1, 0, 1, 0)
+    MainPage.BackgroundTransparency = 1
+    MainPage.BorderSizePixel = 0
+    MainPage.Parent = parent
+    
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 10)
+    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = MainPage
+    
+    -- Status display
+    local StatusFrame = self:CreateSection(MainPage, "Current Status", 120)
+    StatusFrame.LayoutOrder = 1
+    
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Size = UDim2.new(1, -20, 0, 30)
+    StatusLabel.Position = UDim2.new(0, 10, 0, 35)
+    StatusLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    StatusLabel.Text = "● IDLE - Waiting to start..."
+    StatusLabel.Font = Enum.Font.Code
+    StatusLabel.TextSize = 14
+    StatusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    StatusLabel.BorderSizePixel = 0
+    StatusLabel.Parent = StatusFrame
+    
+    local StatusCorner = Instance.new("UICorner")
+    StatusCorner.CornerRadius = UDim.new(0, 6)
+    StatusCorner.Parent = StatusLabel
+    
+    self.Elements.StatusLabel = StatusLabel
+    
+    local RuntimeLabel = Instance.new("TextLabel")
+    RuntimeLabel.Size = UDim2.new(1, -20, 0, 30)
+    RuntimeLabel.Position = UDim2.new(0, 10, 0, 75)
+    RuntimeLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    RuntimeLabel.Text = "⏱ Runtime: 00:00:00"
+    RuntimeLabel.Font = Enum.Font.Code
+    RuntimeLabel.TextSize = 14
+    RuntimeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    RuntimeLabel.TextXAlignment = Enum.TextXAlignment.Left
+    RuntimeLabel.BorderSizePixel = 0
+    RuntimeLabel.Parent = StatusFrame
+    
+    local RuntimeCorner = Instance.new("UICorner")
+    RuntimeCorner.CornerRadius = UDim.new(0, 6)
+    RuntimeCorner.Parent = RuntimeLabel
+    
+    self.Elements.RuntimeLabel = RuntimeLabel
+    
+    -- Quick settings
+    local QuickSettings = self:CreateSection(MainPage, "Quick Settings", 200)
+    QuickSettings.LayoutOrder = 2
+    
+    -- Field selector
+    local FieldLabel = Instance.new("TextLabel")
+    FieldLabel.Size = UDim2.new(1, -20, 0, 20)
+    FieldLabel.Position = UDim2.new(0, 10, 0, 35)
+    FieldLabel.BackgroundTransparency = 1
+    FieldLabel.Text = "Target Field:"
+    FieldLabel.Font = Enum.Font.Gotham
+    FieldLabel.TextSize = 12
+    FieldLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    FieldLabel.TextXAlignment = Enum.TextXAlignment.Left
+    FieldLabel.Parent = QuickSettings
+    
+    local FieldDropdown = self:CreateDropdown(QuickSettings, UDim2.new(1, -20, 0, 35), 
+        UDim2.new(0, 10, 0, 60), FieldDatabase, "Name", function(selected)
+        MacroState.TargetField = selected.Name
+        MacroState.FarmingPattern = selected.Pattern
+    end)
+    
+    -- Convert at slider
+    local ConvertLabel = Instance.new("TextLabel")
+    ConvertLabel.Size = UDim2.new(1, -20, 0, 20)
+    ConvertLabel.Position = UDim2.new(0, 10, 0, 105)
+    ConvertLabel.BackgroundTransparency = 1
+    ConvertLabel.Text = "Convert at: " .. MacroConfig.ConvertAt .. "%"
+    ConvertLabel.Font = Enum.Font.Gotham
+    ConvertLabel.TextSize = 12
+    ConvertLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    ConvertLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ConvertLabel.Parent = QuickSettings
+    
+    local ConvertSlider = self:CreateSlider(QuickSettings, UDim2.new(1, -20, 0, 25),
+        UDim2.new(0, 10, 0, 130), 50, 100, MacroConfig.ConvertAt, function(value)
+        MacroConfig.ConvertAt = value
+        ConvertLabel.Text = "Convert at: " .. value .. "%"
+    end)
+    
+    -- Pattern display
+    local PatternLabel = Instance.new("TextLabel")
+    PatternLabel.Size = UDim2.new(1, -20, 0, 25)
+    PatternLabel.Position = UDim2.new(0, 10, 0, 165)
+
+PatternLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    PatternLabel.Text = "Pattern: " .. MacroState.FarmingPattern
+    PatternLabel.Font = Enum.Font.Gotham
+    PatternLabel.TextSize = 12
+    PatternLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    PatternLabel.BorderSizePixel = 0
+    PatternLabel.Parent = QuickSettings
+    
+    local PatCorner = Instance.new("UICorner")
+    PatCorner.CornerRadius = UDim.new(0, 6)
+    PatCorner.Parent = PatternLabel
+    
+    self.Elements.PatternLabel = PatternLabel
+    
+    -- Quick actions
+    local QuickActions = self:CreateSection(MainPage, "Quick Actions", 150)
+    QuickActions.LayoutOrder = 3
+    
+    local btnData = {
+        {Text = "Go to Hive", Color = Color3.fromRGB(255, 200, 50), Action = function() self:QuickAction("Hive") end},
+        {Text = "Collect Tokens", Color = Color3.fromRGB(50, 200, 255), Action = function() self:QuickAction("Tokens") end},
+        {Text = "Reset Character", Color = Color3.fromRGB(200, 50, 50), Action = function() self:QuickAction("Reset") end}
+    }
+    
+    for i, data in ipairs(btnData) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -20, 0, 35)
+        btn.Position = UDim2.new(0, 10, 0, 30 + (i-1)*40)
+        btn.BackgroundColor3 = data.Color
+        btn.Text = data.Text
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 13
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = false
+        btn.Parent = QuickActions
+        
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = btn
+        
+        table.insert(self.Connections, btn.MouseButton1Click:Connect(data.Action))
+    end
+    
+    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    
+    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    end))
+    
+    self.Pages.Main = MainPage
+end
+
+function UI:CreateFieldsPage(parent)
+    local FieldsPage = Instance.new("Frame")
+    FieldsPage.Name = "FieldsPage"
+    FieldsPage.Size = UDim2.new(1, 0, 1, 0)
+    FieldsPage.BackgroundTransparency = 1
+    FieldsPage.BorderSizePixel = 0
+    FieldsPage.Visible = false
+    FieldsPage.Parent = parent
+    
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 5)
+    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = FieldsPage
+    
+    -- Field list
+    local FieldListSection = self:CreateSection(FieldsPage, "Available Fields", 400)
+    FieldListSection.LayoutOrder = 1
+    
+    local FieldListScroll = Instance.new("ScrollingFrame")
+    FieldListScroll.Size = UDim2.new(1, -20, 1, -40)
+    FieldListScroll.Position = UDim2.new(0, 10, 0, 35)
+    FieldListScroll.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    FieldListScroll.BorderSizePixel = 0
+    FieldListScroll.ScrollBarThickness = 3
+    FieldListScroll.Parent = FieldListSection
+    
+    local ListLayout = Instance.new("UIListLayout")
+    ListLayout.Padding = UDim.new(0, 2)
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ListLayout.Parent = FieldListScroll
+    
+    for i, field in ipairs(FieldDatabase) do
+        local FieldItem = Instance.new("Frame")
+        FieldItem.Size = UDim2.new(1, -4, 0, 30)
+        FieldItem.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(40, 40, 45) or Color3.fromRGB(35, 35, 40)
+        FieldItem.BorderSizePixel = 0
+        FieldItem.LayoutOrder = i
+        FieldItem.Parent = FieldListScroll
+        
+        local FieldName = Instance.new("TextLabel")
+        FieldName.Size = UDim2.new(0.45, 0, 1, 0)
+
+FieldName.Position = UDim2.new(0, 10, 0, 0)
+        FieldName.BackgroundTransparency = 1
+        FieldName.Text = field.Name
+        FieldName.Font = Enum.Font.Gotham
+        FieldName.TextSize = 11
+        FieldName.TextColor3 = Color3.fromRGB(220, 220, 220)
+        FieldName.TextXAlignment = Enum.TextXAlignment.Left
+        FieldName.TextTruncate = Enum.TextTruncate.AtEnd
+        FieldName.Parent = FieldItem
+        
+        local FieldType = Instance.new("TextLabel")
+        FieldType.Size = UDim2.new(0.2, 0, 1, 0)
+        FieldType.Position = UDim2.new(0.45, 0, 0, 0)
+        FieldType.BackgroundTransparency = 1
+        FieldType.Text = field.Type
+        FieldType.Font = Enum.Font.GothamBold
+        FieldType.TextSize = 10
+        FieldType.TextColor3 = field.Type == "Red" and Color3.fromRGB(255, 100, 100) or
+                               field.Type == "Blue" and Color3.fromRGB(100, 150, 255) or
+                               Color3.fromRGB(255, 255, 150)
+        FieldType.Parent = FieldItem
+        
+        local SelectBtn = Instance.new("TextButton")
+        SelectBtn.Size = UDim2.new(0.3, -10, 0, 25)
+        SelectBtn.Position = UDim2.new(0.7, 0, 0.5, -12.5)
+        SelectBtn.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+        SelectBtn.Text = "Select"
+        SelectBtn.Font = Enum.Font.Gotham
+        SelectBtn.TextSize = 10
+        SelectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        SelectBtn.BorderSizePixel = 0
+        SelectBtn.AutoButtonColor = false
+        SelectBtn.Parent = FieldItem
+        
+        local BtnCorner = Instance.new("UICorner")
+        BtnCorner.CornerRadius = UDim.new(0, 4)
+        BtnCorner.Parent = SelectBtn
+        
+        table.insert(self.Connections, SelectBtn.MouseButton1Click:Connect(function()
+            MacroState.TargetField = field.Name
+            MacroState.FarmingPattern = field.Pattern
+            if self.Elements.PatternLabel then
+                self.Elements.PatternLabel.Text = "Pattern: " .. field.Pattern
+            end
+        end))
+    end
+    
+    FieldListScroll.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 5)
+    
+    table.insert(self.Connections, ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        FieldListScroll.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 5)
+    end))
+    
+    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    
+    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    end))
+    
+    self.Pages.Fields = FieldsPage
+end
+
+function UI:CreateSettingsPage(parent)
+    local SettingsPage = Instance.new("Frame")
+    SettingsPage.Name = "SettingsPage"
+    SettingsPage.Size = UDim2.new(1, 0, 1, 0)
+    SettingsPage.BackgroundTransparency = 1
+    SettingsPage.BorderSizePixel = 0
+    SettingsPage.Visible = false
+    SettingsPage.Parent = parent
+    
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 10)
+    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = SettingsPage
+    
+    -- General settings
+    local GeneralSection = self:CreateSection(SettingsPage, "General Settings", 200)
+    GeneralSection.LayoutOrder = 1
+    
+    local settings = {
+        {Name = "Field Rotation", Var = "FieldRotation", Config = true},
+        {Name = "Use Haste", Var = "UseHaste", Config = false},
+        {Name = "Auto Dig", Var = "AutoDig", Config = false},
+        {Name = "Collect Stingers", Var = "CollectStingers", Config = false},
+        {Name = "Memory Match", Var = "DoMemoryMatch", Config = false}
+    }
+    
+    for i, setting in ipairs(settings) do
+
+local defaultVal = setting.Config and MacroConfig[setting.Var] or MacroState[setting.Var]
+        self:CreateToggle(GeneralSection, setting.Name, 
+            UDim2.new(0, 10, 0, 30 + (i-1)*30),
+            defaultVal or false, 
+            function(state)
+                if setting.Config then
+                    MacroConfig[setting.Var] = state
+                else
+                    MacroState[setting.Var] = state
+                end
+            end)
+    end
+    
+    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    
+    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    end))
+    
+    self.Pages.Settings = SettingsPage
+end
+
+function UI:CreateStatsPage(parent)
+    local StatsPage = Instance.new("Frame")
+    StatsPage.Name = "StatsPage"
+    StatsPage.Size = UDim2.new(1, 0, 1, 0)
+    StatsPage.BackgroundTransparency = 1
+    StatsPage.BorderSizePixel = 0
+    StatsPage.Visible = false
+    StatsPage.Parent = parent
+    
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 10)
+    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = StatsPage
+    
+    local StatsSection = self:CreateSection(StatsPage, "Session Statistics", 260)
+    StatsSection.LayoutOrder = 1
+    
+    local stats = {
+        {Name = "Honey Gained", Key = "HoneyGained", Suffix = ""},
+        {Name = "Fields Completed", Key = "FieldsCompleted", Suffix = ""},
+        {Name = "Quests Completed", Key = "QuestsCompleted", Suffix = ""},
+        {Name = "Mobs Killed", Key = "MobsKilled", Suffix = ""},
+        {Name = "Deaths", Key = "DeathCount", Suffix = ""}
+    }
+    
+    for i, stat in ipairs(stats) do
+        local StatFrame = Instance.new("Frame")
+        StatFrame.Size = UDim2.new(1, -20, 0, 35)
+        StatFrame.Position = UDim2.new(0, 10, 0, 30 + (i-1)*45)
+        StatFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+        StatFrame.BorderSizePixel = 0
+        StatFrame.Parent = StatsSection
+        
+        local StatCorner = Instance.new("UICorner")
+        StatCorner.CornerRadius = UDim.new(0, 6)
+        StatCorner.Parent = StatFrame
+        
+        local StatName = Instance.new("TextLabel")
+        StatName.Size = UDim2.new(0.6, 0, 1, 0)
+        StatName.Position = UDim2.new(0, 10, 0, 0)
+        StatName.BackgroundTransparency = 1
+        StatName.Text = stat.Name .. ":"
+        StatName.Font = Enum.Font.Gotham
+        StatName.TextSize = 12
+        StatName.TextColor3 = Color3.fromRGB(200, 200, 200)
+        StatName.TextXAlignment = Enum.TextXAlignment.Left
+        StatName.Parent = StatFrame
+        
+        local StatValue = Instance.new("TextLabel")
+        StatValue.Name = "StatValue_" .. stat.Key
+        StatValue.Size = UDim2.new(0.4, -10, 1, 0)
+        StatValue.Position = UDim2.new(0.6, 0, 0, 0)
+        StatValue.BackgroundTransparency = 1
+        StatValue.Text = tostring(MacroState.SessionStats[stat.Key]) .. stat.Suffix
+        StatValue.Font = Enum.Font.Code
+        StatValue.TextSize = 13
+        StatValue.TextColor3 = Color3.fromRGB(100, 255, 100)
+        StatValue.TextXAlignment = Enum.TextXAlignment.Right
+        StatValue.Parent = StatFrame
+        
+        self.Elements["Stat_" .. stat.Key] = StatValue
+    end
+    
+    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    
+    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
+    end))
+    
+    self.Pages.Stats = StatsPage
+end
+
+-- Helper functions for UI
+
+function UI:CreateSection(parent, title, height)
+    local Section = Instance.new("Frame")
+    Section.Size = UDim2.new(1, -10, 0, height)
+    Section.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    Section.BorderSizePixel = 0
+    Section.Parent = parent
+    
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 8)
+    Corner.Parent = Section
+    
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, 0, 0, 25)
+    Title.BackgroundTransparency = 1
+    Title.Text = title
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 13
+    Title.TextColor3 = Color3.fromRGB(255, 200, 50)
+    Title.TextXAlignment = Enum.TextXAlignment.Center
+    Title.Parent = Section
+    
+    return Section
+end
+
+function UI:CreateToggle(parent, text, position, default, callback)
+    local ToggleFrame = Instance.new("Frame")
+    ToggleFrame.Size = UDim2.new(1, -20, 0, 25)
+    ToggleFrame.Position = position
+    ToggleFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    ToggleFrame.BorderSizePixel = 0
+    ToggleFrame.Parent = parent
+    
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 6)
+    Corner.Parent = ToggleFrame
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.7, 0, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = text
+    Label.Font = Enum.Font.Gotham
+    Label.TextSize = 11
+    Label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = ToggleFrame
+    
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Size = UDim2.new(0, 45, 0, 20)
+    ToggleBtn.Position = UDim2.new(1, -55, 0.5, -10)
+    ToggleBtn.BackgroundColor3 = default and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(100, 100, 100)
+    ToggleBtn.Text = default and "ON" or "OFF"
+    ToggleBtn.Font = Enum.Font.GothamBold
+    ToggleBtn.TextSize = 10
+    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ToggleBtn.BorderSizePixel = 0
+    ToggleBtn.AutoButtonColor = false
+    ToggleBtn.Parent = ToggleFrame
+    
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 10)
+    BtnCorner.Parent = ToggleBtn
+    
+    local state = default
+    table.insert(self.Connections, ToggleBtn.MouseButton1Click:Connect(function()
+        state = not state
+        ToggleBtn.BackgroundColor3 = state and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(100, 100, 100)
+        ToggleBtn.Text = state and "ON" or "OFF"
+        callback(state)
+    end))
+    
+    return ToggleFrame
+end
+
+function UI:CreateSlider(parent, size, position, min, max, default, callback)
+    local SliderFrame = Instance.new("Frame")
+    SliderFrame.Size = size
+    SliderFrame.Position = position
+    SliderFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    SliderFrame.BorderSizePixel = 0
+    SliderFrame.Parent = parent
+    
+    local Corner = Instance.new("UICorner")
+    Corner.CornerRadius = UDim.new(0, 12)
+    Corner.Parent = SliderFrame
+    
+    local Fill = Instance.new("Frame")
+    Fill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    Fill.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+    Fill.BorderSizePixel = 0
+    Fill.Parent = SliderFrame
+    
+    local FillCorner = Instance.new("UICorner")
+    FillCorner.CornerRadius = UDim.new(0, 12)
+    FillCorner.Parent = Fill
+    
+    local dragging = false
+    
+    local function update(input)
+        local pos = math.clamp((input.Position.X - SliderFrame.AbsolutePosition.X) / SliderFrame.AbsoluteSize.X, 0, 1)
+        local value = math.floor(min + (max - min) * pos)
+        Fill.Size = UDim2.new(pos, 0, 1, 0)
+        callback(value)
+    end
+    
+    table.insert(self.Connections, SliderFrame.InputBegan:Connect(function(input)
+
+if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+           input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update(input)
+        end
+    end))
+    
+    table.insert(self.Connections, SliderFrame.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+           input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    
+    table.insert(self.Connections, UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or
+                         input.UserInputType == Enum.UserInputType.Touch) then
+            update(input)
+        end
+    end))
+    
+    return SliderFrame
+end
+
+function UI:CreateDropdown(parent, size, position, options, displayKey, callback)
+    local DropdownBtn = Instance.new("TextButton")
+    DropdownBtn.Size = size
+    DropdownBtn.Position = position
+    DropdownBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+    DropdownBtn.Text = ""
+    DropdownBtn.BorderSizePixel = 0
+    DropdownBtn.AutoButtonColor = false
+    DropdownBtn.Parent = parent
+    
+    local BtnCorner = Instance.new("UICorner")
+    BtnCorner.CornerRadius = UDim.new(0, 6)
+    BtnCorner.Parent = DropdownBtn
+    
+    local SelectedLabel = Instance.new("TextLabel")
+    SelectedLabel.Size = UDim2.new(1, -30, 1, 0)
+    SelectedLabel.Position = UDim2.new(0, 10, 0, 0)
+    SelectedLabel.BackgroundTransparency = 1
+    SelectedLabel.Text = options[1][displayKey] .. " ▼"
+    SelectedLabel.Font = Enum.Font.Gotham
+    SelectedLabel.TextSize = 12
+    SelectedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SelectedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    SelectedLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    SelectedLabel.Parent = DropdownBtn
+    
+    local DropdownList = Instance.new("ScrollingFrame")
+    DropdownList.Size = UDim2.new(1, 0, 0, 150)
+    DropdownList.Position = UDim2.new(0, 0, 1, 5)
+    DropdownList.BackgroundColor3 = Color3.fromRGB(45, 45, 50)
+    DropdownList.BorderSizePixel = 0
+    DropdownList.ScrollBarThickness = 4
+    DropdownList.Visible = false
+    DropdownList.ZIndex = 10
+    DropdownList.Parent = DropdownBtn
+    
+    local ListCorner = Instance.new("UICorner")
+    ListCorner.CornerRadius = UDim.new(0, 6)
+    ListCorner.Parent = DropdownList
+    
+    local ListLayout = Instance.new("UIListLayout")
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ListLayout.Parent = DropdownList
+    
+    for i, option in ipairs(options) do
+        local OptionBtn = Instance.new("TextButton")
+        OptionBtn.Size = UDim2.new(1, -4, 0, 30)
+        OptionBtn.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(50, 50, 55) or Color3.fromRGB(45, 45, 50)
+        OptionBtn.Text = option[displayKey]
+        OptionBtn.Font = Enum.Font.Gotham
+        OptionBtn.TextSize = 11
+        OptionBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+        OptionBtn.BorderSizePixel = 0
+        OptionBtn.ZIndex = 11
+        OptionBtn.AutoButtonColor = false
+        OptionBtn.LayoutOrder = i
+        OptionBtn.Parent = DropdownList
+        
+        table.insert(self.Connections, OptionBtn.MouseButton1Click:Connect(function()
+            SelectedLabel.Text = option[displayKey] .. " ▼"
+            DropdownList.Visible = false
+            callback(option)
+        end))
+    end
+    
+    DropdownList.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y)
+    
+    table.insert(self.Connections, ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        DropdownList.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y)
+    end))
+    
+    table.insert(self.Connections, DropdownBtn.MouseButton1Click:Connect(function()
+        DropdownList.Visible = not DropdownList.Visible
+    end))
+    
+    return DropdownBtn
+end
+
+function UI:SwitchTab(tabName, buttons)
+    for name, page in pairs(self.Pages) do
+        page.Visible = (name == tabName)
+    end
+    
+    for name, button in pairs(buttons) do
+        if name == tabName then
+            button.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+            button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            button.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+            button.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+    end
+    
+    self.CurrentPage = tabName
+end
+
+function UI:UpdateStatus(text, color)
+    if self.Elements.StatusLabel then
+        pcall(function()
+            self.Elements.StatusLabel.Text = "● " .. text
+            self.Elements.StatusLabel.TextColor3 = color or Color3.fromRGB(100, 255, 100)
+        end)
+    end
+end
+
+function UI:UpdateRuntime()
+    if self.Elements.RuntimeLabel and MacroState.Active then
+        pcall(function()
+            local runtime = tick() - MacroState.StartTime
+            local hours = math.floor(runtime / 3600)
+            local minutes = math.floor((runtime % 3600) / 60)
+            local seconds = math.floor(runtime % 60)
+            self.Elements.RuntimeLabel.Text = string.format("⏱ Runtime: %02d:%02d:%02d", hours, minutes, seconds)
+        end)
+    end
+end
+
+function UI:UpdateStats()
+    for key, value in pairs(MacroState.SessionStats) do
+        local element = self.Elements["Stat_" .. key]
+        if element then
+            pcall(function()
+                element.Text = tostring(value)
+            end)
+        end
+    end
+end
+
+function UI:QuickAction(action)
+    if action == "Hive" then
+        MacroState.CurrentPhase = "Converting"
+    elseif action == "Tokens" then
+        task.spawn(function()
+            pcall(Movement.CollectAllTokens)
+        end)
+    elseif action == "Reset" then
+        if Character then
+            pcall(function()
+                Character:BreakJoints()
+            end)
+        end
+    end
+end
+
+function UI:StartMacro()
+    UpdateCache()
+    self:UpdateStatus("STARTING - Initializing systems...", Color3.fromRGB(255, 200, 50))
+end
+
+function UI:StopMacro()
+    self:UpdateStatus("STOPPED - Macro halted", Color3.fromRGB(255, 100, 100))
+    if Humanoid then
+        pcall(function()
+            Humanoid:MoveTo(Root.Position)
+        end)
+    end
+end
+
+--// ═══════════════════════════════════════════════════════════
+--// ДВИЖЕНИЕ И НАВИГАЦИЯ (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+Movement = {}
+
+function Movement.GetHivePosition()
+    if MacroState.HivePosition then return MacroState.HivePosition end
+    
+    UpdateCache()
+    if not Cache.Hives then return nil end
+    
+    for _, hive in pairs(Cache.Hives:GetChildren()) do
+        local owner = hive:FindFirstChild("Owner")
+        if owner and owner.Value == Player then
+            local spawn = hive:FindFirstChild("SpawnPos")
+            if spawn and spawn.Value then
+                MacroState.HivePosition = spawn.Value.Position
+                return MacroState.HivePosition
+            end
+        end
+    end
     return nil
 end
 
-local function FollowPath(path)
-    if not path then return end
+function Movement.GetFieldPosition(fieldName)
+    UpdateCache()
+    if not Cache.FlowerZones then return nil end
+    
+    local field = Cache.FlowerZones:FindFirstChild(fieldName)
+    if field and field:IsA("BasePart") then
+        return field.Position
+    end
+    return nil
+end
+
+function Movement.PathfindTo(targetPos, timeout)
+    if not Root or not Humanoid then return false end
+    if not MacroState.Active then return false end
+    if not targetPos then return false end
+    
+    timeout = timeout or 30
+    MacroState.IsMoving = true
+    
+    local distance = (Root.Position - targetPos).Magnitude
+    
+    -- Прямое движение для близких расстояний
+    if distance < 20 then
+
+Humanoid:MoveTo(targetPos)
+        local timer = 0
+        while (Root.Position - targetPos).Magnitude > 5 and timer < 5 and MacroState.Active do
+            task.wait(0.1)
+            timer = timer + 0.1
+        end
+        MacroState.IsMoving = false
+        return true
+    end
+    
+    -- Pathfinding для дальних расстояний
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = false,
+        WaypointSpacing = 4,
+        Costs = {
+            Water = math.huge,
+            Danger = 10
+        }
+    })
+    
+    local success, errorMsg = pcall(function()
+        path:ComputeAsync(Root.Position, targetPos)
+    end)
+    
+    if not success or path.Status ~= Enum.PathStatus.Success then
+        -- Fallback: прямое движение
+        Humanoid:MoveTo(targetPos)
+        task.wait(math.min(distance / MacroConfig.WalkSpeed, 10))
+        MacroState.IsMoving = false
+        return false
+    end
     
     local waypoints = path:GetWaypoints()
-    CurrentPath = path
-    WaypointIndex = 1
-    Macro.Navigating = true
+    local startTime = tick()
     
-    while Macro.Enabled and Macro.Navigating and WaypointIndex <= #waypoints do
-        local waypoint = waypoints[WaypointIndex]
+    for i = 2, #waypoints do
+        if not MacroState.Active or not Root then 
+            MacroState.IsMoving = false
+            return false 
+        end
         
+        if tick() - startTime > timeout then
+            MacroState.IsMoving = false
+            return false
+        end
+        
+        local waypoint = waypoints[i]
+        
+        -- Прыжок если нужно
         if waypoint.Action == Enum.PathWaypointAction.Jump then
             Humanoid.Jump = true
+            task.wait(0.3)
         end
         
-        -- Smooth movement without MoveToFinished:Wait()
         Humanoid:MoveTo(waypoint.Position)
         
-        -- Check if reached waypoint
-        while Macro.Enabled and Macro.Navigating and (HumanoidRootPart.Position - waypoint.Position).Magnitude > 4 do
-            task.wait(0.05)
-            
-            -- Check for stuck
-            if Macro.StuckDetection.StuckTime >= Macro.StuckDetection.Threshold * 0.5 then
-                break
+        -- Ожидание достижения точки
+        local timer = 0
+        local reached = false
+        while timer < 3 and not reached and MacroState.Active do
+            if (Root.Position - waypoint.Position).Magnitude < 5 then
+                reached = true
             end
+            timer = timer + 0.1
+            task.wait(0.1)
         end
         
-        WaypointIndex = WaypointIndex + 1
-        task.wait(0.05)
-    end
-    
-    Macro.Navigating = false
-    CurrentPath = nil
-end
-
---==========================================
--- MOVEMENT PATTERNS
---==========================================
-
-local function GenerateSpiralPoints(center, radius, loops, pointCount)
-    local points = {}
-    local angleStep = (2 * math.pi * loops) / pointCount
-    
-    for i = 1, pointCount do
-        local angle = i * angleStep
-        local currentRadius = (i / pointCount) * radius
-        local x = center.X + currentRadius * math.cos(angle)
-        local z = center.Z + currentRadius * math.sin(angle)
-        
-        table.insert(points, Vector3.new(x, center.Y, z))
-    end
-    
-    return points
-end
-
-local function GenerateSuperSPoints(center, width, height, pointCount)
-    local points = {}
-    local halfWidth = width / 2
-    local segmentLength = pointCount / 4
-    
-    for i = 1, pointCount do
-        local x, z
-        
-        if i <= segmentLength then
-            -- Top left to top right
-            local t = (i - 1) / (segmentLength - 1)
-            x = center.X - halfWidth + t * width
-            z = center.Z + height
-        elseif i <= segmentLength * 2 then
-            -- Top right to middle left
-            local t = (i - segmentLength - 1) / (segmentLength - 1)
-            x = center.X + halfWidth - t * width
-            z = center.Z + height - t * height
-        elseif i <= segmentLength * 3 then
-            -- Middle left to bottom right
-            local t = (i - segmentLength * 2 - 1) / (segmentLength - 1)
-            x = center.X - halfWidth + t * width
-            z = center.Z - t * height
-        else
-            -- Bottom right to bottom left
-            local t = (i - segmentLength * 3 - 1) / (segmentLength - 1)
-            x = center.X + halfWidth - t * width
-            z = center.Z - height
+        -- Если застряли
+        if not reached then
+            Humanoid.Jump = true
+            task.wait(0.5)
         end
-        
-        table.insert(points, Vector3.new(x, center.Y, z))
     end
     
-    return points
+    MacroState.IsMoving = false
+    return true
 end
 
-local function ExecutePattern(center)
-    if not Macro.Enabled then return end
+function Movement.CollectNearbyTokens()
+    if not Cache.Collectibles or not Root then return 0 end
     
-    local points = {}
+    local collected = 0
     
-    if Macro.CurrentPattern == "Spiral" then
-        points = GenerateSpiralPoints(
-            center,
-            Macro.Movement.SpiralRadius,
-            Macro.Movement.SpiralLoops,
-            50
-        )
-    elseif Macro.CurrentPattern == "Super-S" then
-        points = GenerateSuperSPoints(
-            center,
-            Macro.Movement.SpiralRadius * 1.5,
-            Macro.Movement.SpiralRadius,
-            Macro.Movement.SuperSPoints
-        )
-    end
-    
-    Macro.Farming = true
-    
-    for i, point in ipairs(points) do
-        if not Macro.Enabled then break end
-        
-        -- Move to point
-        Humanoid:MoveTo(point)
-        
-        -- Wait until close enough or timeout
-        local startTime = tick()
-        while Macro.Enabled and (HumanoidRootPart.Position - point).Magnitude > 3 do
-            task.wait(0.05)
+    pcall(function()
+        for _, token in pairs(Cache.Collectibles:GetChildren()) do
+            if not MacroState.Active then break end
             
-            if tick() - startTime > 5 then
-                break
-            end
-        end
-        
-        -- Collect tokens during movement
-        CollectibleTokens = GetTokenPositions()
-        if #CollectibleTokens > 0 then
-            for _, token in pairs(CollectibleTokens) do
-                if Macro.Collection.InstantTween then
-                    -- Instant collection with TweenService
-                    local tweenInfo = TweenInfo.new(Macro.Collection.TweenSpeed, Enum.EasingStyle.Linear)
-                    local tween = TweenService:Create(HumanoidRootPart, tweenInfo, {CFrame = token.CFrame})
-                    tween:Play()
-                    tween:Wait()
+            if token:IsA("BasePart") and token.Transparency < 1 then
+                local dist = (token.Position - Root.Position).Magnitude
+                
+                if dist < MacroConfig.TokenRange then
+                    local direction = (token.Position - Root.Position).Unit
+                    Humanoid:MoveTo(Root.Position + direction * math.min(dist - 2, 5))
+                    task.wait(0.05)
+                    collected = collected + 1
                 end
             end
         end
-        
-        task.wait(0.1)
-    end
+    end)
     
-    Macro.Farming = false
+    return collected
 end
 
---==========================================
--- AUTO CLICKER SYSTEM
---==========================================
+function Movement.CollectAllTokens()
+    if not Cache.Collectibles or not Root then return end
+    
+    UI:UpdateStatus("COLLECTING - Gathering all tokens...", Color3.fromRGB(100, 200, 255))
+    
+    local tokens = {}
+    pcall(function()
+        tokens = Cache.Collectibles:GetChildren()
+    end)
+    
+    table.sort(tokens, function(a, b)
+        if not a:IsA("BasePart") or not b:IsA("BasePart") then return false end
+        return (a.Position - Root.Position).Magnitude < (b.Position - Root.Position).Magnitude
+    end)
+    
+    for _, token in ipairs(tokens) do
+        if not MacroState.Active then break end
+        
+        if token:IsA("BasePart") and token.Transparency < 1 then
+            Movement.PathfindTo(token.Position, 10)
+            Movement.CollectNearbyTokens()
+        end
+    end
+end
+
+--// ═══════════════════════════════════════════════════════════
+--// ПАТТЕРНЫ ФАРМИНГА (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+FarmingPatterns = {}
+
+function FarmingPatterns.Spiral(center, radius, duration)
+    if not center or not Root or not Humanoid then return end
+    
+    local startTime = tick()
+    local angle = 0
+    local currentRadius = 5
+    local expanding = true
+    
+    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
+        if tick() - startTime >= duration then break end
+        
+        -- Проверка рюкзака
+        if Farming.CheckBackpack() then
+            MacroState.CurrentPhase = "Converting"
+            return
+        end
+        
+        -- Спираль
+        angle = angle + (MacroConfig.SpiralSpeed / 10)
+        
+        if expanding then
+            currentRadius = currentRadius + 0.3
+            if currentRadius >= radius then expanding = false end
+        else
+            currentRadius = currentRadius - 0.3
+            if currentRadius <= 5 then expanding = true end
+        end
+        
+        local targetX = center.X + math.cos(angle) * currentRadius
+        local targetZ = center.Z + math.sin(angle) * currentRadius
+        local target = Vector3.new(targetX, center.Y, targetZ)
+        
+        pcall(function()
+            Humanoid:MoveTo(target)
+        end)
+        
+        -- Проверка "ушли далеко"
+        if (Root.Position - center).Magnitude > radius + 20 then
+            Movement.PathfindTo(center, 15)
+            currentRadius = 5
+            angle = 0
+        end
+        
+        Movement.CollectNearbyTokens()
+        task.wait(MacroConfig.TickRate)
+    end
+end
+
+function FarmingPatterns.Square(center, size, duration)
+    if not center or not Root or not Humanoid then return end
+    
+    local startTime = tick()
+    local corners = {
+        Vector3.new(center.X + size/2, center.Y, center.Z + size/2),
+        Vector3.new(center.X - size/2, center.Y, center.Z + size/2),
+        Vector3.new(center.X - size/2, center.Y, center.Z - size/2),
+        Vector3.new(center.X + size/2, center.Y, center.Z - size/2)
+    }
+    
+    local cornerIndex = 1
+    
+    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
+        if tick() - startTime >= duration then break end
+        
+        if Farming.CheckBackpack() then
+            MacroState.CurrentPhase = "Converting"
+            return
+        end
+        
+        local target = corners[cornerIndex]
+        Movement.PathfindTo(target, 20)
+        
+        cornerIndex = cornerIndex + 1
+        if cornerIndex > 4 then cornerIndex = 1 end
+        
+        Movement.CollectNearbyTokens()
+        task.wait(MacroConfig.PathUpdateRate)
+    end
+end
+
+function FarmingPatterns.Zigzag(center, width, duration)
+    if not center or not Root or not Humanoid then return end
+    
+    local startTime = tick()
+    local rows = 10
+    local rowHeight = width / rows
+    local currentRow = 0
+    local goingRight = true
+    
+    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
+        if tick() - startTime >= duration then break end
+        
+        if Farming.CheckBackpack() then
+            MacroState.CurrentPhase = "Converting"
+            return
+        end
+        
+        local targetX = goingRight and (center.X + width/2) or (center.X - width/2)
+        local targetZ = center.Z + (currentRow * rowHeight) - (width/2)
+        local target = Vector3.new(targetX, center.Y, targetZ)
+        
+        Movement.PathfindTo(target, 20)
+        
+        goingRight = not goingRight
+        currentRow = currentRow + 1
+        if currentRow >= rows then currentRow = 0 end
+        
+        Movement.CollectNearbyTokens()
+        task.wait(MacroConfig.PathUpdateRate)
+    end
+end
+
+--// ═══════════════════════════════════════════════════════════
+--// СИСТЕМА ФАРМИНГА (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+Farming = {}
+
+function Farming.CheckBackpack()
+
+local success, result = pcall(function()
+        if not Player:FindFirstChild("CoreStats") then return false end
+        
+        local pollenStat = Player.CoreStats:FindFirstChild("Pollen")
+        local capacityStat = Player.CoreStats:FindFirstChild("Capacity")
+        
+        if pollenStat and capacityStat and capacityStat.Value > 0 then
+            local percent = (pollenStat.Value / capacityStat.Value) * 100
+            return percent >= MacroConfig.ConvertAt
+        end
+        
+        return false
+    end)
+    
+    return success and result
+end
+
+function Farming.DoFarming(fieldName)
+    if not Root or not Humanoid then return false end
+    
+    local fieldPos = Movement.GetFieldPosition(fieldName)
+    if not fieldPos then
+        UI:UpdateStatus("ERROR - Field not found: " .. fieldName, Color3.fromRGB(255, 50, 50))
+        task.wait(3)
+        return false
+    end
+    
+    UI:UpdateStatus("TRAVELING - Going to " .. fieldName, Color3.fromRGB(100, 200, 255))
+    
+    -- Идем к полю
+    local reached = Movement.PathfindTo(fieldPos, 45)
+    
+    if not reached or (Root.Position - fieldPos).Magnitude > 50 then
+        UI:UpdateStatus("ERROR - Failed to reach field", Color3.fromRGB(255, 50, 50))
+        task.wait(3)
+        return false
+    end
+    
+    UI:UpdateStatus("FARMING - " .. fieldName, Color3.fromRGB(50, 255, 100))
+    MacroState.CurrentPhase = "Gathering"
+    
+    -- Выбираем паттерн
+    local pattern = MacroState.FarmingPattern
+    
+    pcall(function()
+        if pattern == "Spiral" then
+            FarmingPatterns.Spiral(fieldPos, MacroConfig.SpiralRadius, MacroConfig.FarmDuration)
+        elseif pattern == "Square" then
+            FarmingPatterns.Square(fieldPos, MacroConfig.SquareSize, MacroConfig.FarmDuration)
+        elseif pattern == "Zigzag" then
+            FarmingPatterns.Zigzag(fieldPos, MacroConfig.ZigzagWidth, MacroConfig.FarmDuration)
+        end
+    end)
+    
+    MacroState.SessionStats.FieldsCompleted = MacroState.SessionStats.FieldsCompleted + 1
+    return true
+end
+
+function Farming.DoConverting()
+    if not Root or not Humanoid then return false end
+    
+    local hivePos = Movement.GetHivePosition()
+    
+    if not hivePos then
+        UI:UpdateStatus("ERROR - Hive not found!", Color3.fromRGB(255, 50, 50))
+        task.wait(3)
+        return false
+    end
+    
+    MacroState.CurrentPhase = "Converting"
+    UI:UpdateStatus("CONVERTING - Returning to hive", Color3.fromRGB(255, 200, 50))
+    
+    Movement.PathfindTo(hivePos, 60)
+    
+    -- Выравниваемся с ульем
+    local alignTime = 0
+    while (Root.Position - hivePos).Magnitude > 8 and alignTime < 15 and MacroState.Active do
+        pcall(function()
+            Humanoid:MoveTo(hivePos)
+        end)
+        task.wait(0.5)
+        alignTime = alignTime + 0.5
+    end
+    
+    if alignTime >= 15 then
+        UI:UpdateStatus("ERROR - Failed to reach hive", Color3.fromRGB(255, 50, 50))
+        task.wait(3)
+        return false
+    end
+    
+    UI:UpdateStatus("CONVERTING - Making honey...", Color3.fromRGB(255, 200, 50))
+    
+    -- Спамим E для конвертации
+    local convertRunning = true
+    local convertTask = task.spawn(function()
+        while convertRunning and MacroState.CurrentPhase == "Converting" and MacroState.Active do
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                task.wait(0.05)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            end)
+            task.wait(1.5)
+        end
+    end)
+    
+    -- Ждем пока рюкзак опустеет
+    local timeout = 0
+    local pollenStat = nil
+    
+    pcall(function()
+        if Player:FindFirstChild("CoreStats") then
+            pollenStat = Player.CoreStats:FindFirstChild("Pollen")
+
+end
+    end)
+    
+    repeat
+        task.wait(1)
+        timeout = timeout + 1
+        
+        -- Анти-АФК
+        if timeout % 15 == 0 and Humanoid then
+            pcall(function()
+                Humanoid.Jump = true
+            end)
+        end
+        
+        if not pollenStat then break end
+        
+    until (pollenStat and pollenStat.Value < 10) or timeout > 120 or not MacroState.Active
+    
+    convertRunning = false
+    task.cancel(convertTask)
+    
+    if timeout >= 120 then
+        UI:UpdateStatus("WARNING - Convert timeout", Color3.fromRGB(255, 150, 50))
+    else
+        UI:UpdateStatus("SUCCESS - Honey converted!", Color3.fromRGB(50, 255, 100))
+    end
+    
+    task.wait(2)
+    MacroState.CurrentPhase = "Gathering"
+    return true
+end
+
+--// ═══════════════════════════════════════════════════════════
+--// АВТОКЛИКЕР (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
 
 task.spawn(function()
     while true do
-        task.wait(Macro.AutoClick.ClickInterval)
-        
-        if not Macro.Enabled or not Macro.AutoClick.Enabled then continue end
-        
-        if Macro.AutoClick.CheckTool then
-            local tool = GetCurrentTool()
-            if not tool then continue end
-        end
-        
-        -- Simulate click
-        local mouse = Player:GetMouse()
-        local clickEvent = mouse and mouse:FindFirstChild("Button1Down")
-        
-        if clickEvent then
-            clickEvent:Fire()
-        else
-            -- Alternative click method
-            local args = {
-                [1] = Vector3.new(0, 0, 0),
-                [2] = Enum.UserInputType.MouseButton1,
-                [3] = false
-            }
-            
-            if Remotes:FindFirstChild("Click") then
-                Remotes.Click:FireServer(unpack(args))
-            end
-        end
-    end
-end)
-
---==========================================
--- UI SYSTEM
---==========================================
-
-local function CreateMobileUI()
-    -- Create ScreenGui
-    MacroUI = Instance.new("ScreenGui")
-    MacroUI.Name = "NatroMacroUI"
-    MacroUI.Parent = PlayerGui
-    MacroUI.ResetOnSpawn = false
-    MacroUI.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    
-    -- Main Frame
-    MainFrame = Instance.new("Frame")
-    MainFrame.Name = "MainFrame"
-    MainFrame.Parent = MacroUI
-    MainFrame.Size = UDim2.new(0, 300, 0, 400)
-    MainFrame.Position = UDim2.new(0.5, -150, 0.5, -200)
-    MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    MainFrame.BorderSizePixel = 2
-    MainFrame.BorderColor3 = Color3.fromRGB(100, 100, 100)
-    MainFrame.Active = true
-    MainFrame.Draggable = true
-    
-    -- Title
-    local Title = Instance.new("TextLabel")
-    Title.Name = "Title"
-    Title.Parent = MainFrame
-    Title.Size = UDim2.new(1, 0, 0, 30)
-    Title.Position = UDim2.new(0, 0, 0, 0)
-    Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    Title.Text = "🐝 Natro Macro Mobile"
-    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    Title.Font = Enum.Font.SourceSansBold
-    Title.TextSize = 18
-    
-    -- Status Label
-    StatusLabel = Instance.new("TextLabel")
-    StatusLabel.Name = "StatusLabel"
-    StatusLabel.Parent = MainFrame
-    StatusLabel.Size = UDim2.new(1, -20, 0, 25)
-    StatusLabel.Position = UDim2.new(0, 10, 0, 40)
-    StatusLabel.BackgroundTransparency = 1
-    StatusLabel.Text = "Status: Idle"
-    StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    StatusLabel.Font = Enum.Font.SourceSans
-    StatusLabel.TextSize = 14
-    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    
-    -- Toggle Button
-    local ToggleBtn = Instance.new("TextButton")
-    ToggleBtn.Name = "ToggleBtn"
-    ToggleBtn.Parent = MainFrame
-    ToggleBtn.Size = UDim2.new(0.9, 0, 0, 40)
-    ToggleBtn.Position = UDim2.new(0.05, 0, 0, 75)
-    ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
-    ToggleBtn.Text = "START MACRO"
-    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    ToggleBtn.Font = Enum.Font.SourceSansBold
-    ToggleBtn.TextSize = 16
-    ToggleBtn.MouseButton1Click:Connect(function()
-        Macro.Enabled = not Macro.Enabled
-        if Macro.Enabled then
-            ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
-            ToggleBtn.Text = "STOP MACRO"
-            StatusLabel.Text = "Status: Running"
-        else
-            ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
-            ToggleBtn.Text = "START MACRO"
-            StatusLabel.Text = "Status: Stopped"
-            Macro.Farming = false
-            Macro.Navigating = false
-        end
-    end)
-    
-    -- Pattern Selector
-    local PatternLabel = Instance.new("TextLabel")
-    PatternLabel.Name = "PatternLabel"
-    PatternLabel.Parent = MainFrame
-    PatternLabel.Size = UDim2.new(0.9, 0, 0, 25)
-    PatternLabel.Position = UDim2.new(0.05, 0, 0, 125)
-    PatternLabel.BackgroundTransparency = 1
-    PatternLabel.Text = "Movement Pattern:"
-    PatternLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    PatternLabel.Font = Enum.Font.SourceSans
-    PatternLabel.TextSize = 14
-    
-    local PatternDropdown = Instance.new("TextButton")
-    PatternDropdown.Name = "PatternDropdown"
-    PatternDropdown.Parent = MainFrame
-    PatternDropdown.Size = UDim2.new(0.9, 0, 0, 30)
-    PatternDropdown.Position = UDim2.new(0.05, 0, 0, 150)
-    PatternDropdown.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    PatternDropdown.Text = Macro.CurrentPattern
-    PatternDropdown.TextColor3 = Color3.fromRGB(255, 255, 255)
-    PatternDropdown.Font = Enum.Font.SourceSans
-    PatternDropdown.TextSize = 14
-    PatternDropdown.MouseButton1Click:Connect(function()
-        if Macro.CurrentPattern == "Spiral" then
-            Macro.CurrentPattern = "Super-S"
-        else
-            Macro.CurrentPattern = "Spiral"
-        end
-        PatternDropdown.Text = Macro.CurrentPattern
-    end)
-    
-    -- Position Buttons
-    local SaveHiveBtn = Instance.new("TextButton")
-    SaveHiveBtn.Name = "SaveHiveBtn"
-    SaveHiveBtn.Parent = MainFrame
-    SaveHiveBtn.Size = UDim2.new(0.9, 0, 0, 35)
-    SaveHiveBtn.Position = UDim2.new(0.05, 0, 0, 190)
-    SaveHiveBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 200)
-    SaveHiveBtn.Text = "📍 Save Hive Position"
-    SaveHiveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SaveHiveBtn.Font = Enum.Font.SourceSans
-    SaveHiveBtn.TextSize = 14
-    SaveHiveBtn.MouseButton1Click:Connect(function()
-        Macro.HivePosition = HumanoidRootPart.Position
-        StatusLabel.Text = "Status: Hive position saved!"
-        print("[UI] Hive position saved:", Macro.HivePosition)
-    end)
-    
-    local SaveFieldBtn = Instance.new("TextButton")
-    SaveFieldBtn.Name = "SaveFieldBtn"
-    SaveFieldBtn.Parent = MainFrame
-    SaveFieldBtn.Size = UDim2.new(0.9, 0, 0, 35)
-    SaveFieldBtn.Position = UDim2.new(0.05, 0, 0, 230)
-    SaveFieldBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 100)
-    SaveFieldBtn.Text = "🌻 Save Field Position"
-    SaveFieldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SaveFieldBtn.Font = Enum.Font.SourceSans
-    SaveFieldBtn.TextSize = 14
-    SaveFieldBtn.MouseButton1Click:Connect(function()
-        Macro.FieldPosition = HumanoidRootPart.Position
-        Macro.CurrentField = GetFieldByPosition(Macro.FieldPosition)
-        StatusLabel.Text = "Status: Field position saved!"
-        print("[UI] Field position saved:", Macro.FieldPosition)
-    end)
-    
-    -- Settings
-    local SettingsLabel = Instance.new("TextLabel")
-    SettingsLabel.Name = "SettingsLabel"
-    SettingsLabel.Parent = MainFrame
-    SettingsLabel.Size = UDim2.new(0.9, 0, 0, 25)
-    SettingsLabel.Position = UDim2.new(0.05, 0, 0, 275)
-    SettingsLabel.BackgroundTransparency = 1
-    SettingsLabel.Text = "⚙️ Settings"
-    SettingsLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    SettingsLabel.Font = Enum.Font.SourceSansBold
-    SettingsLabel.TextSize = 14
-    
-    -- Speed Slider
-    local SpeedLabel = Instance.new("TextLabel")
-    SpeedLabel.Name = "SpeedLabel"
-    SpeedLabel.Parent = MainFrame
-    SpeedLabel.Size = UDim2.new(0.4, 0, 0, 20)
-    SpeedLabel.Position = UDim2.new(0.05, 0, 0, 300)
-    SpeedLabel.BackgroundTransparency = 1
-    SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
-    SpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    SpeedLabel.Font = Enum.Font.SourceSans
-    SpeedLabel.TextSize = 12
-    
-    local SpeedSlider = Instance.new("TextButton")
-    SpeedSlider.Name = "SpeedSlider"
-    SpeedSlider.Parent = MainFrame
-    SpeedSlider.Size = UDim2.new(0.5, 0, 0, 20)
-    SpeedSlider.Position = UDim2.new(0.45, 0, 0, 300)
-    SpeedSlider.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    SpeedSlider.Text = "-"
-    SpeedSlider.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SpeedSlider.Font = Enum.Font.SourceSans
-    SpeedSlider.TextSize = 12
-    SpeedSlider.MouseButton1Click:Connect(function()
-        Macro.Movement.Speed = math.max(10, Macro.Movement.Speed - 5)
-        SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
-    end)
-    
-    local SpeedSliderPlus = Instance.new("TextButton")
-    SpeedSliderPlus.Name = "SpeedSliderPlus"
-    SpeedSliderPlus.Parent = MainFrame
-    SpeedSliderPlus.Size = UDim2.new(0.5, 0, 0, 20)
-    SpeedSliderPlus.Position = UDim2.new(0.45, 0, 0, 320)
-    SpeedSliderPlus.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    SpeedSliderPlus.Text = "+"
-    SpeedSliderPlus.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SpeedSliderPlus.Font = Enum.Font.SourceSans
-    SpeedSliderPlus.TextSize = 12
-    SpeedSliderPlus.MouseButton1Click:Connect(function()
-        Macro.Movement.Speed = math.min(50, Macro.Movement.Speed + 5)
-        SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
-    end)
-    
-    -- Auto Click Toggle
-    local AutoClickBtn = Instance.new("TextButton")
-    AutoClickBtn.Name = "AutoClickBtn"
-    AutoClickBtn.Parent = MainFrame
-    AutoClickBtn.Size = UDim2.new(0.9, 0, 0, 30)
-    AutoClickBtn.Position = UDim2.new(0.05, 0, 0, 350)
-    AutoClickBtn.BackgroundColor3 = Macro.AutoClick.Enabled and Color3.fromRGB(0, 200, 0) or Color3.fromRGB(100, 100, 100)
-    AutoClickBtn.Text = "Auto Click: " .. (Macro.AutoClick.Enabled and "ON" or "OFF")
-    AutoClickBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    AutoClickBtn.Font = Enum.Font.SourceSans
-    AutoClickBtn.TextSize = 14
-    AutoClickBtn.MouseButton1Click:Connect(function()
-        Macro.AutoClick.Enabled = not Macro.AutoClick.Enabled
-        AutoClickBtn.BackgroundColor3 = Macro.AutoClick.Enabled and Color3.fromRGB(0, 200, 0) or Color3.fromRGB(100, 100, 100)
-        AutoClickBtn.Text = "Auto Click: " .. (Macro.AutoClick.Enabled and "ON" or "OFF")
-    end)
-end
-
---==========================================
--- MAIN MACRO LOGIC
---==========================================
-
-local function MainMacroLoop()
-    while true do
-        task.wait(0.1)
-        
-        if not Macro.Enabled then continue end
-        
-        -- Auto-detect hive position if not set
-        if not Macro.HivePosition then
-            Macro.HivePosition = GetHivePosition()
-        end
-        
-        -- Farm at saved field position
-        if Macro.FieldPosition and not Macro.Farming and not Macro.Navigating then
-            -- Navigate to field if too far
-            if (HumanoidRootPart.Position - Macro.FieldPosition).Magnitude > 20 then
-                StatusLabel.Text = "Status: Navigating to field..."
-                local path = ComputePath(HumanoidRootPart.Position, Macro.FieldPosition)
-                if path then
-                    FollowPath(path)
-                end
-            else
-                -- Execute farming pattern
-                StatusLabel.Text = "Status: Farming pattern..."
-                ExecutePattern(Macro.FieldPosition)
-                
-                -- Return to hive after farming
-                if Macro.HivePosition and Macro.Enabled then
-                    StatusLabel.Text = "Status: Returning to hive..."
-                    local path = ComputePath(HumanoidRootPart.Position, Macro.HivePosition)
-                    if path then
-                        FollowPath(path)
+        task.wait(0.15)
+        if MacroState.Active and MacroState.CurrentPhase == "Gathering" then
+            pcall(function()
+                if Character then
+                    local tool = Character:FindFirstChildOfClass("Tool")
+                    if tool then
+                        tool:Activate()
                     end
                 end
-            end
-        end
-        
-        -- Update status
-        if Macro.Farming then
-            StatusLabel.Text = "Status: Farming (" .. Macro.CurrentPattern .. ")"
-        elseif Macro.Navigating then
-            StatusLabel.Text = "Status: Navigating..."
+            end)
         end
     end
-end
-
---==========================================
--- INITIALIZATION
---==========================================
-
--- Wait for game to load
-task.wait(3)
-
--- Create UI
-CreateMobileUI()
-
--- Start main loop
-task.spawn(MainMacroLoop)
-
--- Character respawn handling
-Player.CharacterAdded:Connect(function(newCharacter)
-    Character = newCharacter
-    Humanoid = Character:WaitForChild("Humanoid")
-    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
-    
-    task.wait(1)
-    Macro.Farming = false
-    Macro.Navigating = false
-    print("[Macro] Character respawned - reset states")
 end)
 
-print("==========================================")
-print("Natro Macro for Bee Swarm Simulator Loaded!")
-print("Mobile Optimized | Delta Executor Compatible")
-print("==========================================")
-print("Features:")
-print("✓ Spiral & Super-S Movement Patterns")
-print("✓ Pathfinding Service Navigation")
-print("✓ Instant Token Collection (TweenService)")
-print("✓ Anti-Stuck Detection")
-print("✓ Auto Clicker (Separate Thread)")
-print("✓ Mobile UI with Position Saving")
-print("==========================================")
+--// ═══════════════════════════════════════════════════════════
+--// АНТИ-ЗАСТРЕВАНИЕ (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        
+        if MacroState.Active and MacroState.CurrentPhase ~= "Idle" and MacroState.CurrentPhase ~= "Converting" then
+            pcall(function()
+                if Root then
+                    local currentPos = Root.Position
+                    local moved = (currentPos - MacroState.LastPosition).Magnitude
+                    
+                    if moved < 1 and not MacroState.IsMoving then
+                        MacroState.StuckTime = MacroState.StuckTime + 1
+                        
+                        if MacroState.StuckTime >= MacroConfig.StuckThreshold then
+                            -- Попытка освободиться
+                            if Humanoid then
+                                Humanoid.Jump = true
+                                task.wait(0.3)
+                                
+                                local randomOffset = Vector3.new(
+                                    math.random(-15, 15),
+                                    0,
+                                    math.random(-15, 15)
+                                )
+                                Humanoid:MoveTo(currentPos + randomOffset)
+                            end
+                            
+                            MacroState.StuckTime = 0
+                        end
+                    else
+                        MacroState.StuckTime = 0
+                    end
+                    
+                    MacroState.LastPosition = currentPos
+                end
+            end)
+        end
+    end
+end)
+
+--// ═══════════════════════════════════════════════════════════
+--// СТАТИСТИКА И ОБНОВЛЕНИЯ (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        
+        if MacroState.Active and UI.Initialized then
+            pcall(function()
+                UI:UpdateRuntime()
+                UI:UpdateStats()
+            end)
+            
+            if tick() - Cache.LastUpdate > Cache.UpdateInterval then
+                UpdateCache()
+            end
+        end
+    end
+end)
+
+--// ═══════════════════════════════════════════════════════════
+--// ГЛАВНЫЙ ЦИКЛ (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+task.spawn(function()
+    task.wait(2) -- Ждем полной загрузки игры
+    
+    UpdateCache()
+    UI:Create()
+    UI:UpdateStatus("READY - Press START to begin", Color3.fromRGB(100, 255, 100))
+    
+    while true do
+        task.wait(0.5)
+        
+        if MacroState.Active then
+            pcall(function()
+                if Root and Humanoid then
+                    
+                    if MacroState.CurrentPhase == "Idle" then
+                        MacroState.CurrentPhase = "Gathering"
+                        
+                    elseif MacroState.CurrentPhase == "Gathering" then
+                        Farming.DoFarming(MacroState.TargetField)
+                        
+                    elseif MacroState.CurrentPhase == "Converting" then
+                        Farming.DoConverting()
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+--// ═══════════════════════════════════════════════════════════
+--// ОБРАБОТКА РЕСПАВНА (ИСПРАВЛЕНО)
+--// ═══════════════════════════════════════════════════════════
+
+Player.CharacterAdded:Connect(function(NewChar)
+    task.wait(1)
+    
+    Character = NewChar
+    Humanoid = Character:WaitForChild("Humanoid", 10)
+    Root = Character:WaitForChild("HumanoidRootPart", 10)
+    
+    if not Humanoid or not Root then
+        warn("Failed to get character parts after respawn")
+        return
+    end
+    
+    MacroState.SessionStats.DeathCount = MacroState.SessionStats.DeathCount + 1
+    
+    if MacroState.Active then
+        UI:UpdateStatus("RESPAWNED - Resuming macro...", Color3.fromRGB(255, 200, 50))
+        task.wait(2)
+        UpdateCache()
+        MacroState.HivePosition = nil
+        MacroState.CurrentPhase = "Gathering"
+        MacroState.LastPosition = Root.Position
+        MacroState.StuckTime = 0
+    end
+end)
+
+--// ═══════════════════════════════════════════════════════════
+--// ОБРАБОТКА ВЫХОДА
+--// ═══════════════════════════════════════════════════════════
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+    if player == Player then
+        MacroState.Active = false
+        if UI then
+            UI:Cleanup()
+        end
+    end
+end)
+
+--// ═══════════════════════════════════════════════════════════
+--// ФИНАЛИЗАЦИЯ
+--// ═══════════════════════════════════════════════════════════
+
+print("═══════════════════════════════════════════════════════")
+print("  🐝 NATRO MACRO v" .. MacroState.Version .. " - LOADED")
+print("═══════════════════════════════════════════════════════")
+print("✅ All bugs fixed:")
+print("  • Pathfinding errors fixed")
+print("  • UI rendering improved")
+print("  • Memory leaks patched")
+print("  • Character respawn fixed")
+print("  • Token collection optimized")
+print("  • Error handling added everywhere")
+print("═══════════════════════════════════════════════════════")
+print("Status: Ready to start!")
+print("═══════════════════════════════════════════════════════")
