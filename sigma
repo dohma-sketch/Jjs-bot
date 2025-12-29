@@ -1,1081 +1,699 @@
--- ═══════════════════════════════════════════════════════════
--- 💎 JUJUTSU SHENANIGANS BOT - FLAWLESS v8.0
--- ═══════════════════════════════════════════════════════════
--- ✅ ВСЕ БАГИ ИСПРАВЛЕНЫ - РАБОТАЕТ 100%
--- 🛡️ Полная защита от крашей
--- ⚡ Оптимизировано до 5ms/цикл
--- 🎯 Идеальная точность боя
--- ═══════════════════════════════════════════════════════════
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 
--- Безопасное получение сервисов
-local function getService(serviceName)
-    local success, service = pcall(function()
-        return game:GetService(serviceName)
-    end)
-    return success and service or nil
-end
+--// Local Player
+local Player = Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+local PlayerGui = Player:WaitForChild("PlayerGui")
 
-local Players = getService("Players")
-local RunService = getService("RunService")
-local Workspace = getService("Workspace") or workspace
-local VIM = getService("VirtualInputManager")
+--// Game-specific Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local Events = ReplicatedStorage:WaitForChild("Events")
 
-if not Players or not Workspace then
-    warn("❌ Critical services not available")
-    return
-end
-
-local LocalPlayer = Players.LocalPlayer
-if not LocalPlayer then
-    warn("❌ LocalPlayer not found")
-    return
-end
-
-local char, humanoid, hrp, camera
-
--- ═══════════════════════════════════════════════════════════
--- ИНИЦИАЛИЗАЦИЯ ПЕРСОНАЖА
--- ═══════════════════════════════════════════════════════════
-
-local function isValid()
-    if not char or not char.Parent then return false end
-    if not humanoid or not humanoid.Parent then return false end
-    if humanoid.Health <= 0 then return false end
-    if not hrp or not hrp.Parent then return false end
-    return true
-end
-
-local function initCharacter()
-    local success, result = pcall(function()
-        if not LocalPlayer then return false end
-        
-        char = LocalPlayer.Character
-        if not char or not char.Parent then return false end
-        
-        humanoid = char:FindFirstChildOfClass("Humanoid")
-        hrp = char:FindFirstChild("HumanoidRootPart")
-        camera = Workspace.CurrentCamera
-        
-        if humanoid and hrp and camera then
-            return true
-        end
-        return false
-    end)
-    
-    return success and result
-end
-
-if LocalPlayer then
-    local connection = LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(1)
-        initCharacter()
-    end)
-end
-
--- Первая инициализация
-task.wait(0.5)
-initCharacter()
-
--- ═══════════════════════════════════════════════════════════
--- УТИЛИТЫ
--- ═══════════════════════════════════════════════════════════
-
-local function safeNumber(val, default)
-    default = default or 0
-    if type(val) ~= "number" then return default end
-    if val ~= val then return default end -- NaN check
-    if val == math.huge or val == -math.huge then return default end
-    return val
-end
-
-local function safeVector3(val, default)
-    default = default or Vector3.zero
-    if typeof(val) ~= "Vector3" then return default end
-    
-    local x = safeNumber(val.X, 0)
-    local y = safeNumber(val.Y, 0)
-    local z = safeNumber(val.Z, 0)
-    
-    return Vector3.new(x, y, z)
-end
-
-local function safeClamp(val, min, max)
-    val = safeNumber(val, min)
-    min = safeNumber(min, 0)
-    max = safeNumber(max, 100)
-    return math.clamp(val, min, max)
-end
-
-local function inBounds(pos)
-    pos = safeVector3(pos)
-    if pos.Y < -200 or pos.Y > 1000 then return false end
-    if math.abs(pos.X) > 20000 then return false end
-    if math.abs(pos.Z) > 20000 then return false end
-    return true
-end
-
-local function safeDistance(a, b)
-    a = safeVector3(a)
-    b = safeVector3(b)
-    
-    local success, dist = pcall(function()
-        return (a - b).Magnitude
-    end)
-    
-    if success then
-        return safeNumber(dist, math.huge)
-    end
-    return math.huge
-end
-
-local function safeNormalize(vec)
-    vec = safeVector3(vec, Vector3.new(0, 0, 1))
-    
-    if vec.Magnitude < 0.001 then
-        return Vector3.new(0, 0, 1)
-    end
-    
-    local success, result = pcall(function()
-        return vec.Unit
-    end)
-    
-    return success and result or Vector3.new(0, 0, 1)
-end
-
--- ═══════════════════════════════════════════════════════════
--- НАВИГАЦИЯ
--- ═══════════════════════════════════════════════════════════
-
-local Navigation = {
-    grid = 5,
-    cache = {},
-    cacheMaxSize = 200,
+--// Macro Settings
+local Macro = {
+    Enabled = false,
+    Farming = false,
+    Navigating = false,
+    CurrentPattern = "Spiral", -- "Spiral" or "Super-S"
+    FarmPoints = {},
+    HivePosition = nil,
+    FieldPosition = nil,
+    CurrentField = nil,
+    StuckDetection = {
+        Enabled = true,
+        LastPosition = nil,
+        StuckTime = 0,
+        Threshold = 1.0,
+        CheckInterval = 0.1
+    },
+    Movement = {
+        Speed = 30,
+        SpiralRadius = 30,
+        SpiralLoops = 3,
+        SuperSPoints = 8,
+        PointSpacing = 5
+    },
+    Collection = {
+        InstantTween = true,
+        TweenSpeed = 0.1,
+        CollectionDistance = 15
+    },
+    AutoClick = {
+        Enabled = true,
+        ClickInterval = 0.1,
+        CheckTool = true
+    }
 }
 
-function Navigation:worldToGrid(pos)
-    pos = safeVector3(pos)
-    return Vector3.new(
-        math.floor(pos.X / self.grid + 0.5),
-        math.floor(pos.Y / self.grid + 0.5),
-        math.floor(pos.Z / self.grid + 0.5)
-    )
+--// UI Elements
+local MacroUI = nil
+local MainFrame = nil
+local StatusLabel = nil
+
+--// Pathfinding Variables
+local CurrentPath = nil
+local PathComputing = false
+local WaypointIndex = 1
+
+--// Token Collection Variables
+local CollectibleTokens = {}
+local LastTokenCollection = 0
+
+--// Utility Functions
+local function GetCurrentTool()
+    local backpack = Player:FindFirstChild("Backpack")
+    local tool = nil
+    
+    if Humanoid and Humanoid:FindFirstChildOfClass("Tool") then
+        tool = Humanoid:FindFirstChildOfClass("Tool")
+    elseif backpack and backpack:FindFirstChildOfClass("Tool") then
+        tool = backpack:FindFirstChildOfClass("Tool")
+    end
+    
+    return tool
 end
 
-function Navigation:gridToWorld(grid)
-    grid = safeVector3(grid)
-    return grid * self.grid
-end
-
-function Navigation:isWalkable(pos)
-    if not isValid() then return false end
-    if not inBounds(pos) then return false end
+local function GetTokenPositions()
+    local tokens = {}
+    local collectibles = Workspace:FindFirstChild("Collectibles")
     
-    local walkable = false
-    
-    pcall(function()
-        local params = RaycastParams.new()
-        params.FilterDescendantsInstances = {char}
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.IgnoreWater = true
-        
-        local ray = Workspace:Raycast(
-            pos + Vector3.new(0, 5, 0),
-            Vector3.new(0, -20, 0),
-            params
-        )
-        
-        if ray and ray.Distance then
-            local dist = safeNumber(ray.Distance, 0)
-            if dist > 2 and dist < 18 then
-                walkable = true
+    if collectibles then
+        for _, token in pairs(collectibles:GetChildren()) do
+            if token:IsA("BasePart") and (token.Position - HumanoidRootPart.Position).Magnitude <= Macro.Collection.CollectionDistance then
+                table.insert(tokens, token)
             end
         end
-    end)
+    end
     
-    return walkable
+    return tokens
 end
 
-function Navigation:moveTo(targetPos, speed)
-    if not isValid() then return false end
-    if not inBounds(targetPos) then return false end
+local function GetFieldByPosition(position)
+    local fields = Workspace:FindFirstChild("FieldZones")
+    if not fields then return nil end
     
-    speed = safeClamp(speed or 1, 0.1, 2)
+    local closestField = nil
+    local closestDistance = math.huge
     
-    local success = pcall(function()
-        local direction = safeNormalize(targetPos - hrp.Position)
-        local moveTarget = hrp.Position + direction * 10 * speed
-        
-        humanoid:MoveTo(moveTarget)
-        
-        if camera and targetPos then
-            local targetCF = CFrame.new(camera.CFrame.Position, targetPos)
-            camera.CFrame = camera.CFrame:Lerp(targetCF, 0.2)
+    for _, field in pairs(fields:GetChildren()) do
+        if field:IsA("BasePart") then
+            local distance = (field.Position - position).Magnitude
+            if distance < closestDistance then
+                closestDistance = distance
+                closestField = field
+            end
         end
-    end)
+    end
     
-    return success
+    return closestField
 end
 
--- ═══════════════════════════════════════════════════════════
--- БОЕВАЯ СИСТЕМА
--- ═══════════════════════════════════════════════════════════
-
-local Combat = {
-    lastCombo = 0,
-    lastSkill = {0, 0, 0, 0},
-    lastDodge = 0,
-    comboCooldown = 1,
-    skillCooldowns = {5, 6, 7, 8},
-    dodgeCooldown = 0.8,
-}
-
-function Combat:canCombo()
-    if not isValid() then return false end
-    if not VIM then return false end
-    return (tick() - self.lastCombo) > self.comboCooldown
-end
-
-function Combat:canSkill(slot)
-    if not isValid() then return false end
-    if not VIM then return false end
-    slot = safeClamp(slot, 1, 4)
-    return (tick() - self.lastSkill[slot]) > self.skillCooldowns[slot]
-end
-
-function Combat:canDodge()
-    if not isValid() then return false end
-    return (tick() - self.lastDodge) > self.dodgeCooldown
-end
-
-function Combat:combo(target)
-    if not self:canCombo() then return false end
-    if not target or not target.Parent then return false end
+local function GetHivePosition()
+    local hives = Workspace:FindFirstChild("Hives")
+    if not hives then return nil end
     
-    local success = pcall(function()
-        local targetHead = target:FindFirstChild("Head")
-        if targetHead and camera then
-            camera.CFrame = CFrame.new(camera.CFrame.Position, targetHead.Position)
+    for _, hive in pairs(hives:GetChildren()) do
+        if hive:FindFirstChild("Owner") and hive.Owner.Value == Player then
+            return hive.Position
         end
+    end
+    
+    return nil
+end
+
+--==========================================
+-- STUCK DETECTION SYSTEM
+--==========================================
+
+task.spawn(function()
+    while true do
+        task.wait(Macro.StuckDetection.CheckInterval)
         
-        for i = 1, 3 do
-            if not isValid() then break end
-            if not VIM then break end
+        if not Macro.Enabled or not Macro.StuckDetection.Enabled then continue end
+        
+        local currentPos = HumanoidRootPart.Position
+        
+        if Macro.StuckDetection.LastPosition then
+            local distance = (currentPos - Macro.StuckDetection.LastPosition).Magnitude
             
-            VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-            task.wait(0.15)
-        end
-        
-        self.lastCombo = tick()
-    end)
-    
-    return success
-end
-
-function Combat:useSkill(slot, target)
-    if not self:canSkill(slot) then return false end
-    
-    local keys = {
-        Enum.KeyCode.One,
-        Enum.KeyCode.Two,
-        Enum.KeyCode.Three,
-        Enum.KeyCode.Four
-    }
-    
-    slot = safeClamp(slot, 1, 4)
-    
-    local success = pcall(function()
-        if target and target:FindFirstChild("Head") and camera then
-            camera.CFrame = CFrame.new(camera.CFrame.Position, target.Head.Position)
-        end
-        
-        if VIM then
-            VIM:SendKeyEvent(true, keys[slot], false, game)
-            task.wait(0.05)
-            VIM:SendKeyEvent(false, keys[slot], false, game)
-        end
-        
-        self.lastSkill[slot] = tick()
-    end)
-    
-    return success
-end
-
-function Combat:dodge()
-    if not self:canDodge() then return false end
-    if not isValid() then return false end
-    
-    local success = pcall(function()
-        local dir = math.random() > 0.5 and 1 or -1
-        local dodgeVec = hrp.CFrame.RightVector * dir * 10
-        
-        hrp.CFrame = hrp.CFrame + dodgeVec
-        humanoid.Jump = true
-        
-        self.lastDodge = tick()
-    end)
-    
-    return success
-end
-
--- ═══════════════════════════════════════════════════════════
--- STATE MACHINE
--- ═══════════════════════════════════════════════════════════
-
-local FSM = {
-    state = "IDLE",
-    target = nil,
-    searchRadius = 100,
-    meleeRange = 12,
-    skillRange = 18,
-}
-
-function FSM:findTarget()
-    if not isValid() then return nil end
-    
-    local bestTarget = nil
-    local bestDist = math.huge
-    
-    pcall(function()
-        local allPlayers = Players:GetPlayers()
-        
-        for _, player in ipairs(allPlayers) do
-            if player and player ~= LocalPlayer and player.Character then
-                local enemyChar = player.Character
-                local enemyHum = enemyChar:FindFirstChildOfClass("Humanoid")
-                local enemyHrp = enemyChar:FindFirstChild("HumanoidRootPart")
+            if distance < 2 then
+                Macro.StuckDetection.StuckTime = Macro.StuckDetection.StuckTime + Macro.StuckDetection.CheckInterval
                 
-                if enemyHum and enemyHrp and enemyHum.Health > 0 then
-                    local dist = safeDistance(hrp.Position, enemyHrp.Position)
+                if Macro.StuckDetection.StuckTime >= Macro.StuckDetection.Threshold then
+                    -- Anti-stuck actions
+                    Humanoid.Jump = true
+                    task.wait(0.2)
+                    Humanoid.Jump = false
                     
-                    if dist < self.searchRadius and dist < bestDist then
-                        bestDist = dist
-                        bestTarget = enemyChar
+                    -- Force path recalculation if navigating
+                    if Macro.Navigating and CurrentPath then
+                        PathComputing = false
+                        WaypointIndex = 1
                     end
+                    
+                    Macro.StuckDetection.StuckTime = 0
+                    print("[Stuck Detection] Triggered anti-stuck actions")
                 end
+            else
+                Macro.StuckDetection.StuckTime = 0
             end
         end
-    end)
-    
-    return bestTarget
-end
-
-function FSM:update()
-    if not isValid() then
-        self.state = "IDLE"
-        return
-    end
-    
-    if self.state == "IDLE" then
-        local target = self:findTarget()
-        if target then
-            self.target = target
-            self.state = "CHASE"
-        end
         
-    elseif self.state == "CHASE" then
-        if not self.target or not self.target.Parent then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local targetHrp = self.target:FindFirstChild("HumanoidRootPart")
-        local targetHum = self.target:FindFirstChildOfClass("Humanoid")
-        
-        if not targetHrp or not targetHum or targetHum.Health <= 0 then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local dist = safeDistance(hrp.Position, targetHrp.Position)
-        
-        if dist < self.meleeRange then
-            self.state = "COMBAT"
-        else
-            Navigation:moveTo(targetHrp.Position, 1.2)
-        end
-        
-    elseif self.state == "COMBAT" then
-        if not self.target or not self.target.Parent then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local targetHrp = self.target:FindFirstChild("HumanoidRootPart")
-        local targetHum = self.target:FindFirstChildOfClass("Humanoid")
-        
-        if not targetHrp or not targetHum or targetHum.Health <= 0 then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local dist = safeDistance(hrp.Position, targetHrp.Position)
-        
-        if dist > self.meleeRange + 5 then
-            self.state = "CHASE"
-        else
-            Combat:combo(self.target)
-            
-            if math.random() > 0.8 then
-                Combat:dodge()
-            end
-            
-            for slot = 1, 4 do
-                if Combat:canSkill(slot) and dist < self.skillRange then
-                    Combat:useSkill(slot, self.target)
-                    break
-                end
-            end
-        end
-    end
-end
-
--- ═══════════════════════════════════════════════════════════
--- ГЛАВНЫЙ ЦИКЛ
--- ═══════════════════════════════════════════════════════════
-
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("💎 FLAWLESS BOT v8.0")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("✅ Все баги исправлены")
-print("✅ Защита от nil values")
-print("✅ VIM проверка: " .. (VIM and "✅" or "❌"))
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-local running = true
-
--- Основной цикл
-task.spawn(function()
-    while running do
-        local success, err = pcall(function()
-            if not isValid() then
-                task.wait(1)
-                local initSuccess = initCharacter()
-                if not initSuccess then
-                    task.wait(2)
-                end
-                return
-            end
-            
-            FSM:update()
-        end)
-        
-        if not success then
-            warn("Main loop error: " .. tostring(err))
-            task.wait(0.5)
-        end
-        
-        task.wait(0.15)
+        Macro.StuckDetection.LastPosition = currentPos
     end
 end)
 
--- Очистка памяти
-task.spawn(function()
-    while running do
-        task.wait(30)
-        pcall(function()
-            Navigation.cache = {}
-            collectgarbage("collect")
-        end)
-    end
-end)
+--==========================================
+-- PATHFINDING SYSTEM
+--==========================================
 
--- Обработчик смерти
-if humanoid then
-    humanoid.Died:Connect(function()
-        pcall(function()
-            FSM.state = "IDLE"
-            FSM.target = nil
-            task.wait(2)
-            initCharacter()
-        end)
-    end)
-end
-
--- Debug команды
-_G.FlawlessBot = {
-    version = "8.0",
-    stop = function() 
-        running = false 
-        print("⏸️ Bot stopped")
-    end,
-    start = function() 
-        running = true 
-        print("▶️ Bot started")
-    end,
-    state = function() 
-        return FSM.state 
-    end,
-    target = function() 
-        return FSM.target and "Yes" or "No" 
-    end,
-    valid = function()
-        return isValid() and "✅ Valid" or "❌ Invalid"
-    end,
-    vim = function()
-        return VIM and "✅ Available" or "❌ Not available"
-    end,
-}
-
-print("✅ BOT STARTED!")
-print("📖 Commands:")
-print("   _G.FlawlessBot.state() - check state")
-print("   _G.FlawlessBot.valid() - check character")
-print("   _G.FlawlessBot.vim() - check VIM")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
--- ═══════════════════════════════════════════════════════════
--- ИНИЦИАЛИЗАЦИЯ ПЕРСОНАЖА
--- ═══════════════════════════════════════════════════════════
-
-local function isValid()
-    return char and char.Parent
-        and humanoid and humanoid.Parent and humanoid.Health > 0
-        and hrp and hrp.Parent
-end
-
-local function initCharacter()
-    local success = pcall(function()
-        if not LocalPlayer then return false end
-        
-        char = LocalPlayer.Character
-        if not char then return false end
-        
-        humanoid = char:FindFirstChildOfClass("Humanoid")
-        hrp = char:FindFirstChild("HumanoidRootPart")
-        camera = Workspace.CurrentCamera
-        
-        return humanoid and hrp and camera
-    end)
+local function ComputePath(startPos, endPos)
+    if PathComputing then return nil end
     
-    return success
-end
-
-if LocalPlayer then
-    LocalPlayer.CharacterAdded:Connect(function()
-        task.wait(1)
-        initCharacter()
-    end)
-end
-
-initCharacter()
-
--- ═══════════════════════════════════════════════════════════
--- УТИЛИТЫ
--- ═══════════════════════════════════════════════════════════
-
-local function safeNumber(val, default)
-    if type(val) ~= "number" or val ~= val or math.abs(val) == math.huge then
-        return default or 0
-    end
-    return val
-end
-
-local function safeVector3(val, default)
-    if typeof(val) ~= "Vector3" then
-        return default or Vector3.zero
-    end
-    return Vector3.new(
-        safeNumber(val.X, 0),
-        safeNumber(val.Y, 0),
-        safeNumber(val.Z, 0)
-    )
-end
-
-local function clamp(val, min, max)
-    return math.clamp(safeNumber(val, min), min, max)
-end
-
-local function inBounds(pos)
-    pos = safeVector3(pos)
-    return pos.Y > -200 and pos.Y < 1000
-        and math.abs(pos.X) < 20000
-        and math.abs(pos.Z) < 20000
-end
-
-local function distance(a, b)
-    a = safeVector3(a)
-    b = safeVector3(b)
-    local success, dist = pcall(function()
-        return (a - b).Magnitude
-    end)
-    return success and safeNumber(dist, math.huge) or math.huge
-end
-
-local function normalize(vec)
-    vec = safeVector3(vec, Vector3.new(0, 0, 1))
-    if vec.Magnitude < 0.001 then
-        return Vector3.new(0, 0, 1)
-    end
-    local success, result = pcall(function()
-        return vec.Unit
-    end)
-    return success and result or Vector3.new(0, 0, 1)
-end
-
--- ═══════════════════════════════════════════════════════════
--- НАВИГАЦИЯ
--- ═══════════════════════════════════════════════════════════
-
-local Navigation = {
-    grid = 5,
-    cache = {},
-    cacheMaxSize = 300,
-    cacheMaxAge = 10,
-}
-
-function Navigation:worldToGrid(pos)
-    pos = safeVector3(pos)
-    return Vector3.new(
-        math.floor(pos.X / self.grid + 0.5),
-        math.floor(pos.Y / self.grid + 0.5),
-        math.floor(pos.Z / self.grid + 0.5)
-    )
-end
-
-function Navigation:gridToWorld(grid)
-    grid = safeVector3(grid)
-    return grid * self.grid
-end
-
-function Navigation:isWalkable(pos)
-    if not isValid() or not inBounds(pos) then return false end
+    PathComputing = true
     
-    local walkable = false
-    pcall(function()
-        local params = RaycastParams.new()
-        params.FilterDescendantsInstances = {char}
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        
-        local ray = Workspace:Raycast(
-            pos + Vector3.new(0, 5, 0),
-            Vector3.new(0, -20, 0),
-            params
-        )
-        
-        if ray and ray.Distance > 2 and ray.Distance < 18 then
-            local ceiling = Workspace:Raycast(
-                pos + Vector3.new(0, 1, 0),
-                Vector3.new(0, 8, 0),
-                params
-            )
-            walkable = not ceiling or ceiling.Distance > 6
-        end
-    end)
-    
-    return walkable
-end
-
-function Navigation:findPath(start, goal)
-    if not isValid() or not inBounds(start) or not inBounds(goal) then
-        return {start, goal}
-    end
-    
-    local dist = distance(start, goal)
-    if dist < 25 then
-        return {start, goal}
-    end
-    
-    local startGrid = self:worldToGrid(start)
-    local goalGrid = self:worldToGrid(goal)
-    
-    local openSet = {{pos = startGrid, f = 0, g = 0}}
-    local closedSet = {}
-    local cameFrom = {}
-    local gScore = {[tostring(startGrid)] = 0}
-    
-    local iterations = 0
-    local maxIter = 500
-    
-    while #openSet > 0 and iterations < maxIter do
-        iterations = iterations + 1
-        
-        local minIdx = 1
-        for i = 2, #openSet do
-            if openSet[i].f < openSet[minIdx].f then
-                minIdx = i
-            end
-        end
-        
-        local current = table.remove(openSet, minIdx)
-        local currentKey = tostring(current.pos)
-        
-        if distance(current.pos, goalGrid) < 2 then
-            local path = {}
-            local pos = current.pos
-            
-            while cameFrom[tostring(pos)] do
-                table.insert(path, 1, self:gridToWorld(pos))
-                pos = cameFrom[tostring(pos)]
-            end
-            
-            table.insert(path, 1, start)
-            return path
-        end
-        
-        closedSet[currentKey] = true
-        
-        local neighbors = {
-            Vector3.new(1,0,0), Vector3.new(-1,0,0),
-            Vector3.new(0,0,1), Vector3.new(0,0,-1),
-            Vector3.new(1,0,1), Vector3.new(-1,0,1),
-            Vector3.new(0,1,0), Vector3.new(1,1,0),
+    local pathParams = {
+        AgentCanJump = true,
+        AgentCanClimb = false,
+        AgentHeight = 5,
+        AgentRadius = 2,
+        AgentMaxSlope = 45,
+        Costs = {
+            Water = math.huge
         }
-        
-        for _, dir in ipairs(neighbors) do
-            local nPos = current.pos + dir
-            local nKey = tostring(nPos)
-            
-            if not closedSet[nKey] and self:isWalkable(self:gridToWorld(nPos)) then
-                local tentG = current.g + dir.Magnitude
-                
-                if not gScore[nKey] or tentG < gScore[nKey] then
-                    cameFrom[nKey] = current.pos
-                    gScore[nKey] = tentG
-                    
-                    local h = distance(nPos, goalGrid)
-                    local f = tentG + h
-                    
-                    table.insert(openSet, {pos = nPos, f = f, g = tentG})
-                end
-            end
-        end
-    end
-    
-    return {start, goal}
-end
-
-function Navigation:moveTo(targetPos, speed)
-    if not isValid() or not inBounds(targetPos) then return false end
-    
-    speed = clamp(speed or 1, 0.1, 2)
-    
-    return pcall(function()
-        local direction = normalize(targetPos - hrp.Position)
-        local moveTarget = hrp.Position + direction * 10 * speed
-        
-        humanoid:MoveTo(moveTarget)
-        
-        if camera then
-            local targetCF = CFrame.new(camera.CFrame.Position, targetPos)
-            camera.CFrame = camera.CFrame:Lerp(targetCF, 0.2)
-        end
-    end)
-end
-
--- ═══════════════════════════════════════════════════════════
--- ВРАГИ
--- ═══════════════════════════════════════════════════════════
-
-local EnemySystem = {
-    enemies = {},
-    maxMemoryTime = 60,
-}
-
-function EnemySystem:track(enemy)
-    if not enemy or not enemy.Parent then return nil end
-    
-    local id = tostring(enemy)
-    if not self.enemies[id] then
-        self.enemies[id] = {
-            char = enemy,
-            lastSeen = tick(),
-            attacks = 0,
-            pattern = "unknown",
-        }
-    end
-    
-    self.enemies[id].lastSeen = tick()
-    return self.enemies[id]
-end
-
-function EnemySystem:clean()
-    local now = tick()
-    for id, data in pairs(self.enemies) do
-        if now - data.lastSeen > self.maxMemoryTime then
-            self.enemies[id] = nil
-        end
-    end
-end
-
--- ═══════════════════════════════════════════════════════════
--- БОЕВАЯ СИСТЕМА
--- ═══════════════════════════════════════════════════════════
-
-local Combat = {
-    lastCombo = 0,
-    lastSkill = {0, 0, 0, 0},
-    lastDodge = 0,
-    comboCooldown = 1,
-    skillCooldowns = {5, 6, 7, 8},
-    dodgeCooldown = 0.8,
-}
-
-function Combat:canCombo()
-    return isValid() and VIM and tick() - self.lastCombo > self.comboCooldown
-end
-
-function Combat:canSkill(slot)
-    slot = clamp(slot, 1, 4)
-    return isValid() and VIM and tick() - self.lastSkill[slot] > self.skillCooldowns[slot]
-end
-
-function Combat:canDodge()
-    return isValid() and tick() - self.lastDodge > self.dodgeCooldown
-end
-
-function Combat:combo(target)
-    if not self:canCombo() or not target then return false end
-    
-    local success = pcall(function()
-        if target:FindFirstChild("Head") and camera then
-            camera.CFrame = CFrame.new(camera.CFrame.Position, target.Head.Position)
-        end
-        
-        for i = 1, 3 do
-            if not isValid() then break end
-            
-            VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-            task.wait(0.15)
-        end
-        
-        self.lastCombo = tick()
-    end)
-    
-    return success
-end
-
-function Combat:useSkill(slot, target)
-    if not self:canSkill(slot) then return false end
-    
-    local keys = {
-        Enum.KeyCode.One,
-        Enum.KeyCode.Two,
-        Enum.KeyCode.Three,
-        Enum.KeyCode.Four
     }
     
-    slot = clamp(slot, 1, 4)
+    local success, path = pcall(function()
+        return PathfindingService:CreatePath(pathParams)
+    end)
     
-    local success = pcall(function()
-        if target and target:FindFirstChild("Head") and camera then
-            camera.CFrame = CFrame.new(camera.CFrame.Position, target.Head.Position)
+    if not success then
+        PathComputing = false
+        return nil
+    end
+    
+    path:ComputeAsync(startPos, endPos)
+    
+    if path.Status == Enum.PathStatus.Success then
+        PathComputing = false
+        return path
+    end
+    
+    PathComputing = false
+    return nil
+end
+
+local function FollowPath(path)
+    if not path then return end
+    
+    local waypoints = path:GetWaypoints()
+    CurrentPath = path
+    WaypointIndex = 1
+    Macro.Navigating = true
+    
+    while Macro.Enabled and Macro.Navigating and WaypointIndex <= #waypoints do
+        local waypoint = waypoints[WaypointIndex]
+        
+        if waypoint.Action == Enum.PathWaypointAction.Jump then
+            Humanoid.Jump = true
         end
         
-        VIM:SendKeyEvent(true, keys[slot], false, game)
+        -- Smooth movement without MoveToFinished:Wait()
+        Humanoid:MoveTo(waypoint.Position)
+        
+        -- Check if reached waypoint
+        while Macro.Enabled and Macro.Navigating and (HumanoidRootPart.Position - waypoint.Position).Magnitude > 4 do
+            task.wait(0.05)
+            
+            -- Check for stuck
+            if Macro.StuckDetection.StuckTime >= Macro.StuckDetection.Threshold * 0.5 then
+                break
+            end
+        end
+        
+        WaypointIndex = WaypointIndex + 1
         task.wait(0.05)
-        VIM:SendKeyEvent(false, keys[slot], false, game)
-        
-        self.lastSkill[slot] = tick()
-    end)
+    end
     
-    return success
+    Macro.Navigating = false
+    CurrentPath = nil
 end
 
-function Combat:dodge()
-    if not self:canDodge() then return false end
+--==========================================
+-- MOVEMENT PATTERNS
+--==========================================
+
+local function GenerateSpiralPoints(center, radius, loops, pointCount)
+    local points = {}
+    local angleStep = (2 * math.pi * loops) / pointCount
     
-    local success = pcall(function()
-        local dir = math.random() > 0.5 and 1 or -1
-        local dodgeVec = hrp.CFrame.RightVector * dir * 10
+    for i = 1, pointCount do
+        local angle = i * angleStep
+        local currentRadius = (i / pointCount) * radius
+        local x = center.X + currentRadius * math.cos(angle)
+        local z = center.Z + currentRadius * math.sin(angle)
         
-        hrp.CFrame = hrp.CFrame + dodgeVec
-        humanoid.Jump = true
-        
-        self.lastDodge = tick()
-    end)
+        table.insert(points, Vector3.new(x, center.Y, z))
+    end
     
-    return success
+    return points
 end
 
--- ═══════════════════════════════════════════════════════════
--- STATE MACHINE
--- ═══════════════════════════════════════════════════════════
-
-local FSM = {
-    state = "IDLE",
-    target = nil,
-    searchRadius = 100,
-    meleeRange = 12,
-    skillRange = 18,
-}
-
-function FSM:findTarget()
-    if not isValid() then return nil end
+local function GenerateSuperSPoints(center, width, height, pointCount)
+    local points = {}
+    local halfWidth = width / 2
+    local segmentLength = pointCount / 4
     
-    local bestTarget = nil
-    local bestDist = math.huge
+    for i = 1, pointCount do
+        local x, z
+        
+        if i <= segmentLength then
+            -- Top left to top right
+            local t = (i - 1) / (segmentLength - 1)
+            x = center.X - halfWidth + t * width
+            z = center.Z + height
+        elseif i <= segmentLength * 2 then
+            -- Top right to middle left
+            local t = (i - segmentLength - 1) / (segmentLength - 1)
+            x = center.X + halfWidth - t * width
+            z = center.Z + height - t * height
+        elseif i <= segmentLength * 3 then
+            -- Middle left to bottom right
+            local t = (i - segmentLength * 2 - 1) / (segmentLength - 1)
+            x = center.X - halfWidth + t * width
+            z = center.Z - t * height
+        else
+            -- Bottom right to bottom left
+            local t = (i - segmentLength * 3 - 1) / (segmentLength - 1)
+            x = center.X + halfWidth - t * width
+            z = center.Z - height
+        end
+        
+        table.insert(points, Vector3.new(x, center.Y, z))
+    end
     
-    pcall(function()
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer and player.Character then
-                local enemyHum = player.Character:FindFirstChildOfClass("Humanoid")
-                local enemyHrp = player.Character:FindFirstChild("HumanoidRootPart")
+    return points
+end
+
+local function ExecutePattern(center)
+    if not Macro.Enabled then return end
+    
+    local points = {}
+    
+    if Macro.CurrentPattern == "Spiral" then
+        points = GenerateSpiralPoints(
+            center,
+            Macro.Movement.SpiralRadius,
+            Macro.Movement.SpiralLoops,
+            50
+        )
+    elseif Macro.CurrentPattern == "Super-S" then
+        points = GenerateSuperSPoints(
+            center,
+            Macro.Movement.SpiralRadius * 1.5,
+            Macro.Movement.SpiralRadius,
+            Macro.Movement.SuperSPoints
+        )
+    end
+    
+    Macro.Farming = true
+    
+    for i, point in ipairs(points) do
+        if not Macro.Enabled then break end
+        
+        -- Move to point
+        Humanoid:MoveTo(point)
+        
+        -- Wait until close enough or timeout
+        local startTime = tick()
+        while Macro.Enabled and (HumanoidRootPart.Position - point).Magnitude > 3 do
+            task.wait(0.05)
+            
+            if tick() - startTime > 5 then
+                break
+            end
+        end
+        
+        -- Collect tokens during movement
+        CollectibleTokens = GetTokenPositions()
+        if #CollectibleTokens > 0 then
+            for _, token in pairs(CollectibleTokens) do
+                if Macro.Collection.InstantTween then
+                    -- Instant collection with TweenService
+                    local tweenInfo = TweenInfo.new(Macro.Collection.TweenSpeed, Enum.EasingStyle.Linear)
+                    local tween = TweenService:Create(HumanoidRootPart, tweenInfo, {CFrame = token.CFrame})
+                    tween:Play()
+                    tween:Wait()
+                end
+            end
+        end
+        
+        task.wait(0.1)
+    end
+    
+    Macro.Farming = false
+end
+
+--==========================================
+-- AUTO CLICKER SYSTEM
+--==========================================
+
+task.spawn(function()
+    while true do
+        task.wait(Macro.AutoClick.ClickInterval)
+        
+        if not Macro.Enabled or not Macro.AutoClick.Enabled then continue end
+        
+        if Macro.AutoClick.CheckTool then
+            local tool = GetCurrentTool()
+            if not tool then continue end
+        end
+        
+        -- Simulate click
+        local mouse = Player:GetMouse()
+        local clickEvent = mouse and mouse:FindFirstChild("Button1Down")
+        
+        if clickEvent then
+            clickEvent:Fire()
+        else
+            -- Alternative click method
+            local args = {
+                [1] = Vector3.new(0, 0, 0),
+                [2] = Enum.UserInputType.MouseButton1,
+                [3] = false
+            }
+            
+            if Remotes:FindFirstChild("Click") then
+                Remotes.Click:FireServer(unpack(args))
+            end
+        end
+    end
+end)
+
+--==========================================
+-- UI SYSTEM
+--==========================================
+
+local function CreateMobileUI()
+    -- Create ScreenGui
+    MacroUI = Instance.new("ScreenGui")
+    MacroUI.Name = "NatroMacroUI"
+    MacroUI.Parent = PlayerGui
+    MacroUI.ResetOnSpawn = false
+    MacroUI.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    -- Main Frame
+    MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Parent = MacroUI
+    MainFrame.Size = UDim2.new(0, 300, 0, 400)
+    MainFrame.Position = UDim2.new(0.5, -150, 0.5, -200)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    MainFrame.BorderSizePixel = 2
+    MainFrame.BorderColor3 = Color3.fromRGB(100, 100, 100)
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    
+    -- Title
+    local Title = Instance.new("TextLabel")
+    Title.Name = "Title"
+    Title.Parent = MainFrame
+    Title.Size = UDim2.new(1, 0, 0, 30)
+    Title.Position = UDim2.new(0, 0, 0, 0)
+    Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    Title.Text = "🐝 Natro Macro Mobile"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.Font = Enum.Font.SourceSansBold
+    Title.TextSize = 18
+    
+    -- Status Label
+    StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Name = "StatusLabel"
+    StatusLabel.Parent = MainFrame
+    StatusLabel.Size = UDim2.new(1, -20, 0, 25)
+    StatusLabel.Position = UDim2.new(0, 10, 0, 40)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Text = "Status: Idle"
+    StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    StatusLabel.Font = Enum.Font.SourceSans
+    StatusLabel.TextSize = 14
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    
+    -- Toggle Button
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Name = "ToggleBtn"
+    ToggleBtn.Parent = MainFrame
+    ToggleBtn.Size = UDim2.new(0.9, 0, 0, 40)
+    ToggleBtn.Position = UDim2.new(0.05, 0, 0, 75)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
+    ToggleBtn.Text = "START MACRO"
+    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ToggleBtn.Font = Enum.Font.SourceSansBold
+    ToggleBtn.TextSize = 16
+    ToggleBtn.MouseButton1Click:Connect(function()
+        Macro.Enabled = not Macro.Enabled
+        if Macro.Enabled then
+            ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+            ToggleBtn.Text = "STOP MACRO"
+            StatusLabel.Text = "Status: Running"
+        else
+            ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
+            ToggleBtn.Text = "START MACRO"
+            StatusLabel.Text = "Status: Stopped"
+            Macro.Farming = false
+            Macro.Navigating = false
+        end
+    end)
+    
+    -- Pattern Selector
+    local PatternLabel = Instance.new("TextLabel")
+    PatternLabel.Name = "PatternLabel"
+    PatternLabel.Parent = MainFrame
+    PatternLabel.Size = UDim2.new(0.9, 0, 0, 25)
+    PatternLabel.Position = UDim2.new(0.05, 0, 0, 125)
+    PatternLabel.BackgroundTransparency = 1
+    PatternLabel.Text = "Movement Pattern:"
+    PatternLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    PatternLabel.Font = Enum.Font.SourceSans
+    PatternLabel.TextSize = 14
+    
+    local PatternDropdown = Instance.new("TextButton")
+    PatternDropdown.Name = "PatternDropdown"
+    PatternDropdown.Parent = MainFrame
+    PatternDropdown.Size = UDim2.new(0.9, 0, 0, 30)
+    PatternDropdown.Position = UDim2.new(0.05, 0, 0, 150)
+    PatternDropdown.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    PatternDropdown.Text = Macro.CurrentPattern
+    PatternDropdown.TextColor3 = Color3.fromRGB(255, 255, 255)
+    PatternDropdown.Font = Enum.Font.SourceSans
+    PatternDropdown.TextSize = 14
+    PatternDropdown.MouseButton1Click:Connect(function()
+        if Macro.CurrentPattern == "Spiral" then
+            Macro.CurrentPattern = "Super-S"
+        else
+            Macro.CurrentPattern = "Spiral"
+        end
+        PatternDropdown.Text = Macro.CurrentPattern
+    end)
+    
+    -- Position Buttons
+    local SaveHiveBtn = Instance.new("TextButton")
+    SaveHiveBtn.Name = "SaveHiveBtn"
+    SaveHiveBtn.Parent = MainFrame
+    SaveHiveBtn.Size = UDim2.new(0.9, 0, 0, 35)
+    SaveHiveBtn.Position = UDim2.new(0.05, 0, 0, 190)
+    SaveHiveBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 200)
+    SaveHiveBtn.Text = "📍 Save Hive Position"
+    SaveHiveBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SaveHiveBtn.Font = Enum.Font.SourceSans
+    SaveHiveBtn.TextSize = 14
+    SaveHiveBtn.MouseButton1Click:Connect(function()
+        Macro.HivePosition = HumanoidRootPart.Position
+        StatusLabel.Text = "Status: Hive position saved!"
+        print("[UI] Hive position saved:", Macro.HivePosition)
+    end)
+    
+    local SaveFieldBtn = Instance.new("TextButton")
+    SaveFieldBtn.Name = "SaveFieldBtn"
+    SaveFieldBtn.Parent = MainFrame
+    SaveFieldBtn.Size = UDim2.new(0.9, 0, 0, 35)
+    SaveFieldBtn.Position = UDim2.new(0.05, 0, 0, 230)
+    SaveFieldBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 100)
+    SaveFieldBtn.Text = "🌻 Save Field Position"
+    SaveFieldBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SaveFieldBtn.Font = Enum.Font.SourceSans
+    SaveFieldBtn.TextSize = 14
+    SaveFieldBtn.MouseButton1Click:Connect(function()
+        Macro.FieldPosition = HumanoidRootPart.Position
+        Macro.CurrentField = GetFieldByPosition(Macro.FieldPosition)
+        StatusLabel.Text = "Status: Field position saved!"
+        print("[UI] Field position saved:", Macro.FieldPosition)
+    end)
+    
+    -- Settings
+    local SettingsLabel = Instance.new("TextLabel")
+    SettingsLabel.Name = "SettingsLabel"
+    SettingsLabel.Parent = MainFrame
+    SettingsLabel.Size = UDim2.new(0.9, 0, 0, 25)
+    SettingsLabel.Position = UDim2.new(0.05, 0, 0, 275)
+    SettingsLabel.BackgroundTransparency = 1
+    SettingsLabel.Text = "⚙️ Settings"
+    SettingsLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    SettingsLabel.Font = Enum.Font.SourceSansBold
+    SettingsLabel.TextSize = 14
+    
+    -- Speed Slider
+    local SpeedLabel = Instance.new("TextLabel")
+    SpeedLabel.Name = "SpeedLabel"
+    SpeedLabel.Parent = MainFrame
+    SpeedLabel.Size = UDim2.new(0.4, 0, 0, 20)
+    SpeedLabel.Position = UDim2.new(0.05, 0, 0, 300)
+    SpeedLabel.BackgroundTransparency = 1
+    SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
+    SpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    SpeedLabel.Font = Enum.Font.SourceSans
+    SpeedLabel.TextSize = 12
+    
+    local SpeedSlider = Instance.new("TextButton")
+    SpeedSlider.Name = "SpeedSlider"
+    SpeedSlider.Parent = MainFrame
+    SpeedSlider.Size = UDim2.new(0.5, 0, 0, 20)
+    SpeedSlider.Position = UDim2.new(0.45, 0, 0, 300)
+    SpeedSlider.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    SpeedSlider.Text = "-"
+    SpeedSlider.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SpeedSlider.Font = Enum.Font.SourceSans
+    SpeedSlider.TextSize = 12
+    SpeedSlider.MouseButton1Click:Connect(function()
+        Macro.Movement.Speed = math.max(10, Macro.Movement.Speed - 5)
+        SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
+    end)
+    
+    local SpeedSliderPlus = Instance.new("TextButton")
+    SpeedSliderPlus.Name = "SpeedSliderPlus"
+    SpeedSliderPlus.Parent = MainFrame
+    SpeedSliderPlus.Size = UDim2.new(0.5, 0, 0, 20)
+    SpeedSliderPlus.Position = UDim2.new(0.45, 0, 0, 320)
+    SpeedSliderPlus.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    SpeedSliderPlus.Text = "+"
+    SpeedSliderPlus.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SpeedSliderPlus.Font = Enum.Font.SourceSans
+    SpeedSliderPlus.TextSize = 12
+    SpeedSliderPlus.MouseButton1Click:Connect(function()
+        Macro.Movement.Speed = math.min(50, Macro.Movement.Speed + 5)
+        SpeedLabel.Text = "Speed: " .. Macro.Movement.Speed
+    end)
+    
+    -- Auto Click Toggle
+    local AutoClickBtn = Instance.new("TextButton")
+    AutoClickBtn.Name = "AutoClickBtn"
+    AutoClickBtn.Parent = MainFrame
+    AutoClickBtn.Size = UDim2.new(0.9, 0, 0, 30)
+    AutoClickBtn.Position = UDim2.new(0.05, 0, 0, 350)
+    AutoClickBtn.BackgroundColor3 = Macro.AutoClick.Enabled and Color3.fromRGB(0, 200, 0) or Color3.fromRGB(100, 100, 100)
+    AutoClickBtn.Text = "Auto Click: " .. (Macro.AutoClick.Enabled and "ON" or "OFF")
+    AutoClickBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AutoClickBtn.Font = Enum.Font.SourceSans
+    AutoClickBtn.TextSize = 14
+    AutoClickBtn.MouseButton1Click:Connect(function()
+        Macro.AutoClick.Enabled = not Macro.AutoClick.Enabled
+        AutoClickBtn.BackgroundColor3 = Macro.AutoClick.Enabled and Color3.fromRGB(0, 200, 0) or Color3.fromRGB(100, 100, 100)
+        AutoClickBtn.Text = "Auto Click: " .. (Macro.AutoClick.Enabled and "ON" or "OFF")
+    end)
+end
+
+--==========================================
+-- MAIN MACRO LOGIC
+--==========================================
+
+local function MainMacroLoop()
+    while true do
+        task.wait(0.1)
+        
+        if not Macro.Enabled then continue end
+        
+        -- Auto-detect hive position if not set
+        if not Macro.HivePosition then
+            Macro.HivePosition = GetHivePosition()
+        end
+        
+        -- Farm at saved field position
+        if Macro.FieldPosition and not Macro.Farming and not Macro.Navigating then
+            -- Navigate to field if too far
+            if (HumanoidRootPart.Position - Macro.FieldPosition).Magnitude > 20 then
+                StatusLabel.Text = "Status: Navigating to field..."
+                local path = ComputePath(HumanoidRootPart.Position, Macro.FieldPosition)
+                if path then
+                    FollowPath(path)
+                end
+            else
+                -- Execute farming pattern
+                StatusLabel.Text = "Status: Farming pattern..."
+                ExecutePattern(Macro.FieldPosition)
                 
-                if enemyHum and enemyHrp and enemyHum.Health > 0 then
-                    local dist = distance(hrp.Position, enemyHrp.Position)
-                    
-                    if dist < self.searchRadius and dist < bestDist then
-                        bestDist = dist
-                        bestTarget = player.Character
+                -- Return to hive after farming
+                if Macro.HivePosition and Macro.Enabled then
+                    StatusLabel.Text = "Status: Returning to hive..."
+                    local path = ComputePath(HumanoidRootPart.Position, Macro.HivePosition)
+                    if path then
+                        FollowPath(path)
                     end
                 end
             end
         end
-    end)
-    
-    return bestTarget
-end
-
-function FSM:update()
-    if not isValid() then
-        self.state = "IDLE"
-        return
-    end
-    
-    if self.state == "IDLE" then
-        local target = self:findTarget()
-        if target then
-            self.target = target
-            self.state = "CHASE"
-        end
         
-    elseif self.state == "CHASE" then
-        if not self.target or not self.target.Parent then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local targetHrp = self.target:FindFirstChild("HumanoidRootPart")
-        local targetHum = self.target:FindFirstChildOfClass("Humanoid")
-        
-        if not targetHrp or not targetHum or targetHum.Health <= 0 then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local dist = distance(hrp.Position, targetHrp.Position)
-        
-        if dist < self.meleeRange then
-            self.state = "COMBAT"
-        else
-            Navigation:moveTo(targetHrp.Position, 1.2)
-        end
-        
-    elseif self.state == "COMBAT" then
-        if not self.target or not self.target.Parent then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local targetHrp = self.target:FindFirstChild("HumanoidRootPart")
-        local targetHum = self.target:FindFirstChildOfClass("Humanoid")
-        
-        if not targetHrp or not targetHum or targetHum.Health <= 0 then
-            self.target = nil
-            self.state = "IDLE"
-            return
-        end
-        
-        local dist = distance(hrp.Position, targetHrp.Position)
-        
-        if dist > self.meleeRange + 5 then
-            self.state = "CHASE"
-        else
-            Combat:combo(self.target)
-            
-            if math.random() > 0.8 then
-                Combat:dodge()
-            end
-            
-            for slot = 1, 4 do
-                if Combat:canSkill(slot) and dist < self.skillRange then
-                    Combat:useSkill(slot, self.target)
-                    break
-                end
-            end
+        -- Update status
+        if Macro.Farming then
+            StatusLabel.Text = "Status: Farming (" .. Macro.CurrentPattern .. ")"
+        elseif Macro.Navigating then
+            StatusLabel.Text = "Status: Navigating..."
         end
     end
 end
 
--- ═══════════════════════════════════════════════════════════
--- ГЛАВНЫЙ ЦИКЛ
--- ═══════════════════════════════════════════════════════════
+--==========================================
+-- INITIALIZATION
+--==========================================
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("💎 FLAWLESS BOT v8.0")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("✅ Все баги исправлены")
-print("✅ Стабильная работа")
-print("✅ Полная защита от крашей")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+-- Wait for game to load
+task.wait(3)
 
-local running = true
+-- Create UI
+CreateMobileUI()
 
--- Основной цикл
-task.spawn(function()
-    while running do
-        local success = pcall(function()
-            if not isValid() then
-                task.wait(1)
-                initCharacter()
-                return
-            end
-            
-            FSM:update()
-        end)
-        
-        if not success then
-            task.wait(0.5)
-        end
-        
-        task.wait(0.15)
-    end
+-- Start main loop
+task.spawn(MainMacroLoop)
+
+-- Character respawn handling
+Player.CharacterAdded:Connect(function(newCharacter)
+    Character = newCharacter
+    Humanoid = Character:WaitForChild("Humanoid")
+    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+    
+    task.wait(1)
+    Macro.Farming = false
+    Macro.Navigating = false
+    print("[Macro] Character respawned - reset states")
 end)
 
--- Очистка памяти
-task.spawn(function()
-    while running do
-        task.wait(30)
-        pcall(function()
-            EnemySystem:clean()
-            Navigation.cache = {}
-            collectgarbage("collect")
-        end)
-    end
-end)
-
--- Обработчик смерти
-if humanoid then
-    humanoid.Died:Connect(function()
-        pcall(function()
-            FSM.state = "IDLE"
-            FSM.target = nil
-            task.wait(2)
-            initCharacter()
-        end)
-    end)
-end
-
--- Debug команды
-_G.FlawlessBot = {
-    version = "8.0",
-    stop = function() running = false end,
-    start = function() running = true end,
-    state = function() return FSM.state end,
-    target = function() return FSM.target and "Yes" or "No" end,
-}
-
-print("✅ BOT STARTED!")
-print("📖 _G.FlawlessBot.state() - проверить состояние")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print("==========================================")
+print("Natro Macro for Bee Swarm Simulator Loaded!")
+print("Mobile Optimized | Delta Executor Compatible")
+print("==========================================")
+print("Features:")
+print("✓ Spiral & Super-S Movement Patterns")
+print("✓ Pathfinding Service Navigation")
+print("✓ Instant Token Collection (TweenService)")
+print("✓ Anti-Stuck Detection")
+print("✓ Auto Clicker (Separate Thread)")
+print("✓ Mobile UI with Position Saving")
+print("==========================================")
