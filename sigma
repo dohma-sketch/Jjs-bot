@@ -1,1734 +1,2186 @@
+--[[
+    Jujutsu Shenanigans Q-Learning Bot v3.5
+
+    Features:
+    - Advanced movement controller
+    - Pathfinding arbitration
+    - Camera fix
+    - Separate skills: skill_1 .. skill_4
+    - Defensive auto block
+    - Low HP safety
+    - Debug stats
+]]
+
 local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local CoreGui = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
-local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
 
-local Player = Players.LocalPlayer
-local Character = Player.Character or Player.CharacterAdded:Wait()
-local Humanoid = Character:WaitForChild("Humanoid")
-local Root = Character:WaitForChild("HumanoidRootPart")
+local VIM
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+end)
 
---// ═══════════════════════════════════════════════════════════
---// ГЛОБАЛЬНЫЕ НАСТРОЙКИ И СОСТОЯНИЕ
---// ═══════════════════════════════════════════════════════════
-
-local MacroState = {
-    Version = "5.1",
-    Active = false,
-    CurrentPhase = "Idle",
-    StartTime = 0,
-    
-    -- Farming
-    TargetField = "Sunflower Field",
-    FarmingPattern = "Spiral",
-    LastFieldChange = 0,
-    
-    -- Stats
-    SessionStats = {
-        HoneyGained = 0,
-        FieldsCompleted = 0,
-        QuestsCompleted = 0,
-        MobsKilled = 0,
-        DeathCount = 0,
-        Disconnects = 0,
-        Runtime = 0
-    },
-    
-    -- Position tracking
-    LastPosition = Vector3.new(0, 0, 0),
-    StuckTime = 0,
-    HivePosition = nil,
-    
-    -- Advanced
-    CollectStingers = true,
-    DoMemoryMatch = true,
-    UseHaste = true,
-    AutoDig = true,
-    ConvertBalloons = true,
-    
-    -- Safety
-    IsMoving = false,
-    LastActionTime = 0
-}
-
-local MacroConfig = {
-    -- Farming settings
-    ConvertAt = 95,
-    WalkSpeed = 18,
-    FarmDuration = 300,
-    FieldRotation = true,
-    
-    -- Pattern settings
-    SpiralSpeed = 2,
-    SpiralRadius = 35,
-    ZigzagWidth = 30,
-    SquareSize = 25,
-    
-    -- Collection
-    TokenRange = 20,
-    FlowerCollectRange = 8,
-    
-    -- Safety
-    AntiAfkInterval = 180,
-    StuckThreshold = 3,
-    ReconnectOnDisconnect = true,
-    
-    -- Performance
-    TickRate = 0.1,
-    PathUpdateRate = 0.5,
-    
-    -- Advanced
-    UseGlidingForTravel = true,
-    CollectCrosshairs = true,
-    PrioritizeBoostFields = true,
-    AutoUseBuffItems = true
-}
-
---// ═══════════════════════════════════════════════════════════
---// ПОЛЯ И ЗОНЫ
---// ═══════════════════════════════════════════════════════════
-
-local FieldDatabase = {
-    {Name = "Sunflower Field", Level = 1, Type = "Yellow", Priority = 1, Pattern = "Spiral"},
-    {Name = "Dandelion Field", Level = 3, Type = "Yellow", Priority = 2, Pattern = "Spiral"},
-    {Name = "Mushroom Field", Level = 5, Type = "Red", Priority = 3, Pattern = "Square"},
-    {Name = "Blue Flower Field", Level = 5, Type = "Blue", Priority = 4, Pattern = "Spiral"},
-    {Name = "Clover Field", Level = 7, Type = "White", Priority = 5, Pattern = "Spiral"},
-    {Name = "Strawberry Field", Level = 10, Type = "Red", Priority = 6, Pattern = "Zigzag"},
-    {Name = "Spider Field", Level = 12, Type = "Red", Priority = 7, Pattern = "Square"},
-    {Name = "Bamboo Field", Level = 15, Type = "Blue", Priority = 8, Pattern = "Zigzag"},
-    {Name = "Rose Field", Level = 20, Type = "Red", Priority = 9, Pattern = "Spiral"},
-
-{Name = "Pine Tree Forest", Level = 25, Type = "White", Priority = 10, Pattern = "Square"},
-    {Name = "Cactus Field", Level = 30, Type = "Blue", Priority = 11, Pattern = "Zigzag"},
-    {Name = "Pumpkin Patch", Level = 35, Type = "Yellow", Priority = 12, Pattern = "Square"},
-    {Name = "Pineapple Patch", Level = 35, Type = "Yellow", Priority = 13, Pattern = "Spiral"},
-    {Name = "Stump Field", Level = 5, Type = "White", Priority = 14, Pattern = "Square"},
-    {Name = "Mountain Top Field", Level = 40, Type = "White", Priority = 15, Pattern = "Spiral"},
-    {Name = "Coconut Field", Level = 35, Type = "White", Priority = 16, Pattern = "Zigzag"},
-    {Name = "Pepper Patch", Level = 35, Type = "Red", Priority = 17, Pattern = "Square"}
-}
-
---// ═══════════════════════════════════════════════════════════
---// КЕШИРОВАНИЕ И ОПТИМИЗАЦИЯ
---// ═══════════════════════════════════════════════════════════
-
-local Cache = {
-    FlowerZones = nil,
-    Flowers = {},
-    Collectibles = nil,
-    Hives = nil,
-    Monsters = nil,
-    NPCs = {},
-    LastUpdate = 0,
-    UpdateInterval = 5
-}
-
-local function UpdateCache()
-    local now = tick()
-    if now - Cache.LastUpdate < Cache.UpdateInterval then return end
-    
+if not VIM then
     pcall(function()
-        Cache.FlowerZones = Workspace:FindFirstChild("FlowerZones")
-        Cache.Collectibles = Workspace:FindFirstChild("Collectibles")
-        Cache.Hives = Workspace:FindFirstChild("Hives")
-        Cache.Monsters = Workspace:FindFirstChild("Monsters")
-        
-        if Cache.FlowerZones then
-            for _, zone in pairs(Cache.FlowerZones:GetChildren()) do
-                if zone:FindFirstChild("Flowers") then
-                    Cache.Flowers[zone.Name] = zone.Flowers:GetChildren()
-                end
-            end
-        end
+        VIM = VirtualInputManager
     end)
-    
-    Cache.LastUpdate = now
 end
 
---// ═══════════════════════════════════════════════════════════
---// UI СИСТЕМА (ИСПРАВЛЕННАЯ)
---// ═══════════════════════════════════════════════════════════
+math.randomseed(tick())
 
-local UI = {
-    Elements = {},
-    Connections = {},
-    Pages = {},
-    CurrentPage = "Main",
-    Initialized = false
+------------------------------------------------------------
+-- CONFIG
+------------------------------------------------------------
+
+local CONFIG = {
+    qFileName = "jjs_qtable_v3_5.json",
+    debug = true,
+    saveEvery = 120,
+    targetUserId = nil,
+
+    -- Q-learning
+    alpha = 0.45,
+    gamma = 0.92,
+    epsilon = 1.0,
+    epsilonMin = 0.05,
+    epsilonDecay = 0.99965,
+
+    -- Combat
+    attackRange = 8,
+    skillRange = 11,
+    backStepDistance = 7,
+
+    distance = {
+        melee = 5,
+        mid = 12,
+    },
+
+    lowHealthThreshold = 0.35,
+    retreatWhenLowHP = true,
+
+    -- Defensive reflex
+    autoBlock = true,
+    reflexBlockCooldown = 1.1,
+
+    -- Camera
+    enableAim = true,
+
+    -- OFF | ORIENTATION_TEMP | FOLLOW_TEMP
+    cameraMode = "FOLLOW_TEMP",
+
+    restoreCameraAfterAction = true,
+    resetCameraWhenNoTarget = true,
+    resetCameraOnStart = true,
+
+    cameraHeight = 2.2,
+    cameraDistance = 11,
+
+    -- TARGET or CENTER
+    clickMode = "TARGET",
+
+    -- Block input
+    -- KEY or RMB
+    blockMode = "KEY",
+    blockKey = Enum.KeyCode.F,
+    blockHold = 0.22,
+    blockHoldJitter = 0.12,
+
+    mouseHold = 0.035,
+    mouseHoldJitter = 0.03,
+
+    keyHold = 0.04,
+    keyHoldJitter = 0.03,
+
+    wanderChance = 0.22,
+    loopInterval = 0.03,
+
+    movement = {
+        enabled = true,
+        stopDistance = 5.0,
+        directRange = 26,
+        pathRefresh = 0.30,
+        waypointRadius = 3.0,
+        stuckCheckInterval = 0.45,
+        stuckDistance = 0.55,
+        unstickDuration = 0.40,
+        jumpIfBlocked = true,
+        obstacleRayDistance = 6,
+        combatStrafe = true,
+        strafeSwitchMin = 0.7,
+        strafeSwitchMax = 1.8,
+        backStepDuration = 0.85,
+    },
+
+    actionCooldowns = {
+        approach = 0.25,
+        back_step = 1.05,
+        jump = 0.85,
+        m1_attack = 0.26,
+        skill_1 = 1.0,
+        skill_2 = 2.2,
+        skill_3 = 4.0,
+        skill_4 = 6.0,
+        block = 0.75,
+    },
+
+    actionPostDelay = {
+        approach = 0.12,
+        back_step = 0.22,
+        jump = 0.16,
+        m1_attack = 0.20,
+        skill_1 = 0.26,
+        skill_2 = 0.28,
+        skill_3 = 0.30,
+        skill_4 = 0.34,
+        block = 0.12,
+    },
+
+    reward = {
+        damageDealt = 0.75,
+        kill = 25,
+        damageTaken = 0.95,
+        approachDistance = 0.08,
+        hitBonus = 1.0,
+        attackBlockedPenalty = 1.0,
+        attackMissPenalty = 0.25,
+    },
 }
 
-function UI:Cleanup()
-    -- Очистка соединений
-    for _, conn in pairs(self.Connections) do
-        if conn and typeof(conn) == "RBXScriptConnection" then
-            pcall(function() conn:Disconnect() end)
-        end
-    end
-    self.Connections = {}
-    
-    -- Очистка старого UI
-    for _, ui in pairs(CoreGui:GetChildren()) do
-        if ui.Name == "NatroMacro" then
-            pcall(function() ui:Destroy() end)
-        end
-    end
-    
-    self.Elements = {}
-    self.Pages = {}
+local actions = {
+    "approach",
+    "back_step",
+    "jump",
+    "m1_attack",
+    "skill_1",
+    "skill_2",
+    "skill_3",
+    "skill_4",
+    "block",
+}
+
+local actionIndex = {}
+
+for i, name in ipairs(actions) do
+    actionIndex[name] = i
 end
 
-function UI:Create()
-    if self.Initialized then return end
-    
-    self:Cleanup()
-    
-    -- Main ScreenGui
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "NatroMacro"
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ScreenGui.IgnoreGuiInset = true
-    
-    local success = pcall(function()
-        ScreenGui.Parent = CoreGui
+local skillKeyMap = {
+    skill_1 = Enum.KeyCode.One,
+    skill_2 = Enum.KeyCode.Two,
+    skill_3 = Enum.KeyCode.Three,
+    skill_4 = Enum.KeyCode.Four,
+}
+
+local stats = {
+    steps = 0,
+    hits = 0,
+    blockedHits = 0,
+    misses = 0,
+    damageTaken = 0,
+    kills = 0,
+    deaths = 0,
+    blocks = 0,
+    reflexBlocks = 0,
+    unstucks = 0,
+}
+
+------------------------------------------------------------
+-- BASE
+------------------------------------------------------------
+
+local LocalPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local RAY_FILTER
+pcall(function()
+    RAY_FILTER = Enum.RaycastFilterType.Exclude
+end)
+
+if not RAY_FILTER then
+    pcall(function()
+        RAY_FILTER = Enum.RaycastFilterType.Blacklist
     end)
-    
-    if not success then
-        warn("Failed to create UI")
+end
+
+if not RAY_FILTER then
+    RAY_FILTER = Enum.RaycastFilterType.Exclude
+end
+
+local PATH_WALK, PATH_JUMP
+pcall(function()
+    PATH_WALK = Enum.PathWaypointAction.Walk
+    PATH_JUMP = Enum.PathWaypointAction.Jump
+end)
+
+local bot = {
+    character = nil,
+    humanoid = nil,
+    hrp = nil,
+}
+
+------------------------------------------------------------
+-- CHARACTER RESPAWN
+------------------------------------------------------------
+
+local function attachCharacter(character)
+    if not character or not character.Parent then
         return
     end
-    
-    -- Main Window
-    local MainWindow = Instance.new("Frame")
-    MainWindow.Name = "MainWindow"
-    MainWindow.Size = UDim2.new(0, 450, 0, 550)
-    MainWindow.Position = UDim2.new(0.5, -225, 0.5, -275)
-    MainWindow.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
-    MainWindow.BorderSizePixel = 0
-    MainWindow.Active = true
-    MainWindow.Draggable = true
-    MainWindow.Parent = ScreenGui
-    
-    local MainCorner = Instance.new("UICorner")
-    MainCorner.CornerRadius = UDim.new(0, 10)
-    MainCorner.Parent = MainWindow
-    
-    -- Title Bar
-    local TitleBar = Instance.new("Frame")
-    TitleBar.Name = "TitleBar"
-    TitleBar.Size = UDim2.new(1, 0, 0, 50)
-    TitleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
 
-TitleBar.BorderSizePixel = 0
-    TitleBar.Parent = MainWindow
-    
-    local TitleCorner = Instance.new("UICorner")
-    TitleCorner.CornerRadius = UDim.new(0, 10)
-    TitleCorner.Parent = TitleBar
-    
-    -- Title gradient
-    local TitleGradient = Instance.new("UIGradient")
-    TitleGradient.Color = ColorSequence.new{
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 200, 50)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 150, 0))
-    }
-    TitleGradient.Rotation = 90
-    TitleGradient.Parent = TitleBar
-    
-    -- Title text
-    local Title = Instance.new("TextLabel")
-    Title.Size = UDim2.new(1, -100, 1, 0)
-    Title.Position = UDim2.new(0, 15, 0, 0)
-    Title.BackgroundTransparency = 1
-    Title.Text = "🐝 NATRO MACRO v" .. MacroState.Version
-    Title.Font = Enum.Font.GothamBold
-    Title.TextSize = 20
-    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    Title.TextXAlignment = Enum.TextXAlignment.Left
-    Title.Parent = TitleBar
-    
-    -- Minimize button
-    local MinimizeBtn = Instance.new("TextButton")
-    MinimizeBtn.Size = UDim2.new(0, 40, 0, 40)
-    MinimizeBtn.Position = UDim2.new(1, -90, 0, 5)
-    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
-    MinimizeBtn.Text = "−"
-    MinimizeBtn.Font = Enum.Font.GothamBold
-    MinimizeBtn.TextSize = 24
-    MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    MinimizeBtn.BorderSizePixel = 0
-    MinimizeBtn.AutoButtonColor = false
-    MinimizeBtn.Parent = TitleBar
-    
-    local MinCorner = Instance.new("UICorner")
-    MinCorner.CornerRadius = UDim.new(0, 8)
-    MinCorner.Parent = MinimizeBtn
-    
-    -- Close button
-    local CloseBtn = Instance.new("TextButton")
-    CloseBtn.Size = UDim2.new(0, 40, 0, 40)
-    CloseBtn.Position = UDim2.new(1, -45, 0, 5)
-    CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    CloseBtn.Text = "×"
-    CloseBtn.Font = Enum.Font.GothamBold
-    CloseBtn.TextSize = 24
-    CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    CloseBtn.BorderSizePixel = 0
-    CloseBtn.AutoButtonColor = false
-    CloseBtn.Parent = TitleBar
-    
-    local CloseCorner = Instance.new("UICorner")
-    CloseCorner.CornerRadius = UDim.new(0, 8)
-    CloseCorner.Parent = CloseBtn
-    
-    -- Tab navigation
-    local TabContainer = Instance.new("Frame")
-    TabContainer.Size = UDim2.new(1, -20, 0, 40)
-    TabContainer.Position = UDim2.new(0, 10, 0, 60)
-    TabContainer.BackgroundTransparency = 1
-    TabContainer.Parent = MainWindow
-    
-    local TabLayout = Instance.new("UIListLayout")
-    TabLayout.FillDirection = Enum.FillDirection.Horizontal
-    TabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
-    TabLayout.Padding = UDim.new(0, 5)
-    TabLayout.Parent = TabContainer
-    
-    local tabs = {"Main", "Fields", "Settings", "Stats"}
-    local TabButtons = {}
-    
-    for i, tabName in ipairs(tabs) do
-        local TabBtn = Instance.new("TextButton")
-        TabBtn.Size = UDim2.new(0, 100, 1, 0)
-        TabBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-        TabBtn.Text = tabName
-        TabBtn.Font = Enum.Font.Gotham
-        TabBtn.TextSize = 13
-        TabBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
-        TabBtn.BorderSizePixel = 0
-        TabBtn.AutoButtonColor = false
-        TabBtn.Parent = TabContainer
-        
-        local TabCorner = Instance.new("UICorner")
-        TabCorner.CornerRadius = UDim.new(0, 6)
-        TabCorner.Parent = TabBtn
-        
-        TabButtons[tabName] = TabBtn
-        
-        table.insert(self.Connections, TabBtn.MouseButton1Click:Connect(function()
-            self:SwitchTab(tabName, TabButtons)
-        end))
-    end
-    
-    -- Content area
-    local ContentFrame = Instance.new("ScrollingFrame")
-    ContentFrame.Name = "ContentFrame"
-    ContentFrame.Size = UDim2.new(1, -20, 1, -180)
+    bot.character = character
 
-ContentFrame.Position = UDim2.new(0, 10, 0, 110)
-    ContentFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-    ContentFrame.BorderSizePixel = 0
-    ContentFrame.ScrollBarThickness = 4
-    ContentFrame.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
-    ContentFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    ContentFrame.Parent = MainWindow
-    
-    local ContentCorner = Instance.new("UICorner")
-    ContentCorner.CornerRadius = UDim.new(0, 8)
-    ContentCorner.Parent = ContentFrame
-    
-    -- Create pages
-    self:CreateMainPage(ContentFrame)
-    self:CreateFieldsPage(ContentFrame)
-    self:CreateSettingsPage(ContentFrame)
-    self:CreateStatsPage(ContentFrame)
-    
-    -- Bottom control panel
-    local ControlPanel = Instance.new("Frame")
-    ControlPanel.Size = UDim2.new(1, -20, 0, 60)
-    ControlPanel.Position = UDim2.new(0, 10, 1, -70)
-    ControlPanel.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-    ControlPanel.BorderSizePixel = 0
-    ControlPanel.Parent = MainWindow
-    
-    local ControlCorner = Instance.new("UICorner")
-    ControlCorner.CornerRadius = UDim.new(0, 8)
-    ControlCorner.Parent = ControlPanel
-    
-    -- Start/Stop button
-    local ToggleBtn = Instance.new("TextButton")
-    ToggleBtn.Size = UDim2.new(1, -10, 1, -10)
-    ToggleBtn.Position = UDim2.new(0, 5, 0, 5)
-    ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
-    ToggleBtn.Text = "▶ START MACRO"
-    ToggleBtn.Font = Enum.Font.GothamBold
-    ToggleBtn.TextSize = 20
-    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    ToggleBtn.BorderSizePixel = 0
-    ToggleBtn.AutoButtonColor = false
-    ToggleBtn.Parent = ControlPanel
-    
-    local ToggleCorner = Instance.new("UICorner")
-    ToggleCorner.CornerRadius = UDim.new(0, 8)
-    ToggleCorner.Parent = ToggleBtn
-    
-    self.Elements.ToggleBtn = ToggleBtn
-    self.Elements.MainWindow = MainWindow
-    self.Elements.ContentFrame = ContentFrame
-    
-    -- Toggle functionality
-    table.insert(self.Connections, ToggleBtn.MouseButton1Click:Connect(function()
-        MacroState.Active = not MacroState.Active
-        if MacroState.Active then
-            ToggleBtn.Text = "■ STOP MACRO"
-            ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-            MacroState.StartTime = tick()
-            MacroState.CurrentPhase = "Gathering"
-            self:StartMacro()
-        else
-            ToggleBtn.Text = "▶ START MACRO"
-            ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
-            MacroState.CurrentPhase = "Idle"
-            self:StopMacro()
-        end
-    end))
-    
-    -- Minimize functionality
-    local minimized = false
-    table.insert(self.Connections, MinimizeBtn.MouseButton1Click:Connect(function()
-        minimized = not minimized
-        if minimized then
-            TweenService:Create(MainWindow, TweenInfo.new(0.3, Enum.EasingStyle.Quad), 
-                {Size = UDim2.new(0, 450, 0, 50)}):Play()
-            ContentFrame.Visible = false
-            TabContainer.Visible = false
-            ControlPanel.Visible = false
-            MinimizeBtn.Text = "+"
-        else
-            TweenService:Create(MainWindow, TweenInfo.new(0.3, Enum.EasingStyle.Quad), 
-                {Size = UDim2.new(0, 450, 0, 550)}):Play()
-            task.wait(0.3)
-            ContentFrame.Visible = true
-            TabContainer.Visible = true
-            ControlPanel.Visible = true
-            MinimizeBtn.Text = "−"
-        end
-    end))
-    
-    -- Close functionality
-    table.insert(self.Connections, CloseBtn.MouseButton1Click:Connect(function()
-        MacroState.Active = false
-        self:Cleanup()
-    end))
-    
-    self:SwitchTab("Main", TabButtons)
-    self.Initialized = true
-end
+    local hum = character:WaitForChild("Humanoid", 8)
+    local root = character:WaitForChild("HumanoidRootPart", 8)
 
-function UI:CreateMainPage(parent)
-    local MainPage = Instance.new("Frame")
-    MainPage.Name = "MainPage"
-
-MainPage.Size = UDim2.new(1, 0, 1, 0)
-    MainPage.BackgroundTransparency = 1
-    MainPage.BorderSizePixel = 0
-    MainPage.Parent = parent
-    
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 10)
-    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    Layout.SortOrder = Enum.SortOrder.LayoutOrder
-    Layout.Parent = MainPage
-    
-    -- Status display
-    local StatusFrame = self:CreateSection(MainPage, "Current Status", 120)
-    StatusFrame.LayoutOrder = 1
-    
-    local StatusLabel = Instance.new("TextLabel")
-    StatusLabel.Size = UDim2.new(1, -20, 0, 30)
-    StatusLabel.Position = UDim2.new(0, 10, 0, 35)
-    StatusLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    StatusLabel.Text = "● IDLE - Waiting to start..."
-    StatusLabel.Font = Enum.Font.Code
-    StatusLabel.TextSize = 14
-    StatusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
-    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    StatusLabel.BorderSizePixel = 0
-    StatusLabel.Parent = StatusFrame
-    
-    local StatusCorner = Instance.new("UICorner")
-    StatusCorner.CornerRadius = UDim.new(0, 6)
-    StatusCorner.Parent = StatusLabel
-    
-    self.Elements.StatusLabel = StatusLabel
-    
-    local RuntimeLabel = Instance.new("TextLabel")
-    RuntimeLabel.Size = UDim2.new(1, -20, 0, 30)
-    RuntimeLabel.Position = UDim2.new(0, 10, 0, 75)
-    RuntimeLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    RuntimeLabel.Text = "⏱ Runtime: 00:00:00"
-    RuntimeLabel.Font = Enum.Font.Code
-    RuntimeLabel.TextSize = 14
-    RuntimeLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    RuntimeLabel.TextXAlignment = Enum.TextXAlignment.Left
-    RuntimeLabel.BorderSizePixel = 0
-    RuntimeLabel.Parent = StatusFrame
-    
-    local RuntimeCorner = Instance.new("UICorner")
-    RuntimeCorner.CornerRadius = UDim.new(0, 6)
-    RuntimeCorner.Parent = RuntimeLabel
-    
-    self.Elements.RuntimeLabel = RuntimeLabel
-    
-    -- Quick settings
-    local QuickSettings = self:CreateSection(MainPage, "Quick Settings", 200)
-    QuickSettings.LayoutOrder = 2
-    
-    -- Field selector
-    local FieldLabel = Instance.new("TextLabel")
-    FieldLabel.Size = UDim2.new(1, -20, 0, 20)
-    FieldLabel.Position = UDim2.new(0, 10, 0, 35)
-    FieldLabel.BackgroundTransparency = 1
-    FieldLabel.Text = "Target Field:"
-    FieldLabel.Font = Enum.Font.Gotham
-    FieldLabel.TextSize = 12
-    FieldLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    FieldLabel.TextXAlignment = Enum.TextXAlignment.Left
-    FieldLabel.Parent = QuickSettings
-    
-    local FieldDropdown = self:CreateDropdown(QuickSettings, UDim2.new(1, -20, 0, 35), 
-        UDim2.new(0, 10, 0, 60), FieldDatabase, "Name", function(selected)
-        MacroState.TargetField = selected.Name
-        MacroState.FarmingPattern = selected.Pattern
-    end)
-    
-    -- Convert at slider
-    local ConvertLabel = Instance.new("TextLabel")
-    ConvertLabel.Size = UDim2.new(1, -20, 0, 20)
-    ConvertLabel.Position = UDim2.new(0, 10, 0, 105)
-    ConvertLabel.BackgroundTransparency = 1
-    ConvertLabel.Text = "Convert at: " .. MacroConfig.ConvertAt .. "%"
-    ConvertLabel.Font = Enum.Font.Gotham
-    ConvertLabel.TextSize = 12
-    ConvertLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    ConvertLabel.TextXAlignment = Enum.TextXAlignment.Left
-    ConvertLabel.Parent = QuickSettings
-    
-    local ConvertSlider = self:CreateSlider(QuickSettings, UDim2.new(1, -20, 0, 25),
-        UDim2.new(0, 10, 0, 130), 50, 100, MacroConfig.ConvertAt, function(value)
-        MacroConfig.ConvertAt = value
-        ConvertLabel.Text = "Convert at: " .. value .. "%"
-    end)
-    
-    -- Pattern display
-    local PatternLabel = Instance.new("TextLabel")
-    PatternLabel.Size = UDim2.new(1, -20, 0, 25)
-    PatternLabel.Position = UDim2.new(0, 10, 0, 165)
-
-PatternLabel.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    PatternLabel.Text = "Pattern: " .. MacroState.FarmingPattern
-    PatternLabel.Font = Enum.Font.Gotham
-    PatternLabel.TextSize = 12
-    PatternLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    PatternLabel.BorderSizePixel = 0
-    PatternLabel.Parent = QuickSettings
-    
-    local PatCorner = Instance.new("UICorner")
-    PatCorner.CornerRadius = UDim.new(0, 6)
-    PatCorner.Parent = PatternLabel
-    
-    self.Elements.PatternLabel = PatternLabel
-    
-    -- Quick actions
-    local QuickActions = self:CreateSection(MainPage, "Quick Actions", 150)
-    QuickActions.LayoutOrder = 3
-    
-    local btnData = {
-        {Text = "Go to Hive", Color = Color3.fromRGB(255, 200, 50), Action = function() self:QuickAction("Hive") end},
-        {Text = "Collect Tokens", Color = Color3.fromRGB(50, 200, 255), Action = function() self:QuickAction("Tokens") end},
-        {Text = "Reset Character", Color = Color3.fromRGB(200, 50, 50), Action = function() self:QuickAction("Reset") end}
-    }
-    
-    for i, data in ipairs(btnData) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, -20, 0, 35)
-        btn.Position = UDim2.new(0, 10, 0, 30 + (i-1)*40)
-        btn.BackgroundColor3 = data.Color
-        btn.Text = data.Text
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 13
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.BorderSizePixel = 0
-        btn.AutoButtonColor = false
-        btn.Parent = QuickActions
-        
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 6)
-        corner.Parent = btn
-        
-        table.insert(self.Connections, btn.MouseButton1Click:Connect(data.Action))
-    end
-    
-    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    
-    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    end))
-    
-    self.Pages.Main = MainPage
-end
-
-function UI:CreateFieldsPage(parent)
-    local FieldsPage = Instance.new("Frame")
-    FieldsPage.Name = "FieldsPage"
-    FieldsPage.Size = UDim2.new(1, 0, 1, 0)
-    FieldsPage.BackgroundTransparency = 1
-    FieldsPage.BorderSizePixel = 0
-    FieldsPage.Visible = false
-    FieldsPage.Parent = parent
-    
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 5)
-    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    Layout.SortOrder = Enum.SortOrder.LayoutOrder
-    Layout.Parent = FieldsPage
-    
-    -- Field list
-    local FieldListSection = self:CreateSection(FieldsPage, "Available Fields", 400)
-    FieldListSection.LayoutOrder = 1
-    
-    local FieldListScroll = Instance.new("ScrollingFrame")
-    FieldListScroll.Size = UDim2.new(1, -20, 1, -40)
-    FieldListScroll.Position = UDim2.new(0, 10, 0, 35)
-    FieldListScroll.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    FieldListScroll.BorderSizePixel = 0
-    FieldListScroll.ScrollBarThickness = 3
-    FieldListScroll.Parent = FieldListSection
-    
-    local ListLayout = Instance.new("UIListLayout")
-    ListLayout.Padding = UDim.new(0, 2)
-    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    ListLayout.Parent = FieldListScroll
-    
-    for i, field in ipairs(FieldDatabase) do
-        local FieldItem = Instance.new("Frame")
-        FieldItem.Size = UDim2.new(1, -4, 0, 30)
-        FieldItem.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(40, 40, 45) or Color3.fromRGB(35, 35, 40)
-        FieldItem.BorderSizePixel = 0
-        FieldItem.LayoutOrder = i
-        FieldItem.Parent = FieldListScroll
-        
-        local FieldName = Instance.new("TextLabel")
-        FieldName.Size = UDim2.new(0.45, 0, 1, 0)
-
-FieldName.Position = UDim2.new(0, 10, 0, 0)
-        FieldName.BackgroundTransparency = 1
-        FieldName.Text = field.Name
-        FieldName.Font = Enum.Font.Gotham
-        FieldName.TextSize = 11
-        FieldName.TextColor3 = Color3.fromRGB(220, 220, 220)
-        FieldName.TextXAlignment = Enum.TextXAlignment.Left
-        FieldName.TextTruncate = Enum.TextTruncate.AtEnd
-        FieldName.Parent = FieldItem
-        
-        local FieldType = Instance.new("TextLabel")
-        FieldType.Size = UDim2.new(0.2, 0, 1, 0)
-        FieldType.Position = UDim2.new(0.45, 0, 0, 0)
-        FieldType.BackgroundTransparency = 1
-        FieldType.Text = field.Type
-        FieldType.Font = Enum.Font.GothamBold
-        FieldType.TextSize = 10
-        FieldType.TextColor3 = field.Type == "Red" and Color3.fromRGB(255, 100, 100) or
-                               field.Type == "Blue" and Color3.fromRGB(100, 150, 255) or
-                               Color3.fromRGB(255, 255, 150)
-        FieldType.Parent = FieldItem
-        
-        local SelectBtn = Instance.new("TextButton")
-        SelectBtn.Size = UDim2.new(0.3, -10, 0, 25)
-        SelectBtn.Position = UDim2.new(0.7, 0, 0.5, -12.5)
-        SelectBtn.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
-        SelectBtn.Text = "Select"
-        SelectBtn.Font = Enum.Font.Gotham
-        SelectBtn.TextSize = 10
-        SelectBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        SelectBtn.BorderSizePixel = 0
-        SelectBtn.AutoButtonColor = false
-        SelectBtn.Parent = FieldItem
-        
-        local BtnCorner = Instance.new("UICorner")
-        BtnCorner.CornerRadius = UDim.new(0, 4)
-        BtnCorner.Parent = SelectBtn
-        
-        table.insert(self.Connections, SelectBtn.MouseButton1Click:Connect(function()
-            MacroState.TargetField = field.Name
-            MacroState.FarmingPattern = field.Pattern
-            if self.Elements.PatternLabel then
-                self.Elements.PatternLabel.Text = "Pattern: " .. field.Pattern
-            end
-        end))
-    end
-    
-    FieldListScroll.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 5)
-    
-    table.insert(self.Connections, ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        FieldListScroll.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 5)
-    end))
-    
-    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    
-    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    end))
-    
-    self.Pages.Fields = FieldsPage
-end
-
-function UI:CreateSettingsPage(parent)
-    local SettingsPage = Instance.new("Frame")
-    SettingsPage.Name = "SettingsPage"
-    SettingsPage.Size = UDim2.new(1, 0, 1, 0)
-    SettingsPage.BackgroundTransparency = 1
-    SettingsPage.BorderSizePixel = 0
-    SettingsPage.Visible = false
-    SettingsPage.Parent = parent
-    
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 10)
-    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    Layout.SortOrder = Enum.SortOrder.LayoutOrder
-    Layout.Parent = SettingsPage
-    
-    -- General settings
-    local GeneralSection = self:CreateSection(SettingsPage, "General Settings", 200)
-    GeneralSection.LayoutOrder = 1
-    
-    local settings = {
-        {Name = "Field Rotation", Var = "FieldRotation", Config = true},
-        {Name = "Use Haste", Var = "UseHaste", Config = false},
-        {Name = "Auto Dig", Var = "AutoDig", Config = false},
-        {Name = "Collect Stingers", Var = "CollectStingers", Config = false},
-        {Name = "Memory Match", Var = "DoMemoryMatch", Config = false}
-    }
-    
-    for i, setting in ipairs(settings) do
-
-local defaultVal = setting.Config and MacroConfig[setting.Var] or MacroState[setting.Var]
-        self:CreateToggle(GeneralSection, setting.Name, 
-            UDim2.new(0, 10, 0, 30 + (i-1)*30),
-            defaultVal or false, 
-            function(state)
-                if setting.Config then
-                    MacroConfig[setting.Var] = state
-                else
-                    MacroState[setting.Var] = state
+    if hum and root then
+        bot.humanoid = hum
+        bot.hrp = root
+    else
+        if character.Parent then
+            task.delay(0.35, function()
+                if bot.character == character then
+                    attachCharacter(character)
                 end
             end)
-    end
-    
-    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    
-    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    end))
-    
-    self.Pages.Settings = SettingsPage
-end
-
-function UI:CreateStatsPage(parent)
-    local StatsPage = Instance.new("Frame")
-    StatsPage.Name = "StatsPage"
-    StatsPage.Size = UDim2.new(1, 0, 1, 0)
-    StatsPage.BackgroundTransparency = 1
-    StatsPage.BorderSizePixel = 0
-    StatsPage.Visible = false
-    StatsPage.Parent = parent
-    
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 10)
-    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    Layout.SortOrder = Enum.SortOrder.LayoutOrder
-    Layout.Parent = StatsPage
-    
-    local StatsSection = self:CreateSection(StatsPage, "Session Statistics", 260)
-    StatsSection.LayoutOrder = 1
-    
-    local stats = {
-        {Name = "Honey Gained", Key = "HoneyGained", Suffix = ""},
-        {Name = "Fields Completed", Key = "FieldsCompleted", Suffix = ""},
-        {Name = "Quests Completed", Key = "QuestsCompleted", Suffix = ""},
-        {Name = "Mobs Killed", Key = "MobsKilled", Suffix = ""},
-        {Name = "Deaths", Key = "DeathCount", Suffix = ""}
-    }
-    
-    for i, stat in ipairs(stats) do
-        local StatFrame = Instance.new("Frame")
-        StatFrame.Size = UDim2.new(1, -20, 0, 35)
-        StatFrame.Position = UDim2.new(0, 10, 0, 30 + (i-1)*45)
-        StatFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-        StatFrame.BorderSizePixel = 0
-        StatFrame.Parent = StatsSection
-        
-        local StatCorner = Instance.new("UICorner")
-        StatCorner.CornerRadius = UDim.new(0, 6)
-        StatCorner.Parent = StatFrame
-        
-        local StatName = Instance.new("TextLabel")
-        StatName.Size = UDim2.new(0.6, 0, 1, 0)
-        StatName.Position = UDim2.new(0, 10, 0, 0)
-        StatName.BackgroundTransparency = 1
-        StatName.Text = stat.Name .. ":"
-        StatName.Font = Enum.Font.Gotham
-        StatName.TextSize = 12
-        StatName.TextColor3 = Color3.fromRGB(200, 200, 200)
-        StatName.TextXAlignment = Enum.TextXAlignment.Left
-        StatName.Parent = StatFrame
-        
-        local StatValue = Instance.new("TextLabel")
-        StatValue.Name = "StatValue_" .. stat.Key
-        StatValue.Size = UDim2.new(0.4, -10, 1, 0)
-        StatValue.Position = UDim2.new(0.6, 0, 0, 0)
-        StatValue.BackgroundTransparency = 1
-        StatValue.Text = tostring(MacroState.SessionStats[stat.Key]) .. stat.Suffix
-        StatValue.Font = Enum.Font.Code
-        StatValue.TextSize = 13
-        StatValue.TextColor3 = Color3.fromRGB(100, 255, 100)
-        StatValue.TextXAlignment = Enum.TextXAlignment.Right
-        StatValue.Parent = StatFrame
-        
-        self.Elements["Stat_" .. stat.Key] = StatValue
-    end
-    
-    parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    
-    table.insert(self.Connections, Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        parent.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 20)
-    end))
-    
-    self.Pages.Stats = StatsPage
-end
-
--- Helper functions for UI
-
-function UI:CreateSection(parent, title, height)
-    local Section = Instance.new("Frame")
-    Section.Size = UDim2.new(1, -10, 0, height)
-    Section.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    Section.BorderSizePixel = 0
-    Section.Parent = parent
-    
-    local Corner = Instance.new("UICorner")
-    Corner.CornerRadius = UDim.new(0, 8)
-    Corner.Parent = Section
-    
-    local Title = Instance.new("TextLabel")
-    Title.Size = UDim2.new(1, 0, 0, 25)
-    Title.BackgroundTransparency = 1
-    Title.Text = title
-    Title.Font = Enum.Font.GothamBold
-    Title.TextSize = 13
-    Title.TextColor3 = Color3.fromRGB(255, 200, 50)
-    Title.TextXAlignment = Enum.TextXAlignment.Center
-    Title.Parent = Section
-    
-    return Section
-end
-
-function UI:CreateToggle(parent, text, position, default, callback)
-    local ToggleFrame = Instance.new("Frame")
-    ToggleFrame.Size = UDim2.new(1, -20, 0, 25)
-    ToggleFrame.Position = position
-    ToggleFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    ToggleFrame.BorderSizePixel = 0
-    ToggleFrame.Parent = parent
-    
-    local Corner = Instance.new("UICorner")
-    Corner.CornerRadius = UDim.new(0, 6)
-    Corner.Parent = ToggleFrame
-    
-    local Label = Instance.new("TextLabel")
-    Label.Size = UDim2.new(0.7, 0, 1, 0)
-    Label.Position = UDim2.new(0, 10, 0, 0)
-    Label.BackgroundTransparency = 1
-    Label.Text = text
-    Label.Font = Enum.Font.Gotham
-    Label.TextSize = 11
-    Label.TextColor3 = Color3.fromRGB(220, 220, 220)
-    Label.TextXAlignment = Enum.TextXAlignment.Left
-    Label.Parent = ToggleFrame
-    
-    local ToggleBtn = Instance.new("TextButton")
-    ToggleBtn.Size = UDim2.new(0, 45, 0, 20)
-    ToggleBtn.Position = UDim2.new(1, -55, 0.5, -10)
-    ToggleBtn.BackgroundColor3 = default and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(100, 100, 100)
-    ToggleBtn.Text = default and "ON" or "OFF"
-    ToggleBtn.Font = Enum.Font.GothamBold
-    ToggleBtn.TextSize = 10
-    ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    ToggleBtn.BorderSizePixel = 0
-    ToggleBtn.AutoButtonColor = false
-    ToggleBtn.Parent = ToggleFrame
-    
-    local BtnCorner = Instance.new("UICorner")
-    BtnCorner.CornerRadius = UDim.new(0, 10)
-    BtnCorner.Parent = ToggleBtn
-    
-    local state = default
-    table.insert(self.Connections, ToggleBtn.MouseButton1Click:Connect(function()
-        state = not state
-        ToggleBtn.BackgroundColor3 = state and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(100, 100, 100)
-        ToggleBtn.Text = state and "ON" or "OFF"
-        callback(state)
-    end))
-    
-    return ToggleFrame
-end
-
-function UI:CreateSlider(parent, size, position, min, max, default, callback)
-    local SliderFrame = Instance.new("Frame")
-    SliderFrame.Size = size
-    SliderFrame.Position = position
-    SliderFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-    SliderFrame.BorderSizePixel = 0
-    SliderFrame.Parent = parent
-    
-    local Corner = Instance.new("UICorner")
-    Corner.CornerRadius = UDim.new(0, 12)
-    Corner.Parent = SliderFrame
-    
-    local Fill = Instance.new("Frame")
-    Fill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
-    Fill.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
-    Fill.BorderSizePixel = 0
-    Fill.Parent = SliderFrame
-    
-    local FillCorner = Instance.new("UICorner")
-    FillCorner.CornerRadius = UDim.new(0, 12)
-    FillCorner.Parent = Fill
-    
-    local dragging = false
-    
-    local function update(input)
-        local pos = math.clamp((input.Position.X - SliderFrame.AbsolutePosition.X) / SliderFrame.AbsoluteSize.X, 0, 1)
-        local value = math.floor(min + (max - min) * pos)
-        Fill.Size = UDim2.new(pos, 0, 1, 0)
-        callback(value)
-    end
-    
-    table.insert(self.Connections, SliderFrame.InputBegan:Connect(function(input)
-
-if input.UserInputType == Enum.UserInputType.MouseButton1 or 
-           input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            update(input)
-        end
-    end))
-    
-    table.insert(self.Connections, SliderFrame.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or 
-           input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end))
-    
-    table.insert(self.Connections, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or
-                         input.UserInputType == Enum.UserInputType.Touch) then
-            update(input)
-        end
-    end))
-    
-    return SliderFrame
-end
-
-function UI:CreateDropdown(parent, size, position, options, displayKey, callback)
-    local DropdownBtn = Instance.new("TextButton")
-    DropdownBtn.Size = size
-    DropdownBtn.Position = position
-    DropdownBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
-    DropdownBtn.Text = ""
-    DropdownBtn.BorderSizePixel = 0
-    DropdownBtn.AutoButtonColor = false
-    DropdownBtn.Parent = parent
-    
-    local BtnCorner = Instance.new("UICorner")
-    BtnCorner.CornerRadius = UDim.new(0, 6)
-    BtnCorner.Parent = DropdownBtn
-    
-    local SelectedLabel = Instance.new("TextLabel")
-    SelectedLabel.Size = UDim2.new(1, -30, 1, 0)
-    SelectedLabel.Position = UDim2.new(0, 10, 0, 0)
-    SelectedLabel.BackgroundTransparency = 1
-    SelectedLabel.Text = options[1][displayKey] .. " ▼"
-    SelectedLabel.Font = Enum.Font.Gotham
-    SelectedLabel.TextSize = 12
-    SelectedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-    SelectedLabel.TextXAlignment = Enum.TextXAlignment.Left
-    SelectedLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    SelectedLabel.Parent = DropdownBtn
-    
-    local DropdownList = Instance.new("ScrollingFrame")
-    DropdownList.Size = UDim2.new(1, 0, 0, 150)
-    DropdownList.Position = UDim2.new(0, 0, 1, 5)
-    DropdownList.BackgroundColor3 = Color3.fromRGB(45, 45, 50)
-    DropdownList.BorderSizePixel = 0
-    DropdownList.ScrollBarThickness = 4
-    DropdownList.Visible = false
-    DropdownList.ZIndex = 10
-    DropdownList.Parent = DropdownBtn
-    
-    local ListCorner = Instance.new("UICorner")
-    ListCorner.CornerRadius = UDim.new(0, 6)
-    ListCorner.Parent = DropdownList
-    
-    local ListLayout = Instance.new("UIListLayout")
-    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    ListLayout.Parent = DropdownList
-    
-    for i, option in ipairs(options) do
-        local OptionBtn = Instance.new("TextButton")
-        OptionBtn.Size = UDim2.new(1, -4, 0, 30)
-        OptionBtn.BackgroundColor3 = (i % 2 == 0) and Color3.fromRGB(50, 50, 55) or Color3.fromRGB(45, 45, 50)
-        OptionBtn.Text = option[displayKey]
-        OptionBtn.Font = Enum.Font.Gotham
-        OptionBtn.TextSize = 11
-        OptionBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
-        OptionBtn.BorderSizePixel = 0
-        OptionBtn.ZIndex = 11
-        OptionBtn.AutoButtonColor = false
-        OptionBtn.LayoutOrder = i
-        OptionBtn.Parent = DropdownList
-        
-        table.insert(self.Connections, OptionBtn.MouseButton1Click:Connect(function()
-            SelectedLabel.Text = option[displayKey] .. " ▼"
-            DropdownList.Visible = false
-            callback(option)
-        end))
-    end
-    
-    DropdownList.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y)
-    
-    table.insert(self.Connections, ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        DropdownList.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y)
-    end))
-    
-    table.insert(self.Connections, DropdownBtn.MouseButton1Click:Connect(function()
-        DropdownList.Visible = not DropdownList.Visible
-    end))
-    
-    return DropdownBtn
-end
-
-function UI:SwitchTab(tabName, buttons)
-    for name, page in pairs(self.Pages) do
-        page.Visible = (name == tabName)
-    end
-    
-    for name, button in pairs(buttons) do
-        if name == tabName then
-            button.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
-            button.TextColor3 = Color3.fromRGB(255, 255, 255)
-        else
-            button.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-            button.TextColor3 = Color3.fromRGB(200, 200, 200)
-        end
-    end
-    
-    self.CurrentPage = tabName
-end
-
-function UI:UpdateStatus(text, color)
-    if self.Elements.StatusLabel then
-        pcall(function()
-            self.Elements.StatusLabel.Text = "● " .. text
-            self.Elements.StatusLabel.TextColor3 = color or Color3.fromRGB(100, 255, 100)
-        end)
-    end
-end
-
-function UI:UpdateRuntime()
-    if self.Elements.RuntimeLabel and MacroState.Active then
-        pcall(function()
-            local runtime = tick() - MacroState.StartTime
-            local hours = math.floor(runtime / 3600)
-            local minutes = math.floor((runtime % 3600) / 60)
-            local seconds = math.floor(runtime % 60)
-            self.Elements.RuntimeLabel.Text = string.format("⏱ Runtime: %02d:%02d:%02d", hours, minutes, seconds)
-        end)
-    end
-end
-
-function UI:UpdateStats()
-    for key, value in pairs(MacroState.SessionStats) do
-        local element = self.Elements["Stat_" .. key]
-        if element then
-            pcall(function()
-                element.Text = tostring(value)
-            end)
         end
     end
 end
 
-function UI:QuickAction(action)
-    if action == "Hive" then
-        MacroState.CurrentPhase = "Converting"
-    elseif action == "Tokens" then
-        task.spawn(function()
-            pcall(Movement.CollectAllTokens)
-        end)
-    elseif action == "Reset" then
-        if Character then
-            pcall(function()
-                Character:BreakJoints()
-            end)
+LocalPlayer.CharacterAdded:Connect(function(character)
+    task.spawn(function()
+        attachCharacter(character)
+    end)
+end)
+
+if LocalPlayer.Character then
+    task.spawn(function()
+        attachCharacter(LocalPlayer.Character)
+    end)
+else
+    task.spawn(function()
+        local character = LocalPlayer.CharacterAdded:Wait()
+        attachCharacter(character)
+    end)
+end
+
+------------------------------------------------------------
+-- Q TABLE
+------------------------------------------------------------
+
+local Q = {}
+
+if isfile and isfile(CONFIG.qFileName) then
+    pcall(function()
+        local raw = readfile(CONFIG.qFileName)
+        local decoded = HttpService:JSONDecode(raw)
+
+        if type(decoded) == "table" then
+            Q = decoded
         end
+    end)
+end
+
+local function initState(state)
+    local old = Q[state]
+
+    if type(old) ~= "table" then
+        old = {}
     end
-end
 
-function UI:StartMacro()
-    UpdateCache()
-    self:UpdateStatus("STARTING - Initializing systems...", Color3.fromRGB(255, 200, 50))
-end
+    local row = {}
 
-function UI:StopMacro()
-    self:UpdateStatus("STOPPED - Macro halted", Color3.fromRGB(255, 100, 100))
-    if Humanoid then
-        pcall(function()
-            Humanoid:MoveTo(Root.Position)
-        end)
-    end
-end
+    for i = 1, #actions do
+        local value = tonumber(old[i]) or tonumber(old[tostring(i)]) or 0
 
---// ═══════════════════════════════════════════════════════════
---// ДВИЖЕНИЕ И НАВИГАЦИЯ (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
-
-Movement = {}
-
-function Movement.GetHivePosition()
-    if MacroState.HivePosition then return MacroState.HivePosition end
-    
-    UpdateCache()
-    if not Cache.Hives then return nil end
-    
-    for _, hive in pairs(Cache.Hives:GetChildren()) do
-        local owner = hive:FindFirstChild("Owner")
-        if owner and owner.Value == Player then
-            local spawn = hive:FindFirstChild("SpawnPos")
-            if spawn and spawn.Value then
-                MacroState.HivePosition = spawn.Value.Position
-                return MacroState.HivePosition
-            end
+        if value ~= value then
+            value = 0
         end
+
+        row[i] = value
     end
-    return nil
+
+    Q[state] = row
 end
 
-function Movement.GetFieldPosition(fieldName)
-    UpdateCache()
-    if not Cache.FlowerZones then return nil end
-    
-    local field = Cache.FlowerZones:FindFirstChild(fieldName)
-    if field and field:IsA("BasePart") then
-        return field.Position
-    end
-    return nil
+for state in pairs(Q) do
+    initState(state)
 end
 
-function Movement.PathfindTo(targetPos, timeout)
-    if not Root or not Humanoid then return false end
-    if not MacroState.Active then return false end
-    if not targetPos then return false end
-    
-    timeout = timeout or 30
-    MacroState.IsMoving = true
-    
-    local distance = (Root.Position - targetPos).Magnitude
-    
-    -- Прямое движение для близких расстояний
-    if distance < 20 then
+local function saveQ()
+    if not writefile then
+        return
+    end
 
-Humanoid:MoveTo(targetPos)
-        local timer = 0
-        while (Root.Position - targetPos).Magnitude > 5 and timer < 5 and MacroState.Active do
-            task.wait(0.1)
-            timer = timer + 0.1
-        end
-        MacroState.IsMoving = false
+    pcall(function()
+        writefile(CONFIG.qFileName, HttpService:JSONEncode(Q))
+    end)
+end
+
+------------------------------------------------------------
+-- HELPERS
+------------------------------------------------------------
+
+local function getCamera()
+    camera = workspace.CurrentCamera or camera
+    return camera
+end
+
+local function getHumanoid(model)
+    if not model then
+        return nil
+    end
+
+    return model:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot(model)
+    if not model then
+        return nil
+    end
+
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+end
+
+local function isModelAlive(model)
+    if not model or not model.Parent then
+        return false
+    end
+
+    local hum = getHumanoid(model)
+    local root = getRoot(model)
+
+    return hum ~= nil and root ~= nil and hum.Health > 0
+end
+
+local function botReady()
+    return bot.character ~= nil
+        and bot.character.Parent ~= nil
+        and bot.humanoid ~= nil
+        and bot.humanoid.Parent ~= nil
+        and bot.hrp ~= nil
+        and bot.hrp.Parent ~= nil
+        and bot.humanoid.Health > 0
+end
+
+local function clampNumber(value, min, max)
+    if value ~= value then
+        return min
+    end
+
+    if value < min then
+        return min
+    end
+
+    if value > max then
+        return max
+    end
+
+    return value
+end
+
+local function getSelfHealthFrac()
+    if not botReady() then
+        return 1
+    end
+
+    return bot.humanoid.Health / math.max(1, bot.humanoid.MaxHealth)
+end
+
+local function isAttackAction(name)
+    if name == "m1_attack" then
         return true
     end
-    
-    -- Pathfinding для дальних расстояний
-    local path = PathfindingService:CreatePath({
-        AgentRadius = 2,
-        AgentHeight = 5,
-        AgentCanJump = true,
-        AgentCanClimb = false,
-        WaypointSpacing = 4,
-        Costs = {
-            Water = math.huge,
-            Danger = 10
-        }
-    })
-    
-    local success, errorMsg = pcall(function()
-        path:ComputeAsync(Root.Position, targetPos)
-    end)
-    
-    if not success or path.Status ~= Enum.PathStatus.Success then
-        -- Fallback: прямое движение
-        Humanoid:MoveTo(targetPos)
-        task.wait(math.min(distance / MacroConfig.WalkSpeed, 10))
-        MacroState.IsMoving = false
-        return false
-    end
-    
-    local waypoints = path:GetWaypoints()
-    local startTime = tick()
-    
-    for i = 2, #waypoints do
-        if not MacroState.Active or not Root then 
-            MacroState.IsMoving = false
-            return false 
-        end
-        
-        if tick() - startTime > timeout then
-            MacroState.IsMoving = false
-            return false
-        end
-        
-        local waypoint = waypoints[i]
-        
-        -- Прыжок если нужно
-        if waypoint.Action == Enum.PathWaypointAction.Jump then
-            Humanoid.Jump = true
-            task.wait(0.3)
-        end
-        
-        Humanoid:MoveTo(waypoint.Position)
-        
-        -- Ожидание достижения точки
-        local timer = 0
-        local reached = false
-        while timer < 3 and not reached and MacroState.Active do
-            if (Root.Position - waypoint.Position).Magnitude < 5 then
-                reached = true
-            end
-            timer = timer + 0.1
-            task.wait(0.1)
-        end
-        
-        -- Если застряли
-        if not reached then
-            Humanoid.Jump = true
-            task.wait(0.5)
-        end
-    end
-    
-    MacroState.IsMoving = false
-    return true
+
+    return name:sub(1, 6) == "skill_"
 end
 
-function Movement.CollectNearbyTokens()
-    if not Cache.Collectibles or not Root then return 0 end
-    
-    local collected = 0
-    
-    pcall(function()
-        for _, token in pairs(Cache.Collectibles:GetChildren()) do
-            if not MacroState.Active then break end
-            
-            if token:IsA("BasePart") and token.Transparency < 1 then
-                local dist = (token.Position - Root.Position).Magnitude
-                
-                if dist < MacroConfig.TokenRange then
-                    local direction = (token.Position - Root.Position).Unit
-                    Humanoid:MoveTo(Root.Position + direction * math.min(dist - 2, 5))
-                    task.wait(0.05)
-                    collected = collected + 1
+------------------------------------------------------------
+-- TARGET SEARCH
+------------------------------------------------------------
+
+local function findNearestTarget()
+    if not botReady() then
+        return nil, math.huge
+    end
+
+    local best, bestDist = nil, math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local allowed = true
+
+        if CONFIG.targetUserId ~= nil then
+            allowed = plr.UserId == CONFIG.targetUserId
+        end
+
+        if allowed and plr ~= LocalPlayer and plr.Character and isModelAlive(plr.Character) then
+            local root = getRoot(plr.Character)
+
+            if root then
+                local d = (root.Position - bot.hrp.Position).Magnitude
+
+                if d < bestDist then
+                    bestDist = d
+                    best = plr.Character
                 end
             end
         end
-    end)
-    
-    return collected
+    end
+
+    return best, bestDist
 end
 
-function Movement.CollectAllTokens()
-    if not Cache.Collectibles or not Root then return end
-    
-    UI:UpdateStatus("COLLECTING - Gathering all tokens...", Color3.fromRGB(100, 200, 255))
-    
-    local tokens = {}
-    pcall(function()
-        tokens = Cache.Collectibles:GetChildren()
-    end)
-    
-    table.sort(tokens, function(a, b)
-        if not a:IsA("BasePart") or not b:IsA("BasePart") then return false end
-        return (a.Position - Root.Position).Magnitude < (b.Position - Root.Position).Magnitude
-    end)
-    
-    for _, token in ipairs(tokens) do
-        if not MacroState.Active then break end
-        
-        if token:IsA("BasePart") and token.Transparency < 1 then
-            Movement.PathfindTo(token.Position, 10)
-            Movement.CollectNearbyTokens()
+------------------------------------------------------------
+-- VISION
+------------------------------------------------------------
+
+local function isVisible(target)
+    if not botReady() then
+        return false
+    end
+
+    local part = target:FindFirstChild("Head")
+        or target:FindFirstChild("UpperTorso")
+        or getRoot(target)
+
+    if not part then
+        return false
+    end
+
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {bot.character}
+    params.FilterType = RAY_FILTER
+    params.IgnoreWater = true
+
+    local origin = bot.hrp.Position + Vector3.new(0, 1.5, 0)
+    local direction = part.Position - origin
+
+    if direction.Magnitude < 0.1 then
+        return true
+    end
+
+    local result = workspace:Raycast(origin, direction, params)
+
+    return result == nil or (result.Instance and result.Instance:IsDescendantOf(target))
+end
+
+------------------------------------------------------------
+-- ENEMY STATUS
+------------------------------------------------------------
+
+local BLOCK_ATTRS = {
+    "Blocking",
+    "IsBlocking",
+    "Block",
+    "BlockActive",
+    "BlockingActive",
+    "IsBlock",
+    "BlockState",
+}
+
+local VULNERABLE_ATTRS = {
+    "Stunned",
+    "IsStunned",
+    "Stun",
+    "Ragdolled",
+    "Ragdoll",
+    "IsRagdolled",
+    "Downed",
+    "Knocked",
+    "KnockedDown",
+    "Hitstun",
+    "Blockstun",
+    "Paralyzed",
+    "Disabled",
+}
+
+local ATTACK_ATTRS = {
+    "Attacking",
+    "IsAttacking",
+    "AttackActive",
+    "Casting",
+    "IsCasting",
+    "UsingSkill",
+    "SkillActive",
+}
+
+local BLOCK_TAGS = {
+    "Blocking",
+    "Block",
+    "IsBlocking",
+}
+
+local VULNERABLE_TAGS = {
+    "Stunned",
+    "Ragdoll",
+    "Downed",
+    "Knocked",
+}
+
+local ATTACK_TAGS = {
+    "Attacking",
+    "Attack",
+    "Casting",
+}
+
+local function attrTrueOnInst(inst, names)
+    if not inst then
+        return false
+    end
+
+    for _, name in ipairs(names) do
+        local value = inst:GetAttribute(name)
+
+        if value == true or value == 1 then
+            return true
         end
     end
+
+    return false
 end
 
---// ═══════════════════════════════════════════════════════════
---// ПАТТЕРНЫ ФАРМИНГА (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+local function tagTrueOnInst(inst, names)
+    if not inst then
+        return false
+    end
 
-FarmingPatterns = {}
-
-function FarmingPatterns.Spiral(center, radius, duration)
-    if not center or not Root or not Humanoid then return end
-    
-    local startTime = tick()
-    local angle = 0
-    local currentRadius = 5
-    local expanding = true
-    
-    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
-        if tick() - startTime >= duration then break end
-        
-        -- Проверка рюкзака
-        if Farming.CheckBackpack() then
-            MacroState.CurrentPhase = "Converting"
-            return
-        end
-        
-        -- Спираль
-        angle = angle + (MacroConfig.SpiralSpeed / 10)
-        
-        if expanding then
-            currentRadius = currentRadius + 0.3
-            if currentRadius >= radius then expanding = false end
-        else
-            currentRadius = currentRadius - 0.3
-            if currentRadius <= 5 then expanding = true end
-        end
-        
-        local targetX = center.X + math.cos(angle) * currentRadius
-        local targetZ = center.Z + math.sin(angle) * currentRadius
-        local target = Vector3.new(targetX, center.Y, targetZ)
-        
-        pcall(function()
-            Humanoid:MoveTo(target)
+    for _, tag in ipairs(names) do
+        local ok, has = pcall(function()
+            return CollectionService:HasTag(inst, tag)
         end)
-        
-        -- Проверка "ушли далеко"
-        if (Root.Position - center).Magnitude > radius + 20 then
-            Movement.PathfindTo(center, 15)
-            currentRadius = 5
-            angle = 0
+
+        if ok and has then
+            return true
         end
-        
-        Movement.CollectNearbyTokens()
-        task.wait(MacroConfig.TickRate)
     end
+
+    return false
 end
 
-function FarmingPatterns.Square(center, size, duration)
-    if not center or not Root or not Humanoid then return end
-    
-    local startTime = tick()
-    local corners = {
-        Vector3.new(center.X + size/2, center.Y, center.Z + size/2),
-        Vector3.new(center.X - size/2, center.Y, center.Z + size/2),
-        Vector3.new(center.X - size/2, center.Y, center.Z - size/2),
-        Vector3.new(center.X + size/2, center.Y, center.Z - size/2)
-    }
-    
-    local cornerIndex = 1
-    
-    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
-        if tick() - startTime >= duration then break end
-        
-        if Farming.CheckBackpack() then
-            MacroState.CurrentPhase = "Converting"
-            return
-        end
-        
-        local target = corners[cornerIndex]
-        Movement.PathfindTo(target, 20)
-        
-        cornerIndex = cornerIndex + 1
-        if cornerIndex > 4 then cornerIndex = 1 end
-        
-        Movement.CollectNearbyTokens()
-        task.wait(MacroConfig.PathUpdateRate)
+local function getEnemyStatus(target)
+    if not isModelAlive(target) then
+        return "dead"
     end
-end
 
-function FarmingPatterns.Zigzag(center, width, duration)
-    if not center or not Root or not Humanoid then return end
-    
-    local startTime = tick()
-    local rows = 10
-    local rowHeight = width / rows
-    local currentRow = 0
-    local goingRight = true
-    
-    while MacroState.Active and MacroState.CurrentPhase == "Gathering" do
-        if tick() - startTime >= duration then break end
-        
-        if Farming.CheckBackpack() then
-            MacroState.CurrentPhase = "Converting"
-            return
-        end
-        
-        local targetX = goingRight and (center.X + width/2) or (center.X - width/2)
-        local targetZ = center.Z + (currentRow * rowHeight) - (width/2)
-        local target = Vector3.new(targetX, center.Y, targetZ)
-        
-        Movement.PathfindTo(target, 20)
-        
-        goingRight = not goingRight
-        currentRow = currentRow + 1
-        if currentRow >= rows then currentRow = 0 end
-        
-        Movement.CollectNearbyTokens()
-        task.wait(MacroConfig.PathUpdateRate)
+    local hum = getHumanoid(target)
+    local root = getRoot(target)
+
+    if attrTrueOnInst(hum, BLOCK_ATTRS)
+        or attrTrueOnInst(root, BLOCK_ATTRS)
+        or attrTrueOnInst(target, BLOCK_ATTRS)
+        or tagTrueOnInst(hum, BLOCK_TAGS)
+        or tagTrueOnInst(target, BLOCK_TAGS) then
+        return "blocking"
     end
+
+    if attrTrueOnInst(hum, VULNERABLE_ATTRS)
+        or attrTrueOnInst(root, VULNERABLE_ATTRS)
+        or attrTrueOnInst(target, VULNERABLE_ATTRS)
+        or tagTrueOnInst(hum, VULNERABLE_TAGS)
+        or tagTrueOnInst(target, VULNERABLE_TAGS) then
+        return "vulnerable"
+    end
+
+    if hum and hum.PlatformStand then
+        return "vulnerable"
+    end
+
+    return "neutral"
 end
 
---// ═══════════════════════════════════════════════════════════
---// СИСТЕМА ФАРМИНГА (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+local ATTACK_ANIM_KEYWORDS = {
+    "attack",
+    "m1",
+    "combo",
+    "skill",
+    "cast",
+    "punch",
+    "kick",
+}
 
-Farming = {}
-
-function Farming.CheckBackpack()
-
-local success, result = pcall(function()
-        if not Player:FindFirstChild("CoreStats") then return false end
-        
-        local pollenStat = Player.CoreStats:FindFirstChild("Pollen")
-        local capacityStat = Player.CoreStats:FindFirstChild("Capacity")
-        
-        if pollenStat and capacityStat and capacityStat.Value > 0 then
-            local percent = (pollenStat.Value / capacityStat.Value) * 100
-            return percent >= MacroConfig.ConvertAt
-        end
-        
-        return false
-    end)
-    
-    return success and result
-end
-
-function Farming.DoFarming(fieldName)
-    if not Root or not Humanoid then return false end
-    
-    local fieldPos = Movement.GetFieldPosition(fieldName)
-    if not fieldPos then
-        UI:UpdateStatus("ERROR - Field not found: " .. fieldName, Color3.fromRGB(255, 50, 50))
-        task.wait(3)
+local function enemyLikelyAttacking(target)
+    if not isModelAlive(target) or not botReady() then
         return false
     end
-    
-    UI:UpdateStatus("TRAVELING - Going to " .. fieldName, Color3.fromRGB(100, 200, 255))
-    
-    -- Идем к полю
-    local reached = Movement.PathfindTo(fieldPos, 45)
-    
-    if not reached or (Root.Position - fieldPos).Magnitude > 50 then
-        UI:UpdateStatus("ERROR - Failed to reach field", Color3.fromRGB(255, 50, 50))
-        task.wait(3)
-        return false
-    end
-    
-    UI:UpdateStatus("FARMING - " .. fieldName, Color3.fromRGB(50, 255, 100))
-    MacroState.CurrentPhase = "Gathering"
-    
-    -- Выбираем паттерн
-    local pattern = MacroState.FarmingPattern
-    
-    pcall(function()
-        if pattern == "Spiral" then
-            FarmingPatterns.Spiral(fieldPos, MacroConfig.SpiralRadius, MacroConfig.FarmDuration)
-        elseif pattern == "Square" then
-            FarmingPatterns.Square(fieldPos, MacroConfig.SquareSize, MacroConfig.FarmDuration)
-        elseif pattern == "Zigzag" then
-            FarmingPatterns.Zigzag(fieldPos, MacroConfig.ZigzagWidth, MacroConfig.FarmDuration)
-        end
-    end)
-    
-    MacroState.SessionStats.FieldsCompleted = MacroState.SessionStats.FieldsCompleted + 1
-    return true
-end
 
-function Farming.DoConverting()
-    if not Root or not Humanoid then return false end
-    
-    local hivePos = Movement.GetHivePosition()
-    
-    if not hivePos then
-        UI:UpdateStatus("ERROR - Hive not found!", Color3.fromRGB(255, 50, 50))
-        task.wait(3)
+    local hum = getHumanoid(target)
+    local root = getRoot(target)
+
+    if not hum or not root then
         return false
     end
-    
-    MacroState.CurrentPhase = "Converting"
-    UI:UpdateStatus("CONVERTING - Returning to hive", Color3.fromRGB(255, 200, 50))
-    
-    Movement.PathfindTo(hivePos, 60)
-    
-    -- Выравниваемся с ульем
-    local alignTime = 0
-    while (Root.Position - hivePos).Magnitude > 8 and alignTime < 15 and MacroState.Active do
-        pcall(function()
-            Humanoid:MoveTo(hivePos)
+
+    if attrTrueOnInst(hum, ATTACK_ATTRS)
+        or attrTrueOnInst(root, ATTACK_ATTRS)
+        or attrTrueOnInst(target, ATTACK_ATTRS)
+        or tagTrueOnInst(hum, ATTACK_TAGS)
+        or tagTrueOnInst(target, ATTACK_TAGS) then
+        return true
+    end
+
+    local animator = hum:FindFirstChildOfClass("Animator")
+
+    if animator then
+        local ok, tracks = pcall(function()
+            return animator:GetPlayingAnimationTracks()
         end)
-        task.wait(0.5)
-        alignTime = alignTime + 0.5
+
+        if ok and tracks then
+            for _, track in ipairs(tracks) do
+                local trackName = track.Name:lower()
+
+                for _, keyword in ipairs(ATTACK_ANIM_KEYWORDS) do
+                    if string.find(trackName, keyword, 1, true) then
+                        return true
+                    end
+                end
+            end
+        end
     end
-    
-    if alignTime >= 15 then
-        UI:UpdateStatus("ERROR - Failed to reach hive", Color3.fromRGB(255, 50, 50))
-        task.wait(3)
+
+    local dist = (root.Position - bot.hrp.Position).Magnitude
+
+    if dist > CONFIG.attackRange + 4 then
         return false
     end
-    
-    UI:UpdateStatus("CONVERTING - Making honey...", Color3.fromRGB(255, 200, 50))
-    
-    -- Спамим E для конвертации
-    local convertRunning = true
-    local convertTask = task.spawn(function()
-        while convertRunning and MacroState.CurrentPhase == "Converting" and MacroState.Active do
-            pcall(function()
-                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                task.wait(0.05)
-                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-            end)
-            task.wait(1.5)
-        end
-    end)
-    
-    -- Ждем пока рюкзак опустеет
-    local timeout = 0
-    local pollenStat = nil
-    
-    pcall(function()
-        if Player:FindFirstChild("CoreStats") then
-            pollenStat = Player.CoreStats:FindFirstChild("Pollen")
 
+    local toBot = bot.hrp.Position - root.Position
+
+    if toBot.Magnitude < 0.2 then
+        return false
+    end
+
+    local lookDot = root.CFrame.LookVector:Dot(toBot.Unit)
+    local moving = hum.MoveDirection.Magnitude > 0.1
+
+    if lookDot > 0.75 and not moving then
+        return true
+    end
+
+    return false
 end
-    end)
-    
-    repeat
-        task.wait(1)
-        timeout = timeout + 1
-        
-        -- Анти-АФК
-        if timeout % 15 == 0 and Humanoid then
-            pcall(function()
-                Humanoid.Jump = true
-            end)
-        end
-        
-        if not pollenStat then break end
-        
-    until (pollenStat and pollenStat.Value < 10) or timeout > 120 or not MacroState.Active
-    
-    convertRunning = false
-    task.cancel(convertTask)
-    
-    if timeout >= 120 then
-        UI:UpdateStatus("WARNING - Convert timeout", Color3.fromRGB(255, 150, 50))
+
+------------------------------------------------------------
+-- STATE
+------------------------------------------------------------
+
+local function getRangeState(dist)
+    if dist <= CONFIG.distance.melee then
+        return "melee"
+    elseif dist <= CONFIG.distance.mid then
+        return "mid"
     else
-        UI:UpdateStatus("SUCCESS - Honey converted!", Color3.fromRGB(50, 255, 100))
+        return "far"
     end
-    
-    task.wait(2)
-    MacroState.CurrentPhase = "Gathering"
-    return true
 end
 
---// ═══════════════════════════════════════════════════════════
---// АВТОКЛИКЕР (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
-
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-        if MacroState.Active and MacroState.CurrentPhase == "Gathering" then
-            pcall(function()
-                if Character then
-                    local tool = Character:FindFirstChildOfClass("Tool")
-                    if tool then
-                        tool:Activate()
-                    end
-                end
-            end)
-        end
+local function getOrientation(targetRoot)
+    if not botReady() or not targetRoot then
+        return "side"
     end
-end)
 
---// ═══════════════════════════════════════════════════════════
---// АНТИ-ЗАСТРЕВАНИЕ (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+    local toTarget = targetRoot.Position - bot.hrp.Position
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        
-        if MacroState.Active and MacroState.CurrentPhase ~= "Idle" and MacroState.CurrentPhase ~= "Converting" then
-            pcall(function()
-                if Root then
-                    local currentPos = Root.Position
-                    local moved = (currentPos - MacroState.LastPosition).Magnitude
-                    
-                    if moved < 1 and not MacroState.IsMoving then
-                        MacroState.StuckTime = MacroState.StuckTime + 1
-                        
-                        if MacroState.StuckTime >= MacroConfig.StuckThreshold then
-                            -- Попытка освободиться
-                            if Humanoid then
-                                Humanoid.Jump = true
-                                task.wait(0.3)
-                                
-                                local randomOffset = Vector3.new(
-                                    math.random(-15, 15),
-                                    0,
-                                    math.random(-15, 15)
-                                )
-                                Humanoid:MoveTo(currentPos + randomOffset)
-                            end
-                            
-                            MacroState.StuckTime = 0
-                        end
-                    else
-                        MacroState.StuckTime = 0
-                    end
-                    
-                    MacroState.LastPosition = currentPos
-                end
-            end)
-        end
+    if toTarget.Magnitude < 0.1 then
+        return "front"
     end
-end)
 
---// ═══════════════════════════════════════════════════════════
---// СТАТИСТИКА И ОБНОВЛЕНИЯ (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+    local dot = bot.hrp.CFrame.LookVector:Dot(toTarget.Unit)
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        
-        if MacroState.Active and UI.Initialized then
-            pcall(function()
-                UI:UpdateRuntime()
-                UI:UpdateStats()
-            end)
-            
-            if tick() - Cache.LastUpdate > Cache.UpdateInterval then
-                UpdateCache()
-            end
-        end
+    if dot > 0.65 then
+        return "front"
+    elseif dot < -0.45 then
+        return "behind"
     end
-end)
 
---// ═══════════════════════════════════════════════════════════
---// ГЛАВНЫЙ ЦИКЛ (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+    return "side"
+end
 
-task.spawn(function()
-    task.wait(2) -- Ждем полной загрузки игры
-    
-    UpdateCache()
-    UI:Create()
-    UI:UpdateStatus("READY - Press START to begin", Color3.fromRGB(100, 255, 100))
-    
-    while true do
-        task.wait(0.5)
-        
-        if MacroState.Active then
-            pcall(function()
-                if Root and Humanoid then
-                    
-                    if MacroState.CurrentPhase == "Idle" then
-                        MacroState.CurrentPhase = "Gathering"
-                        
-                    elseif MacroState.CurrentPhase == "Gathering" then
-                        Farming.DoFarming(MacroState.TargetField)
-                        
-                    elseif MacroState.CurrentPhase == "Converting" then
-                        Farming.DoConverting()
-                    end
-                end
-            end)
-        end
+local function getTargetMotion(target)
+    local hum = getHumanoid(target)
+
+    if not hum then
+        return "idle"
     end
-end)
 
---// ═══════════════════════════════════════════════════════════
---// ОБРАБОТКА РЕСПАВНА (ИСПРАВЛЕНО)
---// ═══════════════════════════════════════════════════════════
+    if hum.MoveDirection.Magnitude > 0.1 then
+        return "move"
+    end
 
-Player.CharacterAdded:Connect(function(NewChar)
-    task.wait(1)
-    
-    Character = NewChar
-    Humanoid = Character:WaitForChild("Humanoid", 10)
-    Root = Character:WaitForChild("HumanoidRootPart", 10)
-    
-    if not Humanoid or not Root then
-        warn("Failed to get character parts after respawn")
+    return "idle"
+end
+
+local function getSelfHealthState()
+    local frac = getSelfHealthFrac()
+
+    if frac <= CONFIG.lowHealthThreshold then
+        return "lowhp"
+    end
+
+    return "ok"
+end
+
+local function getState(target, dist)
+    if not target or not isModelAlive(target) then
+        return "enemy_dead"
+    end
+
+    local root = getRoot(target)
+
+    if not root or not botReady() then
+        return "no_target"
+    end
+
+    return string.format(
+        "%s_%s_%s_%s_%s_%s_%s",
+        getRangeState(dist),
+        isVisible(target) and "vis" or "novis",
+        getEnemyStatus(target),
+        enemyLikelyAttacking(target) and "atk" or "calm",
+        getOrientation(root),
+        getTargetMotion(target),
+        getSelfHealthState()
+    )
+end
+
+------------------------------------------------------------
+-- MOVEMENT CONTROLLER v4
+------------------------------------------------------------
+
+local MV = CONFIG.movement or {}
+
+local function safeUnit(v, fallback)
+    if not v then
+        return fallback or Vector3.new(0, 0, 1)
+    end
+
+    local m = v.Magnitude
+
+    if m > 0.001 then
+        return v / m
+    end
+
+    return fallback or Vector3.new(0, 0, 1)
+end
+
+local Movement = {
+    combat = {
+        target = nil,
+        desiredRange = 5,
+    },
+
+    override = nil,
+    wander = nil,
+
+    waypoints = {},
+    waypointIndex = 1,
+    pathGoal = Vector3.zero,
+    pathMode = "none",
+    lastPathCompute = 0,
+    pathComputing = false,
+    queuedPathGoal = nil,
+    queuedPathMode = nil,
+    pathRequestId = 0,
+
+    lastStuckCheck = 0,
+    lastPos = Vector3.zero,
+    lastJump = 0,
+
+    lastVisCheck = 0,
+    directOK = false,
+
+    lastObstacleCheck = 0,
+    obstacleHit = false,
+    sideDir = Vector3.zero,
+
+    strafeSide = 1,
+    nextStrafeSwitch = 0,
+
+    idleStopped = false,
+}
+
+function Movement.resetPath()
+    Movement.pathRequestId = Movement.pathRequestId + 1
+
+    Movement.waypoints = {}
+    Movement.waypointIndex = 1
+    Movement.pathGoal = Vector3.zero
+    Movement.pathMode = "none"
+    Movement.lastPathCompute = 0
+    Movement.queuedPathGoal = nil
+    Movement.queuedPathMode = nil
+end
+
+function Movement.isOverrideActive()
+    return Movement.override ~= nil and tick() < (Movement.override.until or 0)
+end
+
+function Movement.isWanderActive()
+    return Movement.wander ~= nil and tick() < (Movement.wander.until or 0)
+end
+
+function Movement.getDesiredRange()
+    return Movement.combat.desiredRange or MV.stopDistance or 5
+end
+
+function Movement.jump()
+    if not botReady() then
         return
     end
-    
-    MacroState.SessionStats.DeathCount = MacroState.SessionStats.DeathCount + 1
-    
-    if MacroState.Active then
-        UI:UpdateStatus("RESPAWNED - Resuming macro...", Color3.fromRGB(255, 200, 50))
-        task.wait(2)
-        UpdateCache()
-        MacroState.HivePosition = nil
-        MacroState.CurrentPhase = "Gathering"
-        MacroState.LastPosition = Root.Position
-        MacroState.StuckTime = 0
+
+    if tick() - Movement.lastJump < 0.55 then
+        return
     end
-end)
 
---// ═══════════════════════════════════════════════════════════
---// ОБРАБОТКА ВЫХОДА
---// ═══════════════════════════════════════════════════════════
+    Movement.lastJump = tick()
 
-game:GetService("Players").PlayerRemoving:Connect(function(player)
-    if player == Player then
-        MacroState.Active = false
-        if UI then
-            UI:Cleanup()
+    pcall(function()
+        bot.humanoid.Jump = true
+    end)
+
+    task.delay(0.2, function()
+        if botReady() then
+            pcall(function()
+                bot.humanoid.Jump = false
+            end)
+        end
+    end)
+end
+
+function Movement.makeRayParams(extraModel)
+    local params = RaycastParams.new()
+
+    params.FilterDescendantsInstances = {bot.character}
+
+    if extraModel then
+        table.insert(params.FilterDescendantsInstances, extraModel)
+    end
+
+    if Movement.combat.target and Movement.combat.target ~= extraModel then
+        table.insert(params.FilterDescendantsInstances, Movement.combat.target)
+    end
+
+    params.FilterType = RAY_FILTER
+    params.IgnoreWater = true
+
+    return params
+end
+
+function Movement.rayDistance(origin, dir, params, maxDist)
+    if not dir or dir.Magnitude < 0.001 then
+        return 0
+    end
+
+    local result = workspace:Raycast(origin, dir * maxDist, params)
+
+    if result then
+        return (result.Position - origin).Magnitude
+    end
+
+    return maxDist
+end
+
+function Movement.chooseSafeAwayDirection(threatPos, distance)
+    local origin = bot.hrp.Position + Vector3.new(0, 1, 0)
+
+    local away = bot.hrp.Position - threatPos
+
+    if away.Magnitude < 0.2 then
+        away = -bot.hrp.CFrame.LookVector
+    end
+
+    away = safeUnit(away, bot.hrp.CFrame.LookVector)
+
+    local right = bot.hrp.CFrame.RightVector
+
+    local candidates = {
+        {dir = away, bias = 1.0},
+        {dir = safeUnit(away + right * 0.55, away), bias = 0.85},
+        {dir = safeUnit(away - right * 0.55, away), bias = 0.85},
+        {dir = safeUnit(away + right, away), bias = 0.55},
+        {dir = safeUnit(away - right, away), bias = 0.55},
+        {dir = safeUnit(right, away), bias = 0.35},
+        {dir = safeUnit(-right, away), bias = 0.35},
+    }
+
+    local params = Movement.makeRayParams(Movement.combat.target)
+    local checkDist = math.max((distance or CONFIG.backStepDistance or 7) + 2, 8)
+
+    local bestDir = away
+    local bestScore = -math.huge
+
+    for _, c in ipairs(candidates) do
+        local space = Movement.rayDistance(origin, c.dir, params, checkDist)
+        local dot = c.dir:Dot(away)
+
+        local score = space + dot * 3 + c.bias
+
+        if score > bestScore then
+            bestScore = score
+            bestDir = c.dir
         end
     end
+
+    return bestDir
+end
+
+function Movement.setCombatTarget(model, desiredRange)
+    if not model or not isModelAlive(model) then
+        Movement.combat.target = nil
+        return
+    end
+
+    if Movement.combat.target ~= model then
+        Movement.resetPath()
+        Movement.directOK = false
+        Movement.lastVisCheck = 0
+        Movement.lastStuckCheck = 0
+
+        if botReady() then
+            Movement.lastPos = bot.hrp.Position
+        end
+    end
+
+    Movement.combat.target = model
+    Movement.combat.desiredRange = desiredRange
+        or Movement.combat.desiredRange
+        or MV.stopDistance
+        or 5
+
+    Movement.wander = nil
+    Movement.idleStopped = false
+end
+
+function Movement.clearCombatTarget()
+    if Movement.combat.target ~= nil then
+        Movement.combat.target = nil
+        Movement.resetPath()
+        Movement.directOK = false
+    end
+end
+
+function Movement.requestBackStep(threat, distance)
+    if not botReady() then
+        return
+    end
+
+    local threatPos = nil
+
+    if threat ~= nil then
+        if typeof(threat) == "Vector3" then
+            threatPos = threat
+        else
+            local root = getRoot(threat)
+
+            if root then
+                threatPos = root.Position
+            end
+        end
+    end
+
+    if not threatPos then
+        threatPos = bot.hrp.Position + bot.hrp.CFrame.LookVector * 6
+    end
+
+    local dir = Movement.chooseSafeAwayDirection(threatPos, distance)
+    local dur = MV.backStepDuration or 0.85
+
+    Movement.override = {
+        goal = bot.hrp.Position + dir * (distance or CONFIG.backStepDistance or 7),
+        until = tick() + dur,
+        type = "back_step",
+    }
+
+    Movement.resetPath()
+    Movement.idleStopped = false
+end
+
+function Movement.wanderTo(pos, duration)
+    if not botReady() or not pos then
+        return
+    end
+
+    if Movement.combat.target and isModelAlive(Movement.combat.target) then
+        return
+    end
+
+    Movement.wander = {
+        goal = pos,
+        until = tick() + (duration or 2.0),
+    }
+
+    Movement.override = nil
+    Movement.resetPath()
+    Movement.idleStopped = false
+end
+
+function Movement.unstick()
+    if not botReady() then
+        return
+    end
+
+    local origin = bot.hrp.Position + Vector3.new(0, 1, 0)
+    local params = Movement.makeRayParams(Movement.combat.target)
+
+    local right = bot.hrp.CFrame.RightVector
+    local forward = bot.hrp.CFrame.LookVector
+
+    local candidates = {
+        right,
+        -right,
+        forward,
+        -forward,
+        safeUnit(right + forward, right),
+        safeUnit(-right + forward, -right),
+        safeUnit(right - forward, right),
+        safeUnit(-right - forward, -right),
+    }
+
+    local bestDir = right
+    local bestSpace = -math.huge
+
+    for _, dir in ipairs(candidates) do
+        dir = safeUnit(dir, right)
+
+        local space = Movement.rayDistance(origin, dir, params, 7)
+
+        if space > bestSpace then
+            bestSpace = space
+            bestDir = dir
+        end
+    end
+
+    Movement.override = {
+        goal = bot.hrp.Position + bestDir * 6,
+        until = tick() + (MV.unstickDuration or 0.4),
+        type = "unstick",
+    }
+
+    Movement.resetPath()
+    Movement.lastStuckCheck = tick()
+    Movement.lastPos = bot.hrp.Position
+    Movement.idleStopped = false
+
+    stats.unstucks = stats.unstucks + 1
+
+    Movement.jump()
+end
+
+function Movement.stopIdle()
+    if botReady() and not Movement.idleStopped then
+        pcall(function()
+            bot.humanoid:MoveTo(bot.hrp.Position)
+        end)
+
+        Movement.idleStopped = true
+    end
+end
+
+function Movement.requestPath(goal, mode)
+    if not botReady() or not goal then
+        return
+    end
+
+    if Movement.pathComputing then
+        Movement.queuedPathGoal = goal
+        Movement.queuedPathMode = mode
+        return
+    end
+
+    Movement.pathComputing = true
+    Movement.pathRequestId = Movement.pathRequestId + 1
+
+    local id = Movement.pathRequestId
+
+    task.spawn(function()
+        if not botReady() then
+            Movement.pathComputing = false
+            return
+        end
+
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+        })
+
+        local ok = pcall(function()
+            path:ComputeAsync(bot.hrp.Position, goal)
+        end)
+
+        if id ~= Movement.pathRequestId then
+            Movement.pathComputing = false
+
+            if Movement.queuedPathGoal then
+                local qGoal = Movement.queuedPathGoal
+                local qMode = Movement.queuedPathMode
+
+                Movement.queuedPathGoal = nil
+                Movement.queuedPathMode = nil
+
+                Movement.requestPath(qGoal, qMode)
+            end
+
+            return
+        end
+
+        if ok and path.Status == Enum.PathStatus.Success then
+            Movement.waypoints = path:GetWaypoints()
+            Movement.waypointIndex = 2
+            Movement.pathGoal = goal
+            Movement.pathMode = mode
+            Movement.lastPathCompute = tick()
+        else
+            Movement.waypoints = {}
+            Movement.waypointIndex = 1
+            Movement.pathGoal = goal
+            Movement.pathMode = mode
+            Movement.lastPathCompute = tick()
+        end
+
+        Movement.pathComputing = false
+
+        if Movement.queuedPathGoal then
+            local qGoal = Movement.queuedPathGoal
+            local qMode = Movement.queuedPathMode
+
+            Movement.queuedPathGoal = nil
+            Movement.queuedPathMode = nil
+
+            Movement.requestPath(qGoal, qMode)
+        end
+    end)
+end
+
+function Movement.getSteeredPosition(movePos, targetModel)
+    if not botReady() then
+        return movePos
+    end
+
+    local now = tick()
+
+    if now - Movement.lastObstacleCheck >= 0.08 then
+        Movement.lastObstacleCheck = now
+        Movement.obstacleHit = false
+
+        local look = movePos - bot.hrp.Position
+
+        if look.Magnitude > 0.2 then
+            look = look.Unit
+
+            local params = Movement.makeRayParams(targetModel)
+            local origin = bot.hrp.Position + Vector3.new(0, 1, 0)
+
+            local hit = workspace:Raycast(
+                origin,
+                look * (MV.obstacleRayDistance or 6),
+                params
+            )
+
+            if hit then
+                Movement.obstacleHit = true
+
+                local right = bot.hrp.CFrame.RightVector
+                local left = -right
+
+                local rightHit = workspace:Raycast(origin, right * 5, params)
+                local leftHit = workspace:Raycast(origin, left * 5, params)
+
+                if rightHit and not leftHit then
+                    Movement.sideDir = left
+                elseif leftHit and not rightHit then
+                    Movement.sideDir = right
+                else
+                    Movement.sideDir = math.random() < 0.5 and right or left
+                end
+            end
+        end
+    end
+
+    if Movement.obstacleHit and Movement.sideDir.Magnitude > 0.1 then
+        if MV.jumpIfBlocked ~= false and tick() - Movement.lastJump > 0.7 then
+            Movement.jump()
+        end
+
+        local baseLook = movePos - bot.hrp.Position
+
+        if baseLook.Magnitude > 0.2 then
+            baseLook = baseLook.Unit
+        else
+            baseLook = bot.hrp.CFrame.LookVector
+        end
+
+        local mixed = safeUnit(baseLook * 0.35 + Movement.sideDir * 0.85, baseLook)
+
+        return bot.hrp.Position + mixed * 5
+    end
+
+    return movePos
+end
+
+function Movement.update()
+    if MV.enabled == false or not botReady() then
+        return
+    end
+
+    local now = tick()
+
+    -- Temporary override
+    if Movement.isOverrideActive() then
+        Movement.idleStopped = false
+
+        local goal = Movement.override.goal
+        local movePos = Movement.getSteeredPosition(goal, Movement.combat.target)
+
+        pcall(function()
+            bot.humanoid:MoveTo(movePos)
+        end)
+
+        Movement.lastStuckCheck = now
+        Movement.lastPos = bot.hrp.Position
+
+        return
+    elseif Movement.override ~= nil then
+        Movement.override = nil
+    end
+
+    -- Combat target
+    local target = Movement.combat.target
+
+    if target and isModelAlive(target) then
+        Movement.idleStopped = false
+
+        local root = getRoot(target)
+
+        if not root then
+            Movement.clearCombatTarget()
+            return
+        end
+
+        local goal = root.Position
+        local dist = (goal - bot.hrp.Position).Magnitude
+        local desired = Movement.getDesiredRange()
+
+        if dist <= (MV.directRange or 26) then
+            if now - Movement.lastVisCheck > 0.2 then
+                Movement.directOK = isVisible(target)
+                Movement.lastVisCheck = now
+            end
+        else
+            Movement.directOK = false
+        end
+
+        if dist <= desired then
+            if MV.combatStrafe == false then
+                pcall(function()
+                    bot.humanoid:MoveTo(bot.hrp.Position)
+                end)
+            else
+                if now >= Movement.nextStrafeSwitch then
+                    Movement.strafeSide = math.random() < 0.5 and 1 or -1
+
+                    local minSwitch = MV.strafeSwitchMin or 0.7
+                    local maxSwitch = MV.strafeSwitchMax or 1.8
+
+                    Movement.nextStrafeSwitch = now
+                        + minSwitch
+                        + math.random() * math.max(0.1, maxSwitch - minSwitch)
+                end
+
+                local toEnemy = goal - bot.hrp.Position
+                toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+                toEnemy = safeUnit(toEnemy, bot.hrp.CFrame.LookVector)
+
+                local tangent = safeUnit(
+                    Vector3.new(-toEnemy.Z, 0, toEnemy.X),
+                    Vector3.new(1, 0, 0)
+                )
+
+                local side = tangent * Movement.strafeSide
+
+                local params = Movement.makeRayParams(target)
+                local origin = bot.hrp.Position + Vector3.new(0, 1, 0)
+
+                local sideHit = workspace:Raycast(origin, side * 4, params)
+
+                if sideHit then
+                    Movement.strafeSide = -Movement.strafeSide
+                    side = tangent * Movement.strafeSide
+                end
+
+                local radial = Vector3.zero
+
+                if dist < desired * 0.7 then
+                    radial = -toEnemy * 0.75
+                elseif dist > desired * 1.25 then
+                    radial = toEnemy * 0.75
+                end
+
+                local moveVec = side * 0.85 + radial
+                moveVec = safeUnit(moveVec, side)
+
+                local movePos = bot.hrp.Position + moveVec * 3
+                movePos = Movement.getSteeredPosition(movePos, target)
+
+                pcall(function()
+                    bot.humanoid:MoveTo(movePos)
+                end)
+            end
+
+            Movement.lastStuckCheck = now
+            Movement.lastPos = bot.hrp.Position
+
+            return
+        end
+
+        local movePos = goal
+        local wpAction = nil
+
+        if not Movement.directOK then
+            local needPath = #Movement.waypoints == 0
+                or Movement.pathMode ~= "combat"
+                or (Movement.pathGoal - goal).Magnitude > 4
+                or now - Movement.lastPathCompute > (MV.pathRefresh or 0.30)
+
+            if needPath then
+                Movement.requestPath(goal, "combat")
+            end
+
+            if #Movement.waypoints > 0 then
+                while Movement.waypointIndex <= #Movement.waypoints do
+                    local wp = Movement.waypoints[Movement.waypointIndex]
+
+                    if not wp then
+                        break
+                    end
+
+                    if (bot.hrp.Position - wp.Position).Magnitude > (MV.waypointRadius or 3) then
+                        movePos = wp.Position
+                        wpAction = wp.Action
+                        break
+                    end
+
+                    Movement.waypointIndex = Movement.waypointIndex + 1
+                end
+
+                if Movement.waypointIndex > #Movement.waypoints then
+                    movePos = goal
+                end
+            end
+        end
+
+        if PATH_JUMP and wpAction == PATH_JUMP and now - Movement.lastJump > 0.65 then
+            Movement.jump()
+        end
+
+        movePos = Movement.getSteeredPosition(movePos, target)
+
+        pcall(function()
+            bot.humanoid:MoveTo(movePos)
+        end)
+
+        if now - Movement.lastStuckCheck >= (MV.stuckCheckInterval or 0.45) then
+            local moved = (bot.hrp.Position - Movement.lastPos).Magnitude
+
+            if moved < (MV.stuckDistance or 0.55) and dist > desired + 1 then
+                Movement.unstick()
+            else
+                Movement.lastPos = bot.hrp.Position
+                Movement.lastStuckCheck = now
+            end
+        end
+
+        return
+    else
+        if target then
+            Movement.combat.target = nil
+            Movement.resetPath()
+        end
+    end
+
+    -- Wander
+    if Movement.isWanderActive() then
+        Movement.idleStopped = false
+
+        local goal = Movement.wander.goal
+        local dist = (goal - bot.hrp.Position).Magnitude
+
+        if dist <= 2.5 then
+            Movement.wander = nil
+            Movement.stopIdle()
+            return
+        end
+
+        local movePos = Movement.getSteeredPosition(goal, nil)
+
+        pcall(function()
+            bot.humanoid:MoveTo(movePos)
+        end)
+
+        if now - Movement.lastStuckCheck >= (MV.stuckCheckInterval or 0.45) then
+            local moved = (bot.hrp.Position - Movement.lastPos).Magnitude
+
+            if moved < (MV.stuckDistance or 0.55) and dist > 3 then
+                Movement.unstick()
+            else
+                Movement.lastPos = bot.hrp.Position
+                Movement.lastStuckCheck = now
+            end
+        end
+
+        return
+    elseif Movement.wander ~= nil then
+        Movement.wander = nil
+    end
+
+    Movement.stopIdle()
+end
+
+RunService.Heartbeat:Connect(function()
+    pcall(function()
+        Movement.update()
+    end)
 end)
 
---// ═══════════════════════════════════════════════════════════
---// ФИНАЛИЗАЦИЯ
---// ═══════════════════════════════════════════════════════════
+------------------------------------------------------------
+-- ACTION VALIDATION
+------------------------------------------------------------
 
-print("═══════════════════════════════════════════════════════")
-print("  🐝 NATRO MACRO v" .. MacroState.Version .. " - LOADED")
-print("═══════════════════════════════════════════════════════")
-print("✅ All bugs fixed:")
-print("  • Pathfinding errors fixed")
-print("  • UI rendering improved")
-print("  • Memory leaks patched")
-print("  • Character respawn fixed")
-print("  • Token collection optimized")
-print("  • Error handling added everywhere")
-print("═══════════════════════════════════════════════════════")
-print("Status: Ready to start!")
-print("═══════════════════════════════════════════════════════")
+local lastActionAt = {}
+
+local function isActionReady(name)
+    local cd = CONFIG.actionCooldowns[name] or 0
+    local last = lastActionAt[name] or 0
+
+    return tick() - last >= cd
+end
+
+local function getValidActions(target, dist)
+    local valid = {}
+
+    local desired = math.max(3.5, CONFIG.attackRange * 0.70)
+
+    if Movement and Movement.getDesiredRange then
+        desired = Movement.getDesiredRange()
+    end
+
+    local overrideActive = false
+
+    if Movement and Movement.isOverrideActive then
+        overrideActive = Movement.isOverrideActive()
+    end
+
+    local selfFrac = getSelfHealthFrac()
+    local lowSelf = selfFrac <= CONFIG.lowHealthThreshold
+
+    for i, name in ipairs(actions) do
+        local ok = false
+
+        if name == "approach" then
+            ok = target ~= nil
+                and isActionReady(name)
+                and dist > desired + 0.5
+                and not overrideActive
+
+            if ok and CONFIG.retreatWhenLowHP and lowSelf and dist <= CONFIG.attackRange + 2 then
+                ok = false
+            end
+
+        elseif name == "back_step" then
+            ok = isActionReady(name)
+                and target ~= nil
+                and dist <= CONFIG.attackRange + 4
+                and not overrideActive
+
+        elseif name == "jump" then
+            ok = isActionReady(name)
+
+        elseif name == "m1_attack" then
+            ok = target ~= nil
+                and isActionReady(name)
+                and dist <= CONFIG.attackRange
+
+        elseif name:sub(1, 6) == "skill_" then
+            ok = target ~= nil
+                and isActionReady(name)
+                and dist <= CONFIG.skillRange
+                and not overrideActive
+
+        elseif name == "block" then
+            ok = isActionReady(name)
+        end
+
+        if ok then
+            table.insert(valid, i)
+        end
+    end
+
+    if #valid == 0 then
+        if target ~= nil and dist > desired + 0.5 and not overrideActive then
+            table.insert(valid, actionIndex.approach)
+        else
+            table.insert(valid, actionIndex.block)
+        end
+    end
+
+    return valid
+end
+
+local epsilon = CONFIG.epsilon
+
+local function chooseAction(state, validActions)
+    initState(state)
+
+    local row = Q[state]
+
+    if #validActions == 0 then
+        return actionIndex.approach
+    end
+
+    if math.random() >= epsilon then
+        local bestValue = -math.huge
+        local bestChoices = {}
+
+        for _, idx in ipairs(validActions) do
+            local value = tonumber(row[idx]) or 0
+
+            if value > bestValue then
+                bestValue = value
+                bestChoices = {idx}
+            elseif value == bestValue then
+                table.insert(bestChoices, idx)
+            end
+        end
+
+        return bestChoices[math.random(#bestChoices)]
+    end
+
+    return validActions[math.random(#validActions)]
+end
+
+------------------------------------------------------------
+-- INPUT
+------------------------------------------------------------
+
+local function sendMouseDown(x, y, button)
+    if not VIM then
+        return
+    end
+
+    pcall(function()
+        VIM:SendMouseButtonEvent(x, y, button, true, game, 0)
+    end)
+end
+
+local function sendMouseUp(x, y, button)
+    if not VIM then
+        return
+    end
+
+    pcall(function()
+        VIM:SendMouseButtonEvent(x, y, button, false, game, 0)
+    end)
+end
+
+local function clickMouse(x, y, button, holdTime)
+    if not VIM then
+        return
+    end
+
+    sendMouseDown(x, y, button)
+    task.wait(holdTime)
+    sendMouseUp(x, y, button)
+end
+
+local function pressKey(key, holdTime)
+    if not VIM then
+        return
+    end
+
+    pcall(function()
+        VIM:SendKeyEvent(true, key, false, game)
+    end)
+
+    task.wait(holdTime)
+
+    pcall(function()
+        VIM:SendKeyEvent(false, key, false, game)
+    end)
+end
+
+------------------------------------------------------------
+-- SCREEN / AIM
+------------------------------------------------------------
+
+local function worldToScreen(pos)
+    local cam = getCamera()
+
+    if not cam then
+        return 0, 0, false
+    end
+
+    local vec, onScreen = cam:WorldToScreenPoint(pos)
+
+    return math.floor(vec.X), math.floor(vec.Y), onScreen
+end
+
+local function getCenterScreen()
+    local cam = getCamera()
+
+    if not cam then
+        return 0, 0
+    end
+
+    local vp = cam.ViewportSize
+
+    if not vp or vp.X <= 0 or vp.Y <= 0 then
+        return 0, 0
+    end
+
+    return math.floor(vp.X / 2), math.floor(vp.Y / 2)
+end
+
+local function getAimPart(target)
+    if not target then
+        return nil
+    end
+
+    return target:FindFirstChild("Head")
+        or target:FindFirstChild("UpperTorso")
+        or getRoot(target)
+end
+
+------------------------------------------------------------
+-- CAMERA CONTROLLER
+------------------------------------------------------------
+
+local activeAimTarget = nil
+local cameraSavedType = nil
+
+local function restoreCamera(force)
+    if not force and cameraSavedType == nil and activeAimTarget == nil then
+        return
+    end
+
+    local cam = getCamera()
+    activeAimTarget = nil
+
+    if not cam then
+        cameraSavedType = nil
+        return
+    end
+
+    local restoreType = cameraSavedType
+
+    if restoreType == nil or restoreType == Enum.CameraType.Scriptable then
+        restoreType = Enum.CameraType.Custom
+    end
+
+    pcall(function()
+        cam.CameraType = restoreType
+    end)
+
+    cameraSavedType = nil
+end
+
+local function beginAim(target)
+    local mode = CONFIG.cameraMode or "FOLLOW_TEMP"
+
+    if not CONFIG.enableAim or mode == "OFF" or not target then
+        return
+    end
+
+    local cam = getCamera()
+
+    if not cam then
+        return
+    end
+
+    if cameraSavedType == nil then
+        cameraSavedType = cam.CameraType
+    end
+
+    pcall(function()
+        cam.CameraType = Enum.CameraType.Scriptable
+    end)
+
+    activeAimTarget = target
+end
+
+local function endAim()
+    if CONFIG.restoreCameraAfterAction ~= false and (activeAimTarget ~= nil or cameraSavedType ~= nil) then
+        restoreCamera(false)
+    else
+        activeAimTarget = nil
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        local mode = CONFIG.cameraMode or "FOLLOW_TEMP"
+
+        if not CONFIG.enableAim or mode == "OFF" then
+            return
+        end
+
+        local cam = getCamera()
+
+        if not cam then
+            return
+        end
+
+        if not activeAimTarget then
+            return
+        end
+
+        if not botReady() or not isModelAlive(activeAimTarget) then
+            restoreCamera(true)
+            return
+        end
+
+        local part = getAimPart(activeAimTarget)
+
+        if not part or not bot.hrp then
+            return
+        end
+
+        local look = part.Position - bot.hrp.Position
+
+        if look.Magnitude < 0.2 then
+            return
+        end
+
+        look = look.Unit
+
+        if mode == "FOLLOW_TEMP" then
+            local dist = CONFIG.cameraDistance or 11
+            local height = CONFIG.cameraHeight or 2.2
+
+            local camPos = bot.hrp.Position - look * dist + Vector3.new(0, height, 0)
+
+            pcall(function()
+                cam.CFrame = CFrame.lookAt(camPos, part.Position)
+            end)
+
+        elseif mode == "ORIENTATION_TEMP" then
+            pcall(function()
+                cam.CFrame = CFrame.lookAt(cam.CFrame.Position, part.Position)
+            end)
+        end
+    end)
+end)
+
+if CONFIG.resetCameraOnStart ~= false then
+    task.spawn(function()
+        task.wait(0.5)
+        restoreCamera(true)
+    end)
+end
+
+------------------------------------------------------------
+-- ATTACK ACTIONS
+------------------------------------------------------------
+
+local function performM1(target)
+    local part = getAimPart(target)
+
+    if not part then
+        return false
+    end
+
+    beginAim(target)
+
+    task.wait(0.03 + math.random() * 0.03)
+
+    local x, y
+
+    if CONFIG.clickMode == "CENTER" then
+        x, y = getCenterScreen()
+    else
+        local sx, sy, onScreen = worldToScreen(part.Position)
+
+        if onScreen then
+            x, y = sx, sy
+        else
+            x, y = getCenterScreen()
+        end
+    end
+
+    clickMouse(
+        x,
+        y,
+        0,
+        CONFIG.mouseHold + math.random() * CONFIG.mouseHoldJitter
+    )
+
+    task.wait(0.02)
+
+    endAim()
+
+    return true
+end
+
+local function performSkill(target, key)
+    local part = getAimPart(target)
+
+    if not part or not key then
+        return false
+    end
+
+    beginAim(target)
+
+    task.wait(0.03 + math.random() * 0.03)
+
+    pressKey(
+        key,
+        CONFIG.keyHold + math.random() * CONFIG.keyHoldJitter
+    )
+
+    task.wait(0.02)
+
+    endAim()
+
+    return true
+end
+
+local function performBlock()
+    stats.blocks = stats.blocks + 1
+
+    local holdTime = CONFIG.blockHold + math.random() * CONFIG.blockHoldJitter
+
+    if CONFIG.blockMode == "RMB" then
+        local x, y = getCenterScreen()
+        clickMouse(x, y, 1, holdTime)
+    else
+        pressKey(CONFIG.blockKey, holdTime)
+    end
+end
+
+------------------------------------------------------------
+-- DEFENSIVE REFLEX
+------------------------------------------------------------
+
+local lastReflexBlock = 0
+
+local function shouldDefensiveBlock(target, dist)
+    if CONFIG.autoBlock == false then
+        return false
+    end
+
+    if not botReady() or not target then
+        return false
+    end
+
+    if tick() - lastReflexBlock < CONFIG.reflexBlockCooldown then
+        return false
+    end
+
+    if dist > CONFIG.attackRange + 3 then
+        return false
+    end
+
+    local frac = getSelfHealthFrac()
+
+    if enemyLikelyAttacking(target) or (frac <= CONFIG.lowHealthThreshold and dist <= CONFIG.attackRange) then
+        lastReflexBlock = tick()
+        stats.reflexBlocks = stats.reflexBlocks + 1
+        return true
+    end
+
+    return false
+end
+
+------------------------------------------------------------
+-- ACTION EXECUTION
+------------------------------------------------------------
+
+local function performAction(name, target, dist)
+    if not botReady() then
+        return
+    end
+
+    lastActionAt[name] = tick()
+
+    if name == "approach" and target then
+        local desired = math.max(3.5, CONFIG.attackRange * 0.70)
+        Movement.setCombatTarget(target, desired)
+
+    elseif name == "back_step" then
+        Movement.requestBackStep(target, CONFIG.backStepDistance)
+
+    elseif name == "jump" then
+        Movement.jump()
+
+    elseif name == "m1_attack" and target then
+        local desired = math.max(3.2, CONFIG.attackRange * 0.62)
+        Movement.setCombatTarget(target, desired)
+        performM1(target)
+
+    elseif name:sub(1, 6) == "skill_" and target then
+        local desired = math.max(4.0, CONFIG.skillRange * 0.60)
+        Movement.setCombatTarget(target, desired)
+        performSkill(target, skillKeyMap[name] or Enum.KeyCode.One)
+
+    elseif name == "block" then
+        if target then
+            local desired = math.max(3.5, CONFIG.attackRange * 0.70)
+            Movement.setCombatTarget(target, desired)
+        end
+
+        performBlock()
+    end
+end
+
+------------------------------------------------------------
+-- REWARD
+------------------------------------------------------------
+
+local function evaluateOutcome(actionName, target, oldDist, oldTargetHealth, oldSelfHealth)
+    local newSelfHealth = botReady() and bot.humanoid.Health or 0
+
+    if (oldSelfHealth or 0) > 0 and newSelfHealth <= 0 then
+        stats.deaths = stats.deaths + 1
+    end
+
+    if not botReady() then
+        return -1, false
+    end
+
+    local reward = -0.015
+
+    local targetHum = getHumanoid(target)
+    local targetRoot = getRoot(target)
+
+    local newTargetHealth = targetHum and targetHum.Health or 0
+    local targetAlive = isModelAlive(target)
+
+    local dist = oldDist
+
+    if bot.hrp and targetRoot then
+        dist = (targetRoot.Position - bot.hrp.Position).Magnitude
+    end
+
+    local damageDealt = math.max(0, (oldTargetHealth or 0) - (newTargetHealth or 0))
+    local damageTaken = math.max(0, (oldSelfHealth or 0) - newSelfHealth)
+
+    if damageDealt > 0 then
+        reward = reward + damageDealt * CONFIG.reward.damageDealt
+        stats.hits = stats.hits + 1
+    end
+
+    if (oldTargetHealth or 0) > 0 and newTargetHealth <= 0 then
+        reward = reward + CONFIG.reward.kill
+        stats.kills = stats.kills + 1
+    end
+
+    if damageTaken > 0 then
+        reward = reward - damageTaken * CONFIG.reward.damageTaken
+        stats.damageTaken = stats.damageTaken + damageTaken
+    end
+
+    if actionName == "approach" then
+        reward = reward + clampNumber((oldDist - dist) * CONFIG.reward.approachDistance, -0.5, 0.5)
+
+    elseif actionName == "back_step" then
+        if damageTaken <= 0 then
+            reward = reward + 0.03
+        end
+
+        if dist > oldDist then
+            reward = reward + 0.02
+        end
+
+    elseif actionName == "jump" then
+        reward = reward - 0.01
+
+    elseif isAttackAction(actionName) then
+        if damageDealt > 0 then
+            reward = reward + CONFIG.reward.hitBonus
+        else
+            local status = getEnemyStatus(target)
+
+            if status == "blocking" then
+                reward = reward - CONFIG.reward.attackBlockedPenalty
+                stats.blockedHits = stats.blockedHits + 1
+            else
+                reward = reward - CONFIG.reward.attackMissPenalty
+                stats.misses = stats.misses + 1
+            end
+        end
+
+    elseif actionName == "block" then
+        if damageTaken <= 0 then
+            reward = reward + 0.05
+        else
+            reward = reward - damageTaken * 0.25
+        end
+    end
+
+    reward = clampNumber(reward, -15, 40)
+
+    return reward, targetAlive
+end
+
+------------------------------------------------------------
+-- MAIN LOOP
+------------------------------------------------------------
+
+local function mainStep()
+    getCamera()
+
+    if not botReady() then
+        restoreCamera(true)
+        task.wait(0.25)
+        return
+    end
+
+    local target, dist = findNearestTarget()
+
+    if not target then
+        if CONFIG.resetCameraWhenNoTarget ~= false then
+            restoreCamera(true)
+        end
+
+        Movement.clearCombatTarget()
+
+        if not Movement.isOverrideActive()
+            and not Movement.isWanderActive()
+            and math.random() < CONFIG.wanderChance then
+            local randomGoal = bot.hrp.Position + Vector3.new(math.random(-25, 25), 0, math.random(-25, 25))
+            Movement.wanderTo(randomGoal, 2.5)
+        end
+
+        task.wait(0.2)
+        return
+    end
+
+    local oldDist = dist
+
+    local targetHum = getHumanoid(target)
+    local oldTargetHealth = targetHum and targetHum.Health or 0
+    local oldSelfHealth = bot.humanoid.Health
+
+    local state = getState(target, dist)
+    local validActions = getValidActions(target, dist)
+
+    local actionIdx, actionName
+
+    if shouldDefensiveBlock(target, dist) then
+        actionIdx = actionIndex.block
+        actionName = "block"
+    else
+        actionIdx = chooseAction(state, validActions)
+        actionName = actions[actionIdx]
+    end
+
+    performAction(actionName, target, dist)
+
+    task.wait(CONFIG.actionPostDelay[actionName] or CONFIG.loopInterval)
+
+    local reward, targetAlive = evaluateOutcome(
+        actionName,
+        target,
+        oldDist,
+        oldTargetHealth,
+        oldSelfHealth
+    )
+
+    local newState = "enemy_dead"
+
+    if targetAlive then
+        local root = getRoot(target)
+        local newDist = oldDist
+
+        if root and bot.hrp then
+            newDist = (root.Position - bot.hrp.Position).Magnitude
+        end
+
+        newState = getState(target, newDist)
+    end
+
+    initState(state)
+    initState(newState)
+
+    local maxNext = -math.huge
+
+    for _, value in ipairs(Q[newState]) do
+        local num = tonumber(value) or 0
+
+        if num > maxNext then
+            maxNext = num
+        end
+    end
+
+    if maxNext == -math.huge then
+        maxNext = 0
+    end
+
+    local oldQ = tonumber(Q[state][actionIdx]) or 0
+    local newQ = oldQ + CONFIG.alpha * (reward + CONFIG.gamma * maxNext - oldQ)
+
+    if newQ == newQ and newQ > -1e9 and newQ < 1e9 then
+        Q[state][actionIdx] = newQ
+    end
+
+    if epsilon > CONFIG.epsilonMin then
+        epsilon = math.max(CONFIG.epsilonMin, epsilon * CONFIG.epsilonDecay)
+    end
+
+    stats.steps = stats.steps + 1
+
+    if stats.steps % CONFIG.saveEvery == 0 then
+        saveQ()
+
+        if CONFIG.debug then
+            print(string.format(
+                "[JJS Bot] step=%d | eps=%.4f | state=%s | action=%s | reward=%.2f | q=%.2f",
+                stats.steps,
+                epsilon,
+                state,
+                actionName,
+                reward,
+                tonumber(Q[state][actionIdx]) or 0
+            ))
+
+            print(string.format(
+                "[JJS Stats] hits=%d blocked=%d misses=%d taken=%.1f kills=%d deaths=%d blocks=%d reflex=%d unstucks=%d",
+                stats.hits,
+                stats.blockedHits,
+                stats.misses,
+                stats.damageTaken,
+                stats.kills,
+                stats.deaths,
+                stats.blocks,
+                stats.reflexBlocks,
+                stats.unstucks
+            ))
+        end
+    end
+end
+
+print("[JJS Bot v3.5] started")
+
+if not VIM then
+    print("[JJS Bot] WARNING: VirtualInputManager is unavailable. Attacks/skills/block will not work.")
+end
+
+if not writefile then
+    print("[JJS Bot] WARNING: writefile is unavailable. Q-table will not be saved.")
+end
+
+while true do
+    local ok, err = pcall(mainStep)
+
+    if not ok then
+        pcall(restoreCamera, true)
+
+        if CONFIG.debug then
+            print("[JJS Bot] error:", err)
+        end
+
+        task.wait(0.5)
+    else
+        task.wait(CONFIG.loopInterval)
+    end
+end
