@@ -1,6 +1,6 @@
 --[[ 
     NPC COMBAT AGENT MODULE JJS
-    Architecture: Priority Action Manager + Flank Followup (v9.0)
+    Architecture: Priority Action Manager + Advanced Movement (v10.0)
 ]]
 
 -- // SERVICES // --
@@ -8,6 +8,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
 
 -- // PLAYER // --
 local LocalPlayer = Players.LocalPlayer
@@ -17,16 +18,19 @@ local SETTINGS = {
     Enabled = true,
     DebugMode = false,
 
+    -- Safety / states
+    StrictIncapacitated = true,
+    SurvivalDebounce = 0.2,
+
     -- Targeting
     AggroRange = 400,
     AttackRange = 7,
+    TargetRecheckDelay = 2,
 
-    -- Movement
+    -- Movement / combat toggles
     OrbitMode = true,
     OrbitRadius = 9,
     DashGapClose = true,
-
-    -- Defense / Combat
     AutoParry = true,
     BlockBreaker = true,
 
@@ -52,13 +56,37 @@ local SETTINGS = {
         [Enum.KeyCode.Four]  = {CD = 25, Breaker = true},
     },
 
+    Movement = {
+        UsePathfinding = true,
+        PathfindingRange = 50,
+        DirectMoveRange = 12,
+        PathRecomputeDelay = 0.4,
+
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+
+        StuckThreshold = 0.08,
+        StuckFrames = 45,
+        StuckRayDistance = 6,
+
+        CheckEdges = true,
+        EdgeRayDistance = 5,
+        EdgeHeightLimit = 12,
+
+        SmoothOrbit = true,
+        OrbitSpeed = 1.8,
+        OrbitJitter = 0.25,
+        OrbitMinDist = 6,
+        OrbitMaxDist = 18,
+
+        MoveToThrottle = 0.08,
+    },
+
     FlankDash = {
         Enabled = true,
 
-        -- Клавиша движения. Если нужно A, поменяй.
         Key = Enum.KeyCode.D,
-
-        -- Клавиша дэша
         QKey = Enum.KeyCode.Q,
 
         Cooldown = 2.4,
@@ -66,31 +94,22 @@ local SETTINGS = {
         MinDist = 7,
         MaxDist = 24,
 
-        -- Сколько держать камеру
         CameraHold = 0.62,
-
-        -- Поворачивать не только камеру, но и персонажа
         RotateCharacter = true,
 
         -- 1 = вправо относительно врага
         -- -1 = влево относительно врага
         Side = 1,
-
-        -- Если true, случайно выбирает сторону и не повторяет прошлую
         RandomSide = false,
 
         SideOffset = 4.5,
         BackOffset = 6.5,
 
-        -- Follow-up после dash
         FollowupEnabled = true,
         FollowupDelay = 0.5,
         FollowupRandom = 0.06,
 
-        -- Учитывать общий кулдаун Q-дэша
         UseDashCooldown = true,
-
-        -- Проверки
         CheckWall = true,
         CheckBehind = true,
     },
@@ -123,6 +142,9 @@ local State = {
     LastFlank = 0,
     LastFlankSide = 0,
     FlankSide = 1,
+
+    IncapacitatedSince = 0,
+    LastTargetCheck = 0,
 }
 
 for k, _ in pairs(SETTINGS.Skills) do
@@ -148,6 +170,25 @@ local function CancelAllTimers()
 
     for k in pairs(Timers) do
         Timers[k] = nil
+    end
+end
+
+-- // LOGGING // --
+local function Log(msg)
+    if SETTINGS.DebugMode then
+        pcall(function()
+            game.StarterGui:SetCore("SendNotification", {
+                Title = "JJS AI v10",
+                Text = tostring(msg),
+                Duration = 1,
+            })
+        end)
+    end
+end
+
+local function LogDebug(msg)
+    if SETTINGS.DebugMode then
+        print("[JJS AI DEBUG] " .. tostring(msg))
     end
 end
 
@@ -177,40 +218,40 @@ local function ForceCameraMoveDirection(worldDir, duration)
 
     local startTime = time()
 
-    RunService:BindToRenderStep(
-        FLANK_CAMERA_BINDING,
-        Enum.RenderPriority.Camera.Value + 1,
-        function()
-            if id ~= CameraOverrideId then
-                return
+    pcall(function()
+        RunService:BindToRenderStep(
+            FLANK_CAMERA_BINDING,
+            Enum.RenderPriority.Camera.Value + 1,
+            function()
+                if id ~= CameraOverrideId then
+                    return
+                end
+
+                if time() - startTime > duration then
+                    UnbindFlankCamera()
+                    return
+                end
+
+                local cam = Workspace.CurrentCamera
+                if not cam then
+                    return
+                end
+
+                local look = Vector3.new(0, 1, 0):Cross(worldDir)
+
+                if look.Magnitude < 0.001 then
+                    look = Vector3.new(0, 0, -1)
+                else
+                    look = look.Unit
+                end
+
+                cam.CFrame = CFrame.lookAt(
+                    cam.CFrame.Position,
+                    cam.CFrame.Position + look
+                )
             end
-
-            if time() - startTime > duration then
-                UnbindFlankCamera()
-                return
-            end
-
-            local cam = Workspace.CurrentCamera
-            if not cam then
-                return
-            end
-
-            -- Нужно, чтобы RightVector камеры был равен worldDir.
-            -- Тогда D будет двигать персонажа в нужном мировом направлении.
-            local look = Vector3.new(0, 1, 0):Cross(worldDir)
-
-            if look.Magnitude < 0.001 then
-                look = Vector3.new(0, 0, -1)
-            else
-                look = look.Unit
-            end
-
-            cam.CFrame = CFrame.lookAt(
-                cam.CFrame.Position,
-                cam.CFrame.Position + look
-            )
-        end
-    )
+        )
+    end)
 
     Schedule(duration + 0.05, function()
         if id == CameraOverrideId then
@@ -323,18 +364,6 @@ local function BeginAction(name, duration, priority, lockMovement)
 end
 
 -- // UTILITIES // --
-local function Log(msg)
-    if SETTINGS.DebugMode then
-        pcall(function()
-            game.StarterGui:SetCore("SendNotification", {
-                Title = "JJS AI v9",
-                Text = tostring(msg),
-                Duration = 1,
-            })
-        end)
-    end
-end
-
 local function IsAlive(char)
     if not char or not char.Parent then
         return false
@@ -399,8 +428,24 @@ local function IsIncapacitated(char)
         return false
     end
 
-    if char:GetAttribute("Ragdoll") or char:GetAttribute("Stunned") then
+    if char:GetAttribute("Ragdoll") == true then
         return true
+    end
+
+    if char:GetAttribute("Stunned") == true then
+        return true
+    end
+
+    if char:GetAttribute("Knocked") == true then
+        return true
+    end
+
+    if char:GetAttribute("Incapacitated") == true then
+        return true
+    end
+
+    if SETTINGS.StrictIncapacitated then
+        return false
     end
 
     local hum = char:FindFirstChild("Humanoid")
@@ -412,6 +457,7 @@ local function IsIncapacitated(char)
 
     return state == Enum.HumanoidStateType.Physics
         or state == Enum.HumanoidStateType.PlatformStanding
+        or state == Enum.HumanoidStateType.FallingDown
 end
 
 -- // ENEMY ANALYSIS CACHE // --
@@ -423,6 +469,14 @@ local EnemyCache = {
     lastAwakenScan = 0,
     awakened = false,
 }
+
+local function ResetEnemyCache()
+    EnemyCache.lastAnimScan = 0
+    EnemyCache.blocking = false
+    EnemyCache.attacking = false
+    EnemyCache.lastAwakenScan = 0
+    EnemyCache.awakened = false
+end
 
 local function IsEnemyAwakened(char)
     if char:GetAttribute("Awakened") == true then
@@ -446,9 +500,10 @@ local function IsEnemyAwakened(char)
         or char:FindFirstChild("Particles")
 
     if vfx then
-        for _, d in pairs(vfx:GetDescendants()) do
+        for _, d in pairs(vfx:GetChildren()) do
             local n = d.Name:lower()
-            if n:find("awaken") or n:find("domain") or n:find("aura") then
+
+            if n:find("awaken") or n:find("domain") then
                 return true
             end
         end
@@ -469,7 +524,7 @@ local function UpdateEnemyCache(target)
         EnemyCache.awakened = IsEnemyAwakened(target)
     end
 
-    if now - EnemyCache.lastAnimScan < 0.1 then
+    if now - EnemyCache.lastAnimScan < 0.12 then
         return
     end
 
@@ -479,6 +534,14 @@ local function UpdateEnemyCache(target)
 
     if target:GetAttribute("Blocking") == true then
         EnemyCache.blocking = true
+    end
+
+    if target:GetAttribute("Attacking") == true then
+        EnemyCache.attacking = true
+    end
+
+    if target:GetAttribute("M1") == true then
+        EnemyCache.attacking = true
     end
 
     local hum = target:FindFirstChild("Humanoid")
@@ -506,10 +569,14 @@ local function UpdateEnemyCache(target)
             if t.Priority == Enum.AnimationPriority.Action then
                 if n:find("block") or n:find("guard") or n:find("defend") then
                     EnemyCache.blocking = true
-                elseif not n:find("dash")
-                    and not n:find("run")
-                    and not n:find("jump")
-                    and not n:find("fall")
+                elseif n:find("swing")
+                    or n:find("punch")
+                    or n:find("kick")
+                    or n:find("slash")
+                    or n:find("hit")
+                    or n:find("m1")
+                    or n:find("attack")
+                    or n:find("combo")
                 then
                     EnemyCache.attacking = true
                 end
@@ -518,6 +585,7 @@ local function UpdateEnemyCache(target)
     end
 end
 
+-- // TARGET HELPERS // --
 local function PredictTargetPosition(tRoot, distance)
     local vel = tRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
     local reaction = 0.12 + (distance / 180)
@@ -545,15 +613,33 @@ local function AimAt(pos)
     end
 end
 
--- // TARGETING // --
+local function CanSeeCharacter(myChar, myRoot, target, targetRoot)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {myChar}
+
+    local rayStart = myRoot.Position + Vector3.new(0, 2, 0)
+    local rayEnd = targetRoot.Position + Vector3.new(0, 2, 0)
+
+    local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
+
+    if not result then
+        return true
+    end
+
+    return result.Instance:IsDescendantOf(target)
+end
+
 local function FindTarget()
     local myChar = LocalPlayer.Character
     if not IsAlive(myChar) then
+        LogDebug("FindTarget: myChar not alive")
         return nil
     end
 
     local myRoot = myChar:FindFirstChild("HumanoidRootPart")
     if not myRoot then
+        LogDebug("FindTarget: no myRoot")
         return nil
     end
 
@@ -566,20 +652,35 @@ local function FindTarget()
     params.FilterDescendantsInstances = {myChar}
 
     for _, p in pairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character and IsAlive(p.Character) then
-            local tRoot = p.Character:FindFirstChild("HumanoidRootPart")
-            local hum = p.Character:FindFirstChild("Humanoid")
+        if p ~= LocalPlayer and p.Character then
+            local tChar = p.Character
+            local tRoot = tChar:FindFirstChild("HumanoidRootPart")
+            local hum = tChar:FindFirstChild("Humanoid")
 
-            if tRoot and hum then
+            if tRoot and hum and hum.Health > 0 then
                 local delta = tRoot.Position - myPos
                 local dist = delta.Magnitude
 
-                if dist > 0.5 and dist <= SETTINGS.AggroRange then
-                    local rayDir = delta.Unit * math.min(SETTINGS.AggroRange, dist)
-                    local result = Workspace:Raycast(myPos, rayDir, params)
-                    local canSee = result and result.Instance:IsDescendantOf(p.Character)
+                if dist > 0.1 and dist <= SETTINGS.AggroRange then
+                    local rayStart = myPos + Vector3.new(0, 2, 0)
+                    local rayEnd = tRoot.Position + Vector3.new(0, 2, 0)
 
-                    if canSee or not result then
+                    local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
+
+                    local canSee = false
+
+                    if not result then
+                        canSee = true
+                    elseif result.Instance:IsDescendantOf(tChar) then
+                        canSee = true
+                    end
+
+                    -- Аккуратный fallback для очень близких целей
+                    if not canSee and dist < 10 then
+                        canSee = true
+                    end
+
+                    if canSee then
                         local healthRatio = hum.Health / hum.MaxHealth
 
                         local threat = 1000
@@ -588,12 +689,18 @@ local function FindTarget()
 
                         if threat > bestScore then
                             bestScore = threat
-                            bestTarget = p.Character
+                            bestTarget = tChar
                         end
                     end
                 end
             end
         end
+    end
+
+    if bestTarget then
+        LogDebug("FindTarget: target found")
+    else
+        LogDebug("FindTarget: no target")
     end
 
     return bestTarget
@@ -617,6 +724,370 @@ local function GetReadySkill(preferBreaker)
     return nil
 end
 
+-- ======================================================
+-- ADVANCED MOVEMENT CONTROLLER
+-- ======================================================
+
+local MovementState = {
+    CurrentPath = nil,
+    PathWaypoints = {},
+    CurrentWaypointIndex = 0,
+    LastPathCompute = 0,
+    LastMoveTo = 0,
+    StuckFrames = 0,
+    LastPosition = Vector3.new(0, 0, 0),
+    OrbitAngle = 0,
+    OrbitDirection = 1,
+    LastOrbitSwitch = 0,
+    AvoidanceDir = nil,
+    AvoidanceUntil = 0,
+}
+
+local function ComputePathSafe(startPos, endPos)
+    local ok, path = pcall(function()
+        local p = PathfindingService:CreatePath({
+            AgentRadius = SETTINGS.Movement.AgentRadius,
+            AgentHeight = SETTINGS.Movement.AgentHeight,
+            AgentCanJump = SETTINGS.Movement.AgentCanJump,
+        })
+
+        p:ComputeAsync(startPos, endPos)
+
+        return p
+    end)
+
+    if ok and path and path.Status == Enum.PathStatus.Success then
+        return path
+    end
+
+    return nil
+end
+
+local function IsEdgeAhead(myRoot, direction)
+    if not SETTINGS.Movement.CheckEdges then
+        return false
+    end
+
+    direction = Vector3.new(direction.X, 0, direction.Z)
+
+    if direction.Magnitude < 0.001 then
+        return false
+    end
+
+    direction = direction.Unit
+
+    local rayStart = myRoot.Position + Vector3.new(0, 0.5, 0)
+    local rayEnd = rayStart + direction * SETTINGS.Movement.EdgeRayDistance
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {myRoot.Parent}
+
+    local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
+
+    if not result then
+        return true
+    end
+
+    local heightDiff = myRoot.Position.Y - result.Position.Y
+
+    return heightDiff > SETTINGS.Movement.EdgeHeightLimit
+end
+
+local function IsObstacleAhead(myRoot, direction, distance)
+    direction = Vector3.new(direction.X, 0, direction.Z)
+
+    if direction.Magnitude < 0.001 then
+        return false, false
+    end
+
+    direction = direction.Unit
+
+    local rayStart = myRoot.Position + Vector3.new(0, 1.5, 0)
+    local rayEnd = rayStart + direction * distance
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {myRoot.Parent}
+
+    local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
+
+    if result then
+        local heightDiff = result.Position.Y - myRoot.Position.Y
+
+        if heightDiff < 3.5 then
+            return true, true
+        end
+
+        return true, false
+    end
+
+    return false, false
+end
+
+local function FindAvoidanceDirection(myRoot, targetPos)
+    local forward = targetPos - myRoot.Position
+    forward = Vector3.new(forward.X, 0, forward.Z)
+
+    if forward.Magnitude < 0.1 then
+        forward = Vector3.new(1, 0, 0)
+    else
+        forward = forward.Unit
+    end
+
+    local right = Vector3.new(0, 1, 0):Cross(forward).Unit
+    local left = -right
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {myRoot.Parent}
+
+    local rayStart = myRoot.Position + Vector3.new(0, 1.5, 0)
+    local checkDist = SETTINGS.Movement.StuckRayDistance
+
+    local forwardRay = Workspace:Raycast(rayStart, forward * checkDist, params)
+    local rightRay = Workspace:Raycast(rayStart, right * checkDist, params)
+    local leftRay = Workspace:Raycast(rayStart, left * checkDist, params)
+
+    if not forwardRay then
+        return forward
+    end
+
+    local rightClear = not rightRay
+    local leftClear = not leftRay
+
+    if rightClear and leftClear then
+        return math.random() > 0.5 and right or left
+    elseif rightClear then
+        return right
+    elseif leftClear then
+        return left
+    end
+
+    return forward
+end
+
+local function UpdatePath(myRoot, targetPos)
+    local now = time()
+
+    if now - MovementState.LastPathCompute < SETTINGS.Movement.PathRecomputeDelay then
+        return
+    end
+
+    local dist = (targetPos - myRoot.Position).Magnitude
+
+    if dist < SETTINGS.Movement.DirectMoveRange then
+        MovementState.CurrentPath = nil
+        MovementState.PathWaypoints = {}
+        MovementState.CurrentWaypointIndex = 0
+        return
+    end
+
+    if dist > SETTINGS.Movement.PathfindingRange and SETTINGS.Movement.UsePathfinding then
+        local path = ComputePathSafe(myRoot.Position, targetPos)
+
+        if path then
+            MovementState.CurrentPath = path
+            MovementState.PathWaypoints = path:GetWaypoints()
+            MovementState.CurrentWaypointIndex = 2
+            MovementState.LastPathCompute = now
+        else
+            MovementState.CurrentPath = nil
+            MovementState.PathWaypoints = {}
+            MovementState.CurrentWaypointIndex = 0
+        end
+    end
+end
+
+local function FollowPath(hum, myRoot)
+    if not MovementState.PathWaypoints or #MovementState.PathWaypoints == 0 then
+        return false
+    end
+
+    local idx = MovementState.CurrentWaypointIndex
+
+    if idx > #MovementState.PathWaypoints then
+        MovementState.PathWaypoints = {}
+        MovementState.CurrentWaypointIndex = 0
+        return false
+    end
+
+    local waypoint = MovementState.PathWaypoints[idx]
+    local waypointPos = waypoint.Position
+
+    local distToWaypoint = (waypointPos - myRoot.Position).Magnitude
+
+    if distToWaypoint < 4 then
+        MovementState.CurrentWaypointIndex = idx + 1
+        return true
+    end
+
+    if waypoint.Action == Enum.PathWaypointAction.Jump then
+        hum.Jump = true
+    end
+
+    local direction = waypointPos - myRoot.Position
+    direction = Vector3.new(direction.X, 0, direction.Z)
+
+    if direction.Magnitude < 0.1 then
+        return true
+    end
+
+    direction = direction.Unit
+
+    if IsEdgeAhead(myRoot, direction) then
+        MovementState.PathWaypoints = {}
+        MovementState.CurrentWaypointIndex = 0
+        return false
+    end
+
+    local hasObstacle, canJump = IsObstacleAhead(myRoot, direction, 4)
+
+    if hasObstacle and canJump then
+        hum.Jump = true
+    end
+
+    local now = time()
+
+    if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
+        MovementState.LastMoveTo = now
+        hum:MoveTo(waypointPos)
+    end
+
+    return true
+end
+
+local function HandleAntiStuck(hum, myRoot, targetPos)
+    local currentPos = myRoot.Position
+    local movement = (currentPos - MovementState.LastPosition).Magnitude
+
+    if movement < SETTINGS.Movement.StuckThreshold then
+        MovementState.StuckFrames = MovementState.StuckFrames + 1
+    else
+        MovementState.StuckFrames = 0
+        MovementState.AvoidanceDir = nil
+    end
+
+    MovementState.LastPosition = currentPos
+
+    if MovementState.StuckFrames >= SETTINGS.Movement.StuckFrames then
+        MovementState.StuckFrames = 0
+
+        local avoidDir = FindAvoidanceDirection(myRoot, targetPos)
+
+        if not IsEdgeAhead(myRoot, avoidDir) then
+            MovementState.AvoidanceDir = avoidDir
+            MovementState.AvoidanceUntil = time() + 0.5
+
+            local hasObstacle, canJump = IsObstacleAhead(myRoot, avoidDir, 5)
+
+            if hasObstacle and canJump then
+                hum.Jump = true
+            end
+
+            local avoidTarget = myRoot.Position + avoidDir * 8
+
+            local now = time()
+
+            if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
+                MovementState.LastMoveTo = now
+                hum:MoveTo(avoidTarget)
+            end
+
+            MovementState.PathWaypoints = {}
+            MovementState.CurrentWaypointIndex = 0
+        else
+            hum.Jump = true
+        end
+
+        return true
+    end
+
+    if MovementState.AvoidanceDir and time() < MovementState.AvoidanceUntil then
+        local avoidTarget = myRoot.Position + MovementState.AvoidanceDir * 8
+
+        local now = time()
+
+        if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
+            MovementState.LastMoveTo = now
+            hum:MoveTo(avoidTarget)
+        end
+
+        return true
+    end
+
+    return false
+end
+
+local function GetOrbitPosition(myRoot, tRoot, dist)
+    if not SETTINGS.Movement.SmoothOrbit then
+        return tRoot.Position
+    end
+
+    local now = time()
+
+    if now - MovementState.LastOrbitSwitch > 2.5 + math.random() * 2 then
+        MovementState.LastOrbitSwitch = now
+        MovementState.OrbitDirection = -MovementState.OrbitDirection
+    end
+
+    MovementState.OrbitAngle = MovementState.OrbitAngle
+        + SETTINGS.Movement.OrbitSpeed * MovementState.OrbitDirection * 0.016
+
+    local jitter = (math.random() - 0.5) * SETTINGS.Movement.OrbitJitter
+
+    local radius = math.clamp(
+        SETTINGS.OrbitRadius + jitter,
+        SETTINGS.Movement.OrbitMinDist,
+        SETTINGS.Movement.OrbitMaxDist
+    )
+
+    local offsetX = math.cos(MovementState.OrbitAngle) * radius
+    local offsetZ = math.sin(MovementState.OrbitAngle) * radius
+
+    return tRoot.Position + Vector3.new(offsetX, 0, offsetZ)
+end
+
+local function AdvancedMoveTo(hum, myRoot, tRoot, targetPos, dist)
+    if HandleAntiStuck(hum, myRoot, targetPos) then
+        return
+    end
+
+    UpdatePath(myRoot, targetPos)
+
+    if #MovementState.PathWaypoints > 0 then
+        if FollowPath(hum, myRoot) then
+            return
+        end
+    end
+
+    local direction = targetPos - myRoot.Position
+    direction = Vector3.new(direction.X, 0, direction.Z)
+
+    if direction.Magnitude < 0.5 then
+        return
+    end
+
+    direction = direction.Unit
+
+    if IsEdgeAhead(myRoot, direction) then
+        return
+    end
+
+    local hasObstacle, canJump = IsObstacleAhead(myRoot, direction, 4)
+
+    if hasObstacle and canJump then
+        hum.Jump = true
+    end
+
+    local now = time()
+
+    if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
+        MovementState.LastMoveTo = now
+        hum:MoveTo(targetPos)
+    end
+end
+
 -- // DEFENSE // --
 local function TryParry(target, dist, myRoot, tRoot)
     if not SETTINGS.AutoParry then
@@ -627,6 +1098,10 @@ local function TryParry(target, dist, myRoot, tRoot)
         return true
     end
 
+    if EnemyCache.blocking then
+        return false
+    end
+
     if not EnemyCache.attacking then
         return false
     end
@@ -635,11 +1110,12 @@ local function TryParry(target, dist, myRoot, tRoot)
         return false
     end
 
-    if dist > 14 then
+    if dist > 11 then
         return false
     end
 
     local dirToMe = myRoot.Position - tRoot.Position
+
     if dirToMe.Magnitude < 0.001 then
         return false
     end
@@ -647,7 +1123,8 @@ local function TryParry(target, dist, myRoot, tRoot)
     dirToMe = dirToMe.Unit
 
     local enemyFace = tRoot.CFrame.LookVector
-    if enemyFace:Dot(dirToMe) < 0.25 then
+
+    if enemyFace:Dot(dirToMe) < 0.35 then
         return false
     end
 
@@ -683,8 +1160,6 @@ local function TryParry(target, dist, myRoot, tRoot)
 
         local hold = 0.12 + math.random() * 0.03
 
-        -- Освобождение F делаем независимо от прерывания,
-        -- чтобы клавиша не залипла.
         Schedule(hold, function()
             if IsAlive(LocalPlayer.Character) then
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -732,6 +1207,10 @@ local function TryAwakenKite(target, dist, myRoot, tRoot)
         return false
     end
 
+    MovementState.PathWaypoints = {}
+    MovementState.CurrentWaypointIndex = 0
+    MovementState.AvoidanceDir = nil
+
     local away = myRoot.Position - tRoot.Position
 
     if away.Magnitude > 0.001 then
@@ -749,48 +1228,9 @@ local function TryAwakenKite(target, dist, myRoot, tRoot)
         State.LastDash = time()
     end
 
-    State.MoveDest = dest
-    State.LastDestUpdate = time()
     hum:MoveTo(dest)
 
     return true
-end
-
--- // FLANK HELPERS // --
-local function IsBehindTarget(myRoot, tRoot)
-    local dir = myRoot.Position - tRoot.Position
-
-    if dir.Magnitude < 0.001 then
-        return false
-    end
-
-    dir = dir.Unit
-
-    return tRoot.CFrame.LookVector:Dot(dir) < -0.25
-end
-
-local function IsFlankPathSafe(myChar, target, myRoot, dest)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {myChar}
-
-    local dir = dest - myRoot.Position
-
-    if dir.Magnitude < 0.5 then
-        return true
-    end
-
-    local result = Workspace:Raycast(myRoot.Position, dir, params)
-
-    if not result then
-        return true
-    end
-
-    if target and result.Instance:IsDescendantOf(target) then
-        return true
-    end
-
-    return false
 end
 
 -- // OFFENSE ACTIONS // --
@@ -822,6 +1262,7 @@ local function ExecuteRandomSkill(target)
     local preferBreaker = EnemyCache.blocking and math.random() < 0.4
 
     local key = GetReadySkill(preferBreaker)
+
     if not key then
         key = GetReadySkill(false)
     end
@@ -866,6 +1307,7 @@ local function ExecuteCancelCombo(target)
     end
 
     local myChar = LocalPlayer.Character
+
     if not IsAlive(myChar) or not IsAlive(target) then
         EndAction("CancelCombo")
         return false
@@ -929,6 +1371,7 @@ local function ExecutePunish(target)
     end
 
     local myChar = LocalPlayer.Character
+
     if not IsAlive(myChar) or not IsAlive(target) then
         EndAction("Punish")
         return false
@@ -961,6 +1404,7 @@ local function ExecutePunish(target)
 
             if math.random(1, 3) == 1 then
                 local key = GetReadySkill(false)
+
                 if key then
                     PressKey(key, 0.08)
                     RegisterSkill(key)
@@ -1008,6 +1452,10 @@ local function ExecuteBlockBreak(target)
 
     State.BreakerCooldown = time()
     Log("Block break attempt")
+
+    MovementState.PathWaypoints = {}
+    MovementState.CurrentWaypointIndex = 0
+    MovementState.AvoidanceDir = nil
 
     local side = (math.random() > 0.5) and 1 or -1
 
@@ -1077,11 +1525,48 @@ local function ExecuteBlockBreak(target)
     return true
 end
 
--- // FLANK FOLLOW-UP // --
+-- // FLANK // --
+local function IsBehindTarget(myRoot, tRoot)
+    local dir = myRoot.Position - tRoot.Position
+
+    if dir.Magnitude < 0.001 then
+        return false
+    end
+
+    dir = dir.Unit
+
+    return tRoot.CFrame.LookVector:Dot(dir) < -0.25
+end
+
+local function IsFlankPathSafe(myChar, target, myRoot, dest)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {myChar}
+
+    local dir = dest - myRoot.Position
+
+    if dir.Magnitude < 0.5 then
+        return true
+    end
+
+    local result = Workspace:Raycast(myRoot.Position, dir, params)
+
+    if not result then
+        return true
+    end
+
+    if target and result.Instance:IsDescendantOf(target) then
+        return true
+    end
+
+    return false
+end
+
 local function ExecuteFlankSkill(target)
     local preferBreaker = EnemyCache.blocking and math.random() < 0.65
 
     local key = GetReadySkill(preferBreaker)
+
     if not key then
         key = GetReadySkill(false)
     end
@@ -1147,7 +1632,6 @@ local function ExecuteFlankFollowup(target)
         behind = IsBehindTarget(myRoot, tRoot)
     end
 
-    -- Если не оказались за спиной и враг атакует, пробуем парри
     if not behind and EnemyCache.attacking and SETTINGS.AutoParry then
         if TryParry(target, dist, myRoot, tRoot) then
             Log("Flank followup: emergency parry")
@@ -1223,6 +1707,10 @@ local function TryFlankDash(target, dist, myRoot, tRoot)
         return false
     end
 
+    if EnemyCache.attacking or EnemyCache.blocking then
+        return false
+    end
+
     local myChar = LocalPlayer.Character
     if not IsAlive(myChar) then
         return false
@@ -1233,7 +1721,6 @@ local function TryFlankDash(target, dist, myRoot, tRoot)
         return false
     end
 
-    -- Если уже за спиной, не флангуем
     local dirToMe = myRoot.Position - tRoot.Position
 
     if dirToMe.Magnitude > 0.001 then
@@ -1295,7 +1782,10 @@ local function TryFlankDash(target, dist, myRoot, tRoot)
 
     Log("Flank dash side: " .. tostring(side))
 
-    -- Останавливаем текущий MoveTo
+    MovementState.PathWaypoints = {}
+    MovementState.CurrentWaypointIndex = 0
+    MovementState.AvoidanceDir = nil
+
     hum:MoveTo(myRoot.Position)
 
     local cameraHold = math.max(
@@ -1312,10 +1802,8 @@ local function TryFlankDash(target, dist, myRoot, tRoot)
         )
     end
 
-    -- Зажимаем D
     VirtualInputManager:SendKeyEvent(true, cfg.Key, false, game)
 
-    -- Страховочное освобождение D
     Schedule(0.18, function()
         if IsAlive(myChar) then
             VirtualInputManager:SendKeyEvent(false, cfg.Key, false, game)
@@ -1361,13 +1849,11 @@ local function TryFlankDash(target, dist, myRoot, tRoot)
     return true
 end
 
--- // MOVEMENT // --
+-- // MOVEMENT / COMBAT HANDLERS // --
 local function HandleMovementAndDef(target, dist, myRoot, tRoot)
-    if State.MovementLock then
-        return
-    end
-
-    if ActiveAction.Name == "GapCloseDash" then
+    if State.ActionBusy then
+        State.StuckCount = 0
+        State.LastPos = myRoot.Position
         return
     end
 
@@ -1384,16 +1870,14 @@ local function HandleMovementAndDef(target, dist, myRoot, tRoot)
     local dest = tRoot.Position
 
     if SETTINGS.OrbitMode and dist < 20 and dist > 5 then
-        local angle = time() * (1.8 + math.random() * 0.4)
-        local jitter = (math.random() - 0.5) * 2
-
-        local ox = math.cos(angle) * (SETTINGS.OrbitRadius + jitter)
-        local oz = math.sin(angle) * (SETTINGS.OrbitRadius + jitter)
-
-        dest = tRoot.Position + Vector3.new(ox, 0, oz)
+        dest = GetOrbitPosition(myRoot, tRoot, dist)
     end
 
-    if SETTINGS.DashGapClose and dist > 35 and dist < 100 and time() - State.LastDash > SETTINGS.DashCD then
+    if SETTINGS.DashGapClose
+        and dist > 35
+        and dist < 100
+        and time() - State.LastDash > SETTINGS.DashCD
+    then
         local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
 
         local ok, actionId = BeginAction(
@@ -1410,30 +1894,9 @@ local function HandleMovementAndDef(target, dist, myRoot, tRoot)
         end
     end
 
-    if (myRoot.Position - State.LastPos).Magnitude < 0.15 then
-        State.StuckCount = State.StuckCount + 1
-
-        if State.StuckCount > 35 then
-            hum.Jump = true
-            State.StuckCount = 0
-        end
-    else
-        State.StuckCount = 0
-    end
-
-    State.LastPos = myRoot.Position
-
-    if not State.MoveDest
-        or (dest - State.MoveDest).Magnitude > 3
-        or time() - State.LastDestUpdate > 0.35
-    then
-        State.MoveDest = dest
-        State.LastDestUpdate = time()
-        hum:MoveTo(dest)
-    end
+    AdvancedMoveTo(hum, myRoot, tRoot, dest, dist)
 end
 
--- // COMBAT // --
 local function HandleCombat(target, dist)
     if State.ActionBusy then
         return
@@ -1472,6 +1935,10 @@ local function HandleCombat(target, dist)
         return
     end
 
+    if dist > SETTINGS.AttackRange + 3 then
+        return
+    end
+
     if dist <= SETTINGS.AttackRange then
         if now - State.LastM1 > SETTINGS.M1Cooldown + math.random() * 0.08 then
             local roll = math.random()
@@ -1505,6 +1972,14 @@ local function OnCharacterDeath()
     State.HitsOnBlock = 0
     State.IsBlocking = false
     State.StuckCount = 0
+    State.IncapacitatedSince = 0
+
+    MovementState.CurrentPath = nil
+    MovementState.PathWaypoints = {}
+    MovementState.CurrentWaypointIndex = 0
+    MovementState.StuckFrames = 0
+    MovementState.AvoidanceDir = nil
+    MovementState.AvoidanceUntil = 0
 
     pcall(function()
         VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
@@ -1545,29 +2020,51 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    if IsIncapacitated(myChar) then
-        BeginAction("Survival", 0.25, ActionPriority.SURVIVAL, false)
+    local incapacitated = IsIncapacitated(myChar)
 
-        PressKey(Enum.KeyCode.Space, 0.08)
+    if incapacitated then
+        if State.IncapacitatedSince == 0 then
+            State.IncapacitatedSince = time()
+        end
 
-        if math.random() > 0.75 then
-            local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
-            PressKey(dashKey, 0.05)
+        local incDuration = time() - State.IncapacitatedSince
+
+        if incDuration >= (SETTINGS.SurvivalDebounce or 0.2) then
+            if ActiveAction.Name ~= "Survival" then
+                BeginAction("Survival", 0.35, ActionPriority.SURVIVAL, false)
+
+                PressKey(Enum.KeyCode.Space, 0.08)
+
+                local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
+
+                if math.random() > 0.75 and time() - State.LastDash > SETTINGS.DashCD then
+                    PressKey(dashKey, 0.05)
+                    State.LastDash = time()
+                end
+            end
         end
 
         return
+    else
+        State.IncapacitatedSince = 0
     end
 
     local target = State.Target
 
-    if not IsAlive(target) then
+    if not target or not IsAlive(target) then
         target = FindTarget()
         State.Target = target
         State.HitsOnBlock = 0
+        ResetEnemyCache()
     end
 
     if not target then
         ForceEndAllActions()
+
+        MovementState.PathWaypoints = {}
+        MovementState.CurrentWaypointIndex = 0
+        MovementState.AvoidanceDir = nil
+
         return
     end
 
@@ -1576,12 +2073,44 @@ RunService.Heartbeat:Connect(function()
 
     if not myRoot or not tRoot then
         ForceEndAllActions()
+
+        MovementState.PathWaypoints = {}
+        MovementState.CurrentWaypointIndex = 0
+        MovementState.AvoidanceDir = nil
+
         return
     end
 
     UpdateEnemyCache(target)
 
     local dist = (myRoot.Position - tRoot.Position).Magnitude
+
+    -- Периодическая проверка видимости цели
+    if time() - State.LastTargetCheck > (SETTINGS.TargetRecheckDelay or 2) then
+        State.LastTargetCheck = time()
+
+        if not CanSeeCharacter(myChar, myRoot, target, tRoot) then
+            local newTarget = FindTarget()
+
+            if newTarget and newTarget ~= target then
+                State.Target = newTarget
+                target = newTarget
+                State.HitsOnBlock = 0
+                ResetEnemyCache()
+
+                local newTRoot = target:FindFirstChild("HumanoidRootPart")
+
+                if not newTRoot then
+                    ForceEndAllActions()
+                    return
+                end
+
+                tRoot = newTRoot
+                dist = (myRoot.Position - tRoot.Position).Magnitude
+                UpdateEnemyCache(target)
+            end
+        end
+    end
 
     AimAt(PredictTargetPosition(tRoot, dist))
 
@@ -1609,8 +2138,8 @@ end)
 -- // STARTUP NOTIFICATION // --
 pcall(function()
     game.StarterGui:SetCore("SendNotification", {
-        Title = "JJS AI v9.0",
-        Text = "Priority ActionManager + Flank Followup",
+        Title = "JJS AI v10.0",
+        Text = "Priority ActionManager + Advanced Movement",
         Duration = 5,
     })
 end)
