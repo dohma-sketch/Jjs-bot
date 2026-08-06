@@ -1,509 +1,420 @@
---[[ 
-    NPC COMBAT AGENT MODULE JJS
-    Architecture: Priority Action Manager + Advanced Movement (v10.0)
+--[[
+    JJS COMBAT AGENT - Jujutsu Shenanigans Specific
+    Delta / Lua 5.1 compatible
+    Based on JJS Wiki mechanics
 ]]
 
--- // SERVICES // --
-local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
+local FLANK_CAMERA_BINDING = "JJS_FlankCameraOverride"
+
+if _G.JJS_CombatAgent and _G.JJS_CombatAgent.Cleanup then
+    pcall(_G.JJS_CombatAgent.Cleanup)
+end
+
+_G.JJS_CombatAgent = {
+    Version = "12.0-jjs",
+    Cleanup = nil,
+}
+
+local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
 
--- // PLAYER // --
-local LocalPlayer = Players.LocalPlayer
+local VIM = nil
+pcall(function()
+    VIM = game:GetService("VirtualInputManager")
+end)
 
--- // CONFIGURATION // --
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    Players.PlayerAdded:Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+pcall(function()
+    math.randomseed(tick() * 1000)
+end)
+
+-- // HELPERS // --
+
+local function clamp(val, min, max)
+    if val < min then return min end
+    if val > max then return max end
+    return val
+end
+
+local function MakeLookCFrame(pos, look)
+    if CFrame.lookAt then
+        return CFrame.lookAt(pos, look)
+    end
+    return CFrame.new(pos, look)
+end
+
+local function SafeCFrameLerp(a, b, alpha)
+    if a.Lerp then return a:Lerp(b, alpha) end
+    return b
+end
+
+-- // JJS CONFIGURATION // --
+
 local SETTINGS = {
     Enabled = true,
     DebugMode = false,
 
-    -- Safety / states
-    StrictIncapacitated = true,
-    SurvivalDebounce = 0.2,
+    -- JJS Controls
+    BlockKey = Enum.KeyCode.F,
+    DashKey = Enum.KeyCode.Q,
+    AwakenKey = Enum.KeyCode.G,
+    SpecialKey = Enum.KeyCode.R,
+    M1MouseButton = 0,
 
-    -- Targeting
+    -- JJS Dash Mechanics (from wiki)
+    ForwardDashCD = 6,
+    SideDashCD = 2,
+    ForwardDashDistance = 25,
+    SideDashDistance = 17.5,
+
+    -- JJS M1 Mechanics (from wiki)
+    M1Startup = 0.2,
+    M1Endlag = 0.3,
+    M1Stun = 0.75,
+    M1BlockedEndlag = 0.6,
+    M1Range = 8,
+
+    -- Combat
     AggroRange = 400,
-    AttackRange = 7,
-    TargetRecheckDelay = 2,
+    AttackRange = 8,
+    ParryCD = 0.35,
+    ParryRange = 11,
+    SkillGlobalCD = 1.1,
 
-    -- Movement / combat toggles
+    -- Skills 1-4
+    Skills = {
+        [1] = {CD = 8,  Breaker = false, Name = "Skill1"},
+        [2] = {CD = 12, Breaker = false, Name = "Skill2"},
+        [3] = {CD = 16, Breaker = true,  Name = "Skill3"},
+        [4] = {CD = 25, Breaker = true,  Name = "Skill4"},
+    },
+
+    -- Awakening
+    UseAwakening = true,
+    AwakenCD = 45,
+    AwakenHealthThreshold = 0.35,
+    AwakenKiteRange = 45,
+
+    -- Defense
+    AutoParry = true,
+    BlockBreaker = true,
+    PostureHitsBeforeBreak = 3,
+    UseRagdollCancel = true,
+    RagdollCancelDelay = 0.15,
+
+    -- Movement
     OrbitMode = true,
     OrbitRadius = 9,
     DashGapClose = true,
-    AutoParry = true,
-    BlockBreaker = true,
+    UseSmoothAim = true,
+    AimSmooth = 0.22,
+    TargetRecheckDelay = 2,
+    AllowCloseWallTarget = false,
+    IgnoreSameTeam = true,
+    TargetPlayers = true,
+    TargetNPCs = true,
+    ScanWorkspaceModels = true,
 
-    -- Cooldowns
-    M1Cooldown = 0.45,
-    DashCD = 3,
-    ParryCD = 0.35,
-    BreakerAttemptCD = 2,
-    SkillGlobalCD = 1.1,
-
-    -- Humanization
-    HumanReaction = 0.18,
-    ParryError = 0.05,
-
-    -- JJS meta
-    AwakenKiteRange = 45,
-    PostureHitsBeforeBreak = 3,
-
-    Skills = {
-        [Enum.KeyCode.One]   = {CD = 8,  Breaker = false},
-        [Enum.KeyCode.Two]   = {CD = 12, Breaker = false},
-        [Enum.KeyCode.Three] = {CD = 16, Breaker = true},
-        [Enum.KeyCode.Four]  = {CD = 25, Breaker = true},
-    },
+    NPCFolders = {"NPCs", "Enemies", "Mobs", "Characters"},
 
     Movement = {
         UsePathfinding = true,
         PathfindingRange = 50,
         DirectMoveRange = 12,
         PathRecomputeDelay = 0.4,
-
         AgentRadius = 2,
         AgentHeight = 5,
         AgentCanJump = true,
-
         StuckThreshold = 0.08,
         StuckFrames = 45,
         StuckRayDistance = 6,
-
         CheckEdges = true,
         EdgeRayDistance = 5,
         EdgeHeightLimit = 12,
-
         SmoothOrbit = true,
         OrbitSpeed = 1.8,
         OrbitJitter = 0.25,
         OrbitMinDist = 6,
         OrbitMaxDist = 18,
-
         MoveToThrottle = 0.08,
     },
 
     FlankDash = {
         Enabled = true,
-
-        Key = Enum.KeyCode.D,
-        QKey = Enum.KeyCode.Q,
-
         Cooldown = 2.4,
-
         MinDist = 7,
         MaxDist = 24,
-
-        CameraHold = 0.62,
-        RotateCharacter = true,
-
-        -- 1 = вправо относительно врага
-        -- -1 = влево относительно врага
-        Side = 1,
-        RandomSide = false,
-
         SideOffset = 4.5,
         BackOffset = 6.5,
-
         FollowupEnabled = true,
         FollowupDelay = 0.5,
         FollowupRandom = 0.06,
-
-        UseDashCooldown = true,
         CheckWall = true,
         CheckBehind = true,
     },
 }
 
 -- // STATE // --
+
 local State = {
     Target = nil,
-    IsBlocking = false,
-
     ActionBusy = false,
     MovementLock = false,
 
-    LastPos = Vector3.new(0, 0, 0),
-    StuckCount = 0,
-
     SkillTimers = {},
+    SkillReadyAt = {},
+
     LastM1 = 0,
-    LastDash = 0,
+    LastForwardDash = 0,
+    LastSideDash = 0,
     LastParry = 0,
     LastSkillUse = 0,
+    LastAwaken = 0,
     BreakerCooldown = 0,
-
-    MoveDest = nil,
-    LastDestUpdate = 0,
 
     HitsOnBlock = 0,
     ConnectedChar = nil,
 
     LastFlank = 0,
     LastFlankSide = 0,
-    FlankSide = 1,
 
     IncapacitatedSince = 0,
     LastTargetCheck = 0,
+
+    IsAwakened = false,
+    EnemyIsCountering = false,
 }
 
 for k, _ in pairs(SETTINGS.Skills) do
     State.SkillTimers[k] = 0
+    State.SkillReadyAt[k] = 0
 end
 
--- // TIMER POOL // --
+-- // DIGIT KEY MAP // --
+
+local NUMBER_KEY_TO_ENUM = {
+    [1] = Enum.KeyCode.One,
+    [2] = Enum.KeyCode.Two,
+    [3] = Enum.KeyCode.Three,
+    [4] = Enum.KeyCode.Four,
+}
+
+local function ResolveKeyCode(key)
+    if key == nil then return nil end
+    if type(key) == "number" then
+        local mapped = NUMBER_KEY_TO_ENUM[key]
+        if mapped then return mapped end
+        return nil
+    end
+    return key
+end
+
+-- // TIMER POOL (Lua 5.1) // --
+
 local Timers = {}
+local TimerId = 0
+local TimerGeneration = 0
 
 local function Schedule(delayTime, callback)
-    local thread
-    thread = task.delay(delayTime, function()
-        Timers[thread] = nil
-        callback()
-    end)
-    Timers[thread] = true
+    TimerId = TimerId + 1
+    local id = TimerId
+    Timers[id] = {
+        triggerTime = time() + delayTime,
+        callback = callback,
+        active = true,
+        gen = TimerGeneration,
+    }
+    return id
 end
 
 local function CancelAllTimers()
-    for thread, _ in pairs(Timers) do
-        pcall(task.cancel, thread)
+    TimerGeneration = TimerGeneration + 1
+    for id, timer in pairs(Timers) do
+        timer.active = false
     end
-
-    for k in pairs(Timers) do
-        Timers[k] = nil
-    end
+    Timers = {}
 end
 
 -- // LOGGING // --
-local function Log(msg)
-    if SETTINGS.DebugMode then
-        pcall(function()
-            game.StarterGui:SetCore("SendNotification", {
-                Title = "JJS AI v10",
-                Text = tostring(msg),
-                Duration = 1,
-            })
-        end)
-    end
-end
 
 local function LogDebug(msg)
     if SETTINGS.DebugMode then
-        print("[JJS AI DEBUG] " .. tostring(msg))
+        print("[JJS AI] " .. tostring(msg))
     end
 end
 
--- // CAMERA OVERRIDE // --
-local FLANK_CAMERA_BINDING = "JJS_FlankCameraOverride"
-local CameraOverrideId = 0
+-- // INPUT // --
 
-local function UnbindFlankCamera()
+local function InputAvailable()
+    return VIM ~= nil
+end
+
+local function SendKeyRaw(key, isDown)
+    if not VIM then return end
+    local resolved = ResolveKeyCode(key)
+    if not resolved then return end
     pcall(function()
-        RunService:UnbindFromRenderStep(FLANK_CAMERA_BINDING)
+        VIM:SendKeyEvent(isDown, resolved, false, game)
     end)
 end
 
-local function ForceCameraMoveDirection(worldDir, duration)
-    worldDir = Vector3.new(worldDir.X, 0, worldDir.Z)
-
-    if worldDir.Magnitude < 0.001 then
-        return
-    end
-
-    worldDir = worldDir.Unit
-
-    UnbindFlankCamera()
-
-    CameraOverrideId = CameraOverrideId + 1
-    local id = CameraOverrideId
-
-    local startTime = time()
-
+local function SendMouseRaw(isDown)
+    if not VIM then return end
+    local x, y = 0, 0
     pcall(function()
-        RunService:BindToRenderStep(
-            FLANK_CAMERA_BINDING,
-            Enum.RenderPriority.Camera.Value + 1,
-            function()
-                if id ~= CameraOverrideId then
-                    return
-                end
-
-                if time() - startTime > duration then
-                    UnbindFlankCamera()
-                    return
-                end
-
-                local cam = Workspace.CurrentCamera
-                if not cam then
-                    return
-                end
-
-                local look = Vector3.new(0, 1, 0):Cross(worldDir)
-
-                if look.Magnitude < 0.001 then
-                    look = Vector3.new(0, 0, -1)
-                else
-                    look = look.Unit
-                end
-
-                cam.CFrame = CFrame.lookAt(
-                    cam.CFrame.Position,
-                    cam.CFrame.Position + look
-                )
-            end
-        )
-    end)
-
-    Schedule(duration + 0.05, function()
-        if id == CameraOverrideId then
-            UnbindFlankCamera()
+        local cam = Workspace.CurrentCamera
+        if cam and cam.ViewportSize then
+            x = cam.ViewportSize.X / 2
+            y = cam.ViewportSize.Y / 2
         end
     end)
-end
-
--- // ACTION MANAGER // --
-local ActionPriority = {
-    NONE = 0,
-    MOVEMENT = 10,
-    OFFENSE = 30,
-    FLANK = 50,
-    BLOCK_BREAK = 60,
-    DEFENSE = 80,
-    KITE = 90,
-    SURVIVAL = 100,
-}
-
-local ActiveAction = {
-    Id = 0,
-    Name = nil,
-    Priority = ActionPriority.NONE,
-    StartTime = 0,
-    EndTime = 0,
-    LockMovement = false,
-}
-
-local function SyncActionToState()
-    State.ActionBusy = ActiveAction.Name ~= nil
-    State.MovementLock = ActiveAction.Name ~= nil and ActiveAction.LockMovement
-end
-
-local function ForceEndAllActions()
-    if ActiveAction.Name == "Flank" then
-        UnbindFlankCamera()
-    end
-
-    ActiveAction.Id = ActiveAction.Id + 1
-    ActiveAction.Name = nil
-    ActiveAction.Priority = ActionPriority.NONE
-    ActiveAction.StartTime = 0
-    ActiveAction.EndTime = 0
-    ActiveAction.LockMovement = false
-
-    SyncActionToState()
-end
-
-local function EndAction(name)
-    if ActiveAction.Name == name then
-        if name == "Flank" then
-            UnbindFlankCamera()
-        end
-
-        ActiveAction.Id = ActiveAction.Id + 1
-        ActiveAction.Name = nil
-        ActiveAction.Priority = ActionPriority.NONE
-        ActiveAction.StartTime = 0
-        ActiveAction.EndTime = 0
-        ActiveAction.LockMovement = false
-
-        SyncActionToState()
-    end
-end
-
-local function UpdateAction()
-    if ActiveAction.Name and time() >= ActiveAction.EndTime then
-        ForceEndAllActions()
-    end
-
-    SyncActionToState()
-end
-
-local function CanStartAction(name, priority)
-    if not ActiveAction.Name then
-        return true
-    end
-
-    if ActiveAction.Name == name then
-        return true
-    end
-
-    return priority > ActiveAction.Priority
-end
-
-local function BeginAction(name, duration, priority, lockMovement)
-    UpdateAction()
-
-    if not CanStartAction(name, priority) then
-        return false, 0
-    end
-
-    local oldName = ActiveAction.Name
-
-    if oldName == "Flank" and name ~= "Flank" then
-        UnbindFlankCamera()
-    end
-
-    ActiveAction.Id = ActiveAction.Id + 1
-    ActiveAction.Name = name
-    ActiveAction.Priority = priority
-    ActiveAction.StartTime = time()
-    ActiveAction.EndTime = time() + duration
-    ActiveAction.LockMovement = lockMovement == true
-
-    SyncActionToState()
-
-    return true, ActiveAction.Id
-end
-
--- // UTILITIES // --
-local function IsAlive(char)
-    if not char or not char.Parent then
-        return false
-    end
-
-    local hum = char:FindFirstChild("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-
-    return hum and root and hum.Health > 0
+    pcall(function()
+        VIM:SendMouseButtonEvent(x, y, SETTINGS.M1MouseButton, isDown, game, 1)
+    end)
 end
 
 local function PressKey(key, hold)
-    if not IsAlive(LocalPlayer.Character) then
-        return
-    end
-
+    if not InputAvailable() then return end
+    if not IsAlive(LocalPlayer.Character) then return end
     hold = hold or (0.05 + math.random() * 0.03)
-
-    VirtualInputManager:SendKeyEvent(true, key, false, game)
-
+    SendKeyRaw(key, true)
     Schedule(hold + 0.03, function()
         if IsAlive(LocalPlayer.Character) then
-            VirtualInputManager:SendKeyEvent(false, key, false, game)
+            SendKeyRaw(key, false)
         end
     end)
 end
 
 local function ClickM1()
-    if not IsAlive(LocalPlayer.Character) then
-        return
-    end
-
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-
+    if not InputAvailable() then return end
+    if not IsAlive(LocalPlayer.Character) then return end
+    SendMouseRaw(true)
     Schedule(0.05 + math.random() * 0.02, function()
         if IsAlive(LocalPlayer.Character) then
-            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+            SendMouseRaw(false)
         end
     end)
 end
 
-local function IsSkillReady(key)
-    local info = SETTINGS.Skills[key]
-    if not info then
-        return false
-    end
+-- // UTILITIES // --
 
-    if time() - State.LastSkillUse < SETTINGS.SkillGlobalCD then
-        return false
-    end
-
-    return (time() - State.SkillTimers[key]) > (info.CD + math.random() * 0.5)
+local function GetRootPart(char)
+    if not char then return nil end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then return root end
+    local ok, primary = pcall(function() return char.PrimaryPart end)
+    if ok and primary then return primary end
+    return char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
 end
 
-local function RegisterSkill(key)
-    State.SkillTimers[key] = time()
-    State.LastSkillUse = time()
+local function IsAlive(char)
+    if not char or not char.Parent then return false end
+    local hum = char:FindFirstChild("Humanoid")
+    local root = GetRootPart(char)
+    if not hum or not root then return false end
+    if not hum:IsA("Humanoid") then return false end
+    return hum.Health > 0
+end
+
+local function GetBoolAttr(obj, name)
+    if not obj then return false end
+    local ok, value = pcall(function() return obj:GetAttribute(name) end)
+    return ok and value == true
 end
 
 local function IsIncapacitated(char)
-    if not IsAlive(char) then
-        return false
-    end
-
-    if char:GetAttribute("Ragdoll") == true then
-        return true
-    end
-
-    if char:GetAttribute("Stunned") == true then
-        return true
-    end
-
-    if char:GetAttribute("Knocked") == true then
-        return true
-    end
-
-    if char:GetAttribute("Incapacitated") == true then
-        return true
-    end
-
-    if SETTINGS.StrictIncapacitated then
-        return false
-    end
-
+    if not IsAlive(char) then return false end
+    if GetBoolAttr(char, "Ragdoll") then return true end
+    if GetBoolAttr(char, "Stunned") then return true end
+    if GetBoolAttr(char, "Knocked") then return true end
+    if GetBoolAttr(char, "Incapacitated") then return false end
     local hum = char:FindFirstChild("Humanoid")
-    if not hum then
-        return false
-    end
-
+    if not hum or not hum:IsA("Humanoid") then return false end
     local state = hum:GetState()
-
     return state == Enum.HumanoidStateType.Physics
         or state == Enum.HumanoidStateType.PlatformStanding
         or state == Enum.HumanoidStateType.FallingDown
 end
 
--- // ENEMY ANALYSIS CACHE // --
-local EnemyCache = {
-    lastAnimScan = 0,
-    blocking = false,
-    attacking = false,
+-- // JJS SPECIFIC: Block Angle Check // --
 
-    lastAwakenScan = 0,
-    awakened = false,
-}
-
-local function ResetEnemyCache()
-    EnemyCache.lastAnimScan = 0
-    EnemyCache.blocking = false
-    EnemyCache.attacking = false
-    EnemyCache.lastAwakenScan = 0
-    EnemyCache.awakened = false
+local function IsInFrontOfEnemy(myRoot, tRoot)
+    local toMe = myRoot.Position - tRoot.Position
+    if toMe.Magnitude < 0.001 then return false end
+    toMe = toMe.Unit
+    local enemyLook = tRoot.CFrame.LookVector
+    local dot = enemyLook:Dot(toMe)
+    return dot > 0
 end
 
-local function IsEnemyAwakened(char)
-    if char:GetAttribute("Awakened") == true then
-        return true
+local function IsBehindEnemy(myRoot, tRoot)
+    local toMe = myRoot.Position - tRoot.Position
+    if toMe.Magnitude < 0.001 then return false end
+    toMe = toMe.Unit
+    local enemyLook = tRoot.CFrame.LookVector
+    return enemyLook:Dot(toMe) < -0.3
+end
+
+-- // JJS SPECIFIC: Dash Type Detection // --
+
+local function GetDashType(myRoot)
+    local moveDir = myRoot.CFrame.LookVector
+    local forward = myRoot.CFrame.LookVector
+    local dot = forward:Dot(moveDir)
+    if dot > 0.7 then
+        return "forward"
     end
+    return "side"
+end
 
-    if char:GetAttribute("Awake") == true then
-        return true
+local function IsDashReady(dashType)
+    if dashType == "forward" then
+        return time() - State.LastForwardDash >= SETTINGS.ForwardDashCD
     end
+    return time() - State.LastSideDash >= SETTINGS.SideDashCD
+end
 
-    if char:GetAttribute("Domain") == true then
-        return true
+local function RegisterDash(dashType)
+    if dashType == "forward" then
+        State.LastForwardDash = time()
+    else
+        State.LastSideDash = time()
     end
+end
 
-    if char:GetAttribute("Transformation") == true then
-        return true
-    end
+-- // JJS SPECIFIC: Counter Detection // --
 
-    local vfx = char:FindFirstChild("VFX")
-        or char:FindFirstChild("Effects")
-        or char:FindFirstChild("Particles")
+local function IsEnemyCountering(target)
+    if not target then return false end
+    if GetBoolAttr(target, "CounterReady") then return true end
+    if GetBoolAttr(target, "CounterStance") then return true end
+    if GetBoolAttr(target, "Countering") then return true end
 
-    if vfx then
-        for _, d in pairs(vfx:GetChildren()) do
-            local n = d.Name:lower()
+    local hum = target:FindFirstChild("Humanoid")
+    if not hum or not hum:IsA("Humanoid") then return false end
+    local animator = hum:FindFirstChild("Animator")
+    if not animator or not animator:IsA("Animator") then return false end
 
-            if n:find("awaken") or n:find("domain") then
+    local ok, tracks = pcall(function()
+        return animator:GetPlayingAnimationTracks()
+    end)
+    if not ok then return false end
+
+    for _, t in pairs(tracks) do
+        if t.IsPlaying and t.Animation and t.Animation.Name then
+            local n = string.lower(t.Animation.Name)
+            if string.find(n, "counter")
+                or string.find(n, "parry")
+                or string.find(n, "reflect")
+                or string.find(n, "stance")
+            then
                 return true
             end
         end
@@ -512,11 +423,47 @@ local function IsEnemyAwakened(char)
     return false
 end
 
-local function UpdateEnemyCache(target)
-    if not target then
-        return
-    end
+-- // ENEMY CACHE // --
 
+local EnemyCache = {
+    lastAnimScan = 0,
+    blocking = false,
+    attacking = false,
+    countering = false,
+    lastAwakenScan = 0,
+    awakened = false,
+}
+
+local function ResetEnemyCache()
+    EnemyCache.lastAnimScan = 0
+    EnemyCache.blocking = false
+    EnemyCache.attacking = false
+    EnemyCache.countering = false
+    EnemyCache.lastAwakenScan = 0
+    EnemyCache.awakened = false
+end
+
+local function IsEnemyAwakened(char)
+    if GetBoolAttr(char, "Awakened") then return true end
+    if GetBoolAttr(char, "Awake") then return true end
+    if GetBoolAttr(char, "Domain") then return true end
+    if GetBoolAttr(char, "Transformation") then return true end
+    local vfx = char:FindFirstChild("VFX")
+        or char:FindFirstChild("Effects")
+        or char:FindFirstChild("Particles")
+    if vfx then
+        for _, d in pairs(vfx:GetChildren()) do
+            local n = string.lower(d.Name)
+            if string.find(n, "awaken") or string.find(n, "domain") then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function UpdateEnemyCache(target)
+    if not target then return end
     local now = time()
 
     if now - EnemyCache.lastAwakenScan > 0.5 then
@@ -524,59 +471,37 @@ local function UpdateEnemyCache(target)
         EnemyCache.awakened = IsEnemyAwakened(target)
     end
 
-    if now - EnemyCache.lastAnimScan < 0.12 then
-        return
-    end
+    EnemyCache.countering = IsEnemyCountering(target)
 
+    if now - EnemyCache.lastAnimScan < 0.12 then return end
     EnemyCache.lastAnimScan = now
     EnemyCache.blocking = false
     EnemyCache.attacking = false
 
-    if target:GetAttribute("Blocking") == true then
-        EnemyCache.blocking = true
-    end
-
-    if target:GetAttribute("Attacking") == true then
-        EnemyCache.attacking = true
-    end
-
-    if target:GetAttribute("M1") == true then
-        EnemyCache.attacking = true
-    end
+    if GetBoolAttr(target, "Blocking") then EnemyCache.blocking = true end
+    if GetBoolAttr(target, "Attacking") then EnemyCache.attacking = true end
+    if GetBoolAttr(target, "M1") then EnemyCache.attacking = true end
 
     local hum = target:FindFirstChild("Humanoid")
-    if not hum then
-        return
-    end
-
+    if not hum or not hum:IsA("Humanoid") then return end
     local animator = hum:FindFirstChild("Animator")
-    if not animator then
-        return
-    end
+    if not animator or not animator:IsA("Animator") then return end
 
-    local success, tracks = pcall(function()
+    local ok, tracks = pcall(function()
         return animator:GetPlayingAnimationTracks()
     end)
-
-    if not success then
-        return
-    end
+    if not ok then return end
 
     for _, t in pairs(tracks) do
         if t.IsPlaying and t.Animation and t.Animation.Name then
-            local n = t.Animation.Name:lower()
-
+            local n = string.lower(t.Animation.Name)
             if t.Priority == Enum.AnimationPriority.Action then
-                if n:find("block") or n:find("guard") or n:find("defend") then
+                if string.find(n, "block") or string.find(n, "guard") or string.find(n, "defend") then
                     EnemyCache.blocking = true
-                elseif n:find("swing")
-                    or n:find("punch")
-                    or n:find("kick")
-                    or n:find("slash")
-                    or n:find("hit")
-                    or n:find("m1")
-                    or n:find("attack")
-                    or n:find("combo")
+                elseif string.find(n, "swing") or string.find(n, "punch")
+                    or string.find(n, "kick") or string.find(n, "slash")
+                    or string.find(n, "hit") or string.find(n, "m1")
+                    or string.find(n, "attack") or string.find(n, "combo")
                 then
                     EnemyCache.attacking = true
                 end
@@ -585,31 +510,131 @@ local function UpdateEnemyCache(target)
     end
 end
 
--- // TARGET HELPERS // --
-local function PredictTargetPosition(tRoot, distance)
-    local vel = tRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
-    local reaction = 0.12 + (distance / 180)
+-- // ACTION MANAGER // --
 
+local ActionPriority = {
+    NONE = 0, MOVEMENT = 10, OFFENSE = 30, FLANK = 50,
+    BLOCK_BREAK = 60, DEFENSE = 80, KITE = 90, SURVIVAL = 100,
+}
+
+local ActiveAction = {
+    Id = 0, Name = nil, Priority = ActionPriority.NONE,
+    StartTime = 0, EndTime = 0, LockMovement = false,
+}
+
+local function SyncActionToState()
+    State.ActionBusy = ActiveAction.Name ~= nil
+    State.MovementLock = ActiveAction.Name ~= nil and ActiveAction.LockMovement
+end
+
+local function ForceEndAllActions()
+    ActiveAction.Id = ActiveAction.Id + 1
+    ActiveAction.Name = nil
+    ActiveAction.Priority = ActionPriority.NONE
+    ActiveAction.StartTime = 0
+    ActiveAction.EndTime = 0
+    ActiveAction.LockMovement = false
+    SyncActionToState()
+end
+
+local function EndAction(name)
+    if ActiveAction.Name == name then
+        ActiveAction.Id = ActiveAction.Id + 1
+        ActiveAction.Name = nil
+        ActiveAction.Priority = ActionPriority.NONE
+        ActiveAction.StartTime = 0
+        ActiveAction.EndTime = 0
+        ActiveAction.LockMovement = false
+        SyncActionToState()
+    end
+end
+
+local function UpdateAction()
+    if ActiveAction.Name and time() >= ActiveAction.EndTime then
+        ForceEndAllActions()
+    end
+    SyncActionToState()
+end
+
+local function CanStartAction(name, priority)
+    if not ActiveAction.Name then return true end
+    if ActiveAction.Name == name then return true end
+    return priority > ActiveAction.Priority
+end
+
+local function BeginAction(name, duration, priority, lockMovement)
+    UpdateAction()
+    if not CanStartAction(name, priority) then return false, 0 end
+    ActiveAction.Id = ActiveAction.Id + 1
+    ActiveAction.Name = name
+    ActiveAction.Priority = priority
+    ActiveAction.StartTime = time()
+    ActiveAction.EndTime = time() + duration
+    ActiveAction.LockMovement = lockMovement == true
+    SyncActionToState()
+    return true, ActiveAction.Id
+end
+
+-- // SKILL SYSTEM // --
+
+local function IsSkillReady(key)
+    local info = SETTINGS.Skills[key]
+    if not info then return false end
+    if time() - State.LastSkillUse < SETTINGS.SkillGlobalCD then return false end
+    return time() >= (State.SkillReadyAt[key] or 0)
+end
+
+local function RegisterSkill(key)
+    local info = SETTINGS.Skills[key]
+    local now = time()
+    State.SkillTimers[key] = now
+    State.LastSkillUse = now
+    State.SkillReadyAt[key] = now + info.CD + math.random() * 0.5
+end
+
+local function GetReadySkill(preferBreaker)
+    for key, info in pairs(SETTINGS.Skills) do
+        if info.Breaker == (preferBreaker == true) and IsSkillReady(key) then
+            return key
+        end
+    end
+    if preferBreaker then
+        for key, info in pairs(SETTINGS.Skills) do
+            if not info.Breaker and IsSkillReady(key) then
+                return key
+            end
+        end
+    end
+    return nil
+end
+
+-- // TARGETING // --
+
+local function PredictTargetPosition(tRoot, distance)
+    local vel = Vector3.new(0, 0, 0)
+    pcall(function()
+        vel = tRoot.AssemblyLinearVelocity or tRoot.Velocity or Vector3.new(0, 0, 0)
+    end)
+    local reaction = 0.12 + (distance / 180)
+    if reaction > 0.65 then reaction = 0.65 end
     return tRoot.Position + vel * reaction
 end
 
 local function AimAt(pos)
     local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        return
-    end
-
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot then
-        return
-    end
-
+    if not IsAlive(myChar) then return end
+    local myRoot = GetRootPart(myChar)
+    if not myRoot then return end
     local lookPos = Vector3.new(pos.X, myRoot.Position.Y, pos.Z)
     local dir = lookPos - myRoot.Position
-
     if dir.Magnitude > 0.001 then
-        local safeCFrame = CFrame.lookAt(myRoot.Position, myRoot.Position + dir.Unit)
-        myRoot.CFrame = safeCFrame
+        local goal = MakeLookCFrame(myRoot.Position, myRoot.Position + dir.Unit)
+        if SETTINGS.UseSmoothAim then
+            local alpha = clamp(SETTINGS.AimSmooth, 0.05, 1)
+            myRoot.CFrame = SafeCFrameLerp(myRoot.CFrame, goal, alpha)
+        else
+            myRoot.CFrame = goal
+        end
     end
 end
 
@@ -617,76 +642,91 @@ local function CanSeeCharacter(myChar, myRoot, target, targetRoot)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {myChar}
-
     local rayStart = myRoot.Position + Vector3.new(0, 2, 0)
     local rayEnd = targetRoot.Position + Vector3.new(0, 2, 0)
-
     local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
-
-    if not result then
-        return true
-    end
-
+    if not result then return true end
     return result.Instance:IsDescendantOf(target)
+end
+
+local function GetTargetCandidates()
+    local candidates = {}
+    local seen = {}
+    local playerChars = {}
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr.Character then playerChars[plr.Character] = plr end
+    end
+    if SETTINGS.TargetPlayers then
+        for _, plr in pairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                local allowed = true
+                if SETTINGS.IgnoreSameTeam and plr.Team and LocalPlayer.Team
+                    and plr.Team == LocalPlayer.Team then
+                    allowed = false
+                end
+                if allowed and not seen[plr.Character] then
+                    seen[plr.Character] = true
+                    candidates[#candidates + 1] = plr.Character
+                end
+            end
+        end
+    end
+    if SETTINGS.TargetNPCs then
+        for _, folderName in pairs(SETTINGS.NPCFolders) do
+            local folder = Workspace:FindFirstChild(folderName)
+            if folder then
+                for _, obj in pairs(folder:GetChildren()) do
+                    if obj:IsA("Model") and not playerChars[obj] and not seen[obj] then
+                        seen[obj] = true
+                        candidates[#candidates + 1] = obj
+                    end
+                end
+            end
+        end
+        if SETTINGS.ScanWorkspaceModels then
+            for _, obj in pairs(Workspace:GetChildren()) do
+                if obj:IsA("Model") and not playerChars[obj] and not seen[obj] then
+                    seen[obj] = true
+                    candidates[#candidates + 1] = obj
+                end
+            end
+        end
+    end
+    return candidates
 end
 
 local function FindTarget()
     local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        LogDebug("FindTarget: myChar not alive")
-        return nil
-    end
-
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    if not myRoot then
-        LogDebug("FindTarget: no myRoot")
-        return nil
-    end
-
+    if not IsAlive(myChar) then return nil end
+    local myRoot = GetRootPart(myChar)
+    if not myRoot then return nil end
     local myPos = myRoot.Position
     local bestTarget = nil
     local bestScore = -math.huge
-
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {myChar}
-
-    for _, p in pairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character then
-            local tChar = p.Character
-            local tRoot = tChar:FindFirstChild("HumanoidRootPart")
-            local hum = tChar:FindFirstChild("Humanoid")
-
-            if tRoot and hum and hum.Health > 0 then
+    local candidates = GetTargetCandidates()
+    for _, tChar in pairs(candidates) do
+        local tRoot = GetRootPart(tChar)
+        local hum = tChar:FindFirstChild("Humanoid")
+        if tRoot and hum and hum:IsA("Humanoid") then
+            if hum.Health > 0 and hum.MaxHealth > 0 then
                 local delta = tRoot.Position - myPos
                 local dist = delta.Magnitude
-
                 if dist > 0.1 and dist <= SETTINGS.AggroRange then
                     local rayStart = myPos + Vector3.new(0, 2, 0)
                     local rayEnd = tRoot.Position + Vector3.new(0, 2, 0)
-
                     local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
-
                     local canSee = false
-
-                    if not result then
-                        canSee = true
-                    elseif result.Instance:IsDescendantOf(tChar) then
-                        canSee = true
-                    end
-
-                    -- Аккуратный fallback для очень близких целей
-                    if not canSee and dist < 10 then
+                    if not result then canSee = true
+                    elseif result.Instance:IsDescendantOf(tChar) then canSee = true end
+                    if not canSee and dist < 10 and SETTINGS.AllowCloseWallTarget then
                         canSee = true
                     end
-
                     if canSee then
                         local healthRatio = hum.Health / hum.MaxHealth
-
-                        local threat = 1000
-                        threat = threat - (dist * 1.8)
-                        threat = threat - (healthRatio * 250)
-
+                        local threat = 1000 - (dist * 1.8) - (healthRatio * 250)
                         if threat > bestScore then
                             bestScore = threat
                             bestTarget = tChar
@@ -696,51 +736,17 @@ local function FindTarget()
             end
         end
     end
-
-    if bestTarget then
-        LogDebug("FindTarget: target found")
-    else
-        LogDebug("FindTarget: no target")
-    end
-
     return bestTarget
 end
 
-local function GetReadySkill(preferBreaker)
-    for key, info in pairs(SETTINGS.Skills) do
-        if info.Breaker == (preferBreaker == true) and IsSkillReady(key) then
-            return key
-        end
-    end
-
-    if preferBreaker then
-        for key, info in pairs(SETTINGS.Skills) do
-            if not info.Breaker and IsSkillReady(key) then
-                return key
-            end
-        end
-    end
-
-    return nil
-end
-
--- ======================================================
--- ADVANCED MOVEMENT CONTROLLER
--- ======================================================
+-- // MOVEMENT // --
 
 local MovementState = {
-    CurrentPath = nil,
-    PathWaypoints = {},
-    CurrentWaypointIndex = 0,
-    LastPathCompute = 0,
-    LastMoveTo = 0,
-    StuckFrames = 0,
-    LastPosition = Vector3.new(0, 0, 0),
-    OrbitAngle = 0,
-    OrbitDirection = 1,
-    LastOrbitSwitch = 0,
-    AvoidanceDir = nil,
-    AvoidanceUntil = 0,
+    CurrentPath = nil, PathWaypoints = {}, CurrentWaypointIndex = 0,
+    LastPathCompute = 0, LastMoveTo = 0, StuckFrames = 0,
+    LastPosition = Vector3.new(0, 0, 0), OrbitAngle = 0,
+    OrbitDirection = 1, NextOrbitSwitch = 0, AvoidanceDir = nil,
+    AvoidanceUntil = 0, LastDelta = 0.016,
 }
 
 local function ComputePathSafe(startPos, endPos)
@@ -750,1184 +756,575 @@ local function ComputePathSafe(startPos, endPos)
             AgentHeight = SETTINGS.Movement.AgentHeight,
             AgentCanJump = SETTINGS.Movement.AgentCanJump,
         })
-
         p:ComputeAsync(startPos, endPos)
-
         return p
     end)
-
-    if ok and path and path.Status == Enum.PathStatus.Success then
-        return path
-    end
-
+    if ok and path and path.Status == Enum.PathStatus.Success then return path end
     return nil
 end
 
 local function IsEdgeAhead(myRoot, direction)
-    if not SETTINGS.Movement.CheckEdges then
-        return false
-    end
-
+    if not SETTINGS.Movement.CheckEdges then return false end
     direction = Vector3.new(direction.X, 0, direction.Z)
-
-    if direction.Magnitude < 0.001 then
-        return false
-    end
-
+    if direction.Magnitude < 0.001 then return false end
     direction = direction.Unit
-
-    local rayStart = myRoot.Position + Vector3.new(0, 0.5, 0)
-    local rayEnd = rayStart + direction * SETTINGS.Movement.EdgeRayDistance
-
+    local aheadPos = myRoot.Position + direction * SETTINGS.Movement.EdgeRayDistance
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {myRoot.Parent}
-
-    local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
-
-    if not result then
-        return true
-    end
-
-    local heightDiff = myRoot.Position.Y - result.Position.Y
-
-    return heightDiff > SETTINGS.Movement.EdgeHeightLimit
+    local rayOrigin = aheadPos + Vector3.new(0, 2, 0)
+    local rayDirection = Vector3.new(0, -(SETTINGS.Movement.EdgeHeightLimit + 8), 0)
+    local result = Workspace:Raycast(rayOrigin, rayDirection, params)
+    if not result then return true end
+    return (myRoot.Position.Y - result.Position.Y) > SETTINGS.Movement.EdgeHeightLimit
 end
 
 local function IsObstacleAhead(myRoot, direction, distance)
     direction = Vector3.new(direction.X, 0, direction.Z)
-
-    if direction.Magnitude < 0.001 then
-        return false, false
-    end
-
+    if direction.Magnitude < 0.001 then return false, false end
     direction = direction.Unit
-
     local rayStart = myRoot.Position + Vector3.new(0, 1.5, 0)
     local rayEnd = rayStart + direction * distance
-
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {myRoot.Parent}
-
     local result = Workspace:Raycast(rayStart, rayEnd - rayStart, params)
-
     if result then
         local heightDiff = result.Position.Y - myRoot.Position.Y
-
-        if heightDiff < 3.5 then
-            return true, true
-        end
-
+        if heightDiff < 3.5 then return true, true end
         return true, false
     end
-
     return false, false
 end
 
 local function FindAvoidanceDirection(myRoot, targetPos)
     local forward = targetPos - myRoot.Position
     forward = Vector3.new(forward.X, 0, forward.Z)
-
-    if forward.Magnitude < 0.1 then
-        forward = Vector3.new(1, 0, 0)
-    else
-        forward = forward.Unit
-    end
-
+    if forward.Magnitude < 0.1 then forward = Vector3.new(1, 0, 0) else forward = forward.Unit end
     local right = Vector3.new(0, 1, 0):Cross(forward).Unit
     local left = -right
-
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {myRoot.Parent}
-
     local rayStart = myRoot.Position + Vector3.new(0, 1.5, 0)
     local checkDist = SETTINGS.Movement.StuckRayDistance
-
     local forwardRay = Workspace:Raycast(rayStart, forward * checkDist, params)
     local rightRay = Workspace:Raycast(rayStart, right * checkDist, params)
     local leftRay = Workspace:Raycast(rayStart, left * checkDist, params)
-
-    if not forwardRay then
-        return forward
-    end
-
-    local rightClear = not rightRay
-    local leftClear = not leftRay
-
-    if rightClear and leftClear then
-        return math.random() > 0.5 and right or left
-    elseif rightClear then
-        return right
-    elseif leftClear then
-        return left
-    end
-
+    if not forwardRay then return forward end
+    if not rightRay and not leftRay then return math.random() > 0.5 and right or left
+    elseif not rightRay then return right
+    elseif not leftRay then return left end
     return forward
 end
 
+local PathfindingBusy = false
+
 local function UpdatePath(myRoot, targetPos)
     local now = time()
-
-    if now - MovementState.LastPathCompute < SETTINGS.Movement.PathRecomputeDelay then
-        return
-    end
-
+    if now - MovementState.LastPathCompute < SETTINGS.Movement.PathRecomputeDelay then return end
     local dist = (targetPos - myRoot.Position).Magnitude
-
     if dist < SETTINGS.Movement.DirectMoveRange then
         MovementState.CurrentPath = nil
         MovementState.PathWaypoints = {}
         MovementState.CurrentWaypointIndex = 0
         return
     end
-
-    if dist > SETTINGS.Movement.PathfindingRange and SETTINGS.Movement.UsePathfinding then
-        local path = ComputePathSafe(myRoot.Position, targetPos)
-
-        if path then
-            MovementState.CurrentPath = path
-            MovementState.PathWaypoints = path:GetWaypoints()
-            MovementState.CurrentWaypointIndex = 2
-            MovementState.LastPathCompute = now
-        else
-            MovementState.CurrentPath = nil
-            MovementState.PathWaypoints = {}
-            MovementState.CurrentWaypointIndex = 0
-        end
+    if dist > SETTINGS.Movement.PathfindingRange and SETTINGS.Movement.UsePathfinding and not PathfindingBusy then
+        PathfindingBusy = true
+        local char = myRoot.Parent
+        local startPos = myRoot.Position
+        coroutine.wrap(function()
+            local path = ComputePathSafe(startPos, targetPos)
+            PathfindingBusy = false
+            if not char or not char.Parent then return end
+            if path then
+                MovementState.CurrentPath = path
+                MovementState.PathWaypoints = path:GetWaypoints()
+                MovementState.CurrentWaypointIndex = 2
+                MovementState.LastPathCompute = time()
+            else
+                MovementState.CurrentPath = nil
+                MovementState.PathWaypoints = {}
+                MovementState.CurrentWaypointIndex = 0
+            end
+        end)()
     end
 end
 
 local function FollowPath(hum, myRoot)
-    if not MovementState.PathWaypoints or #MovementState.PathWaypoints == 0 then
-        return false
-    end
-
+    if not MovementState.PathWaypoints or #MovementState.PathWaypoints == 0 then return false end
     local idx = MovementState.CurrentWaypointIndex
-
     if idx > #MovementState.PathWaypoints then
         MovementState.PathWaypoints = {}
         MovementState.CurrentWaypointIndex = 0
         return false
     end
-
     local waypoint = MovementState.PathWaypoints[idx]
     local waypointPos = waypoint.Position
-
-    local distToWaypoint = (waypointPos - myRoot.Position).Magnitude
-
-    if distToWaypoint < 4 then
+    if (waypointPos - myRoot.Position).Magnitude < 4 then
         MovementState.CurrentWaypointIndex = idx + 1
         return true
     end
-
-    if waypoint.Action == Enum.PathWaypointAction.Jump then
-        hum.Jump = true
-    end
-
+    if waypoint.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
     local direction = waypointPos - myRoot.Position
     direction = Vector3.new(direction.X, 0, direction.Z)
-
-    if direction.Magnitude < 0.1 then
-        return true
-    end
-
+    if direction.Magnitude < 0.1 then return true end
     direction = direction.Unit
-
     if IsEdgeAhead(myRoot, direction) then
         MovementState.PathWaypoints = {}
         MovementState.CurrentWaypointIndex = 0
         return false
     end
-
     local hasObstacle, canJump = IsObstacleAhead(myRoot, direction, 4)
-
-    if hasObstacle and canJump then
-        hum.Jump = true
-    end
-
+    if hasObstacle and canJump then hum.Jump = true end
     local now = time()
-
     if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
         MovementState.LastMoveTo = now
         hum:MoveTo(waypointPos)
     end
-
     return true
 end
 
 local function HandleAntiStuck(hum, myRoot, targetPos)
     local currentPos = myRoot.Position
     local movement = (currentPos - MovementState.LastPosition).Magnitude
-
-    if movement < SETTINGS.Movement.StuckThreshold then
-        MovementState.StuckFrames = MovementState.StuckFrames + 1
-    else
-        MovementState.StuckFrames = 0
-        MovementState.AvoidanceDir = nil
-    end
-
+    local expectedMin = SETTINGS.Movement.StuckThreshold * (MovementState.LastDelta or 0.016) * 60
+    if movement < expectedMin then MovementState.StuckFrames = MovementState.StuckFrames + 1
+    else MovementState.StuckFrames = 0 MovementState.AvoidanceDir = nil end
     MovementState.LastPosition = currentPos
-
     if MovementState.StuckFrames >= SETTINGS.Movement.StuckFrames then
         MovementState.StuckFrames = 0
-
         local avoidDir = FindAvoidanceDirection(myRoot, targetPos)
-
         if not IsEdgeAhead(myRoot, avoidDir) then
             MovementState.AvoidanceDir = avoidDir
             MovementState.AvoidanceUntil = time() + 0.5
-
             local hasObstacle, canJump = IsObstacleAhead(myRoot, avoidDir, 5)
-
-            if hasObstacle and canJump then
-                hum.Jump = true
-            end
-
+            if hasObstacle and canJump then hum.Jump = true end
             local avoidTarget = myRoot.Position + avoidDir * 8
-
             local now = time()
-
             if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
                 MovementState.LastMoveTo = now
                 hum:MoveTo(avoidTarget)
             end
-
             MovementState.PathWaypoints = {}
             MovementState.CurrentWaypointIndex = 0
         else
             hum.Jump = true
         end
-
         return true
     end
-
     if MovementState.AvoidanceDir and time() < MovementState.AvoidanceUntil then
         local avoidTarget = myRoot.Position + MovementState.AvoidanceDir * 8
-
         local now = time()
-
         if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
             MovementState.LastMoveTo = now
             hum:MoveTo(avoidTarget)
         end
-
         return true
     end
-
     return false
 end
 
 local function GetOrbitPosition(myRoot, tRoot, dist)
-    if not SETTINGS.Movement.SmoothOrbit then
-        return tRoot.Position
-    end
-
+    if not SETTINGS.Movement.SmoothOrbit then return tRoot.Position end
     local now = time()
-
-    if now - MovementState.LastOrbitSwitch > 2.5 + math.random() * 2 then
-        MovementState.LastOrbitSwitch = now
-        MovementState.OrbitDirection = -MovementState.OrbitDirection
+    if MovementState.NextOrbitSwitch == 0 then
+        MovementState.NextOrbitSwitch = now + 2.5 + math.random() * 2
     end
-
+    if now >= MovementState.NextOrbitSwitch then
+        MovementState.OrbitDirection = -MovementState.OrbitDirection
+        MovementState.NextOrbitSwitch = now + 2.5 + math.random() * 2
+    end
     MovementState.OrbitAngle = MovementState.OrbitAngle
-        + SETTINGS.Movement.OrbitSpeed * MovementState.OrbitDirection * 0.016
-
+        + SETTINGS.Movement.OrbitSpeed * MovementState.OrbitDirection * (MovementState.LastDelta or 0.016)
     local jitter = (math.random() - 0.5) * SETTINGS.Movement.OrbitJitter
-
-    local radius = math.clamp(
-        SETTINGS.OrbitRadius + jitter,
-        SETTINGS.Movement.OrbitMinDist,
-        SETTINGS.Movement.OrbitMaxDist
-    )
-
+    local radius = clamp(SETTINGS.OrbitRadius + jitter, SETTINGS.Movement.OrbitMinDist, SETTINGS.Movement.OrbitMaxDist)
     local offsetX = math.cos(MovementState.OrbitAngle) * radius
     local offsetZ = math.sin(MovementState.OrbitAngle) * radius
-
     return tRoot.Position + Vector3.new(offsetX, 0, offsetZ)
 end
 
 local function AdvancedMoveTo(hum, myRoot, tRoot, targetPos, dist)
-    if HandleAntiStuck(hum, myRoot, targetPos) then
-        return
-    end
-
+    if HandleAntiStuck(hum, myRoot, targetPos) then return end
     UpdatePath(myRoot, targetPos)
-
     if #MovementState.PathWaypoints > 0 then
-        if FollowPath(hum, myRoot) then
-            return
-        end
+        if FollowPath(hum, myRoot) then return end
     end
-
     local direction = targetPos - myRoot.Position
     direction = Vector3.new(direction.X, 0, direction.Z)
-
-    if direction.Magnitude < 0.5 then
-        return
-    end
-
+    if direction.Magnitude < 0.5 then return end
     direction = direction.Unit
-
-    if IsEdgeAhead(myRoot, direction) then
-        return
-    end
-
+    if IsEdgeAhead(myRoot, direction) then return end
     local hasObstacle, canJump = IsObstacleAhead(myRoot, direction, 4)
-
-    if hasObstacle and canJump then
-        hum.Jump = true
-    end
-
+    if hasObstacle and canJump then hum.Jump = true end
     local now = time()
-
     if now - MovementState.LastMoveTo > SETTINGS.Movement.MoveToThrottle then
         MovementState.LastMoveTo = now
         hum:MoveTo(targetPos)
     end
 end
 
--- // DEFENSE // --
-local function TryParry(target, dist, myRoot, tRoot)
-    if not SETTINGS.AutoParry then
-        return false
-    end
+-- // JJS COMBAT ACTIONS // --
 
-    if ActiveAction.Name == "Parry" then
-        return true
-    end
-
-    if EnemyCache.blocking then
-        return false
-    end
-
-    if not EnemyCache.attacking then
-        return false
-    end
-
-    if time() - State.LastParry < SETTINGS.ParryCD then
-        return false
-    end
-
-    if dist > 11 then
-        return false
-    end
-
-    local dirToMe = myRoot.Position - tRoot.Position
-
-    if dirToMe.Magnitude < 0.001 then
-        return false
-    end
-
-    dirToMe = dirToMe.Unit
-
-    local enemyFace = tRoot.CFrame.LookVector
-
-    if enemyFace:Dot(dirToMe) < 0.35 then
-        return false
-    end
-
-    local reaction = SETTINGS.HumanReaction + (math.random() * 2 - 1) * SETTINGS.ParryError
-    local totalDuration = reaction + 0.28
-
-    local ok, actionId = BeginAction(
-        "Parry",
-        totalDuration,
-        ActionPriority.DEFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
-    State.LastParry = time()
-    Log("Parry attempt")
-
-    Schedule(reaction, function()
-        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Parry" then
-            return
-        end
-
-        if not IsAlive(LocalPlayer.Character) or not IsAlive(target) then
-            EndAction("Parry")
-            return
-        end
-
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-        State.IsBlocking = true
-
-        local hold = 0.12 + math.random() * 0.03
-
-        Schedule(hold, function()
-            if IsAlive(LocalPlayer.Character) then
-                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-                State.IsBlocking = false
-            end
-        end)
-
-        Schedule(hold + 0.05, function()
-            if ActiveAction.Id == actionId and ActiveAction.Name == "Parry" then
-                EndAction("Parry")
-            end
-        end)
-    end)
-
-    return true
-end
-
-local function TryAwakenKite(target, dist, myRoot, tRoot)
-    if ActiveAction.Name == "AwakenKite" then
-        return true
-    end
-
-    if not EnemyCache.awakened then
-        return false
-    end
-
-    local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        return false
-    end
-
-    local hum = myChar:FindFirstChild("Humanoid")
-    if not hum then
-        return false
-    end
-
-    local ok, actionId = BeginAction(
-        "AwakenKite",
-        0.25,
-        ActionPriority.KITE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
-    MovementState.PathWaypoints = {}
-    MovementState.CurrentWaypointIndex = 0
-    MovementState.AvoidanceDir = nil
-
-    local away = myRoot.Position - tRoot.Position
-
-    if away.Magnitude > 0.001 then
-        away = away.Unit
-    else
-        away = Vector3.new(1, 0, 0)
-    end
-
-    local dest = myRoot.Position + away * SETTINGS.AwakenKiteRange
-
-    local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
-
-    if dist < 30 and time() - State.LastDash > SETTINGS.DashCD then
-        PressKey(dashKey, 0.05)
-        State.LastDash = time()
-    end
-
-    hum:MoveTo(dest)
-
-    return true
-end
-
--- // OFFENSE ACTIONS // --
 local function ExecuteQuickM1()
-    local ok, actionId = BeginAction(
-        "QuickM1",
-        0.18,
-        ActionPriority.OFFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
+    if not InputAvailable() then return false end
+    if EnemyCache.countering then return false end
+    local ok, actionId = BeginAction("QuickM1", SETTINGS.M1Startup + SETTINGS.M1Endlag, ActionPriority.OFFENSE, false)
+    if not ok then return false end
     ClickM1()
     State.LastM1 = time()
-
-    Schedule(0.18, function()
-        if ActiveAction.Id == actionId and ActiveAction.Name == "QuickM1" then
-            EndAction("QuickM1")
-        end
+    Schedule(SETTINGS.M1Startup + SETTINGS.M1Endlag, function()
+        if ActiveAction.Id == actionId and ActiveAction.Name == "QuickM1" then EndAction("QuickM1") end
     end)
-
     return true
 end
 
-local function ExecuteRandomSkill(target)
-    local preferBreaker = EnemyCache.blocking and math.random() < 0.4
-
-    local key = GetReadySkill(preferBreaker)
-
-    if not key then
-        key = GetReadySkill(false)
-    end
-
-    if not key then
-        return false
-    end
-
-    local ok, actionId = BeginAction(
-        "RandomSkill",
-        0.32,
-        ActionPriority.OFFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
+local function ExecuteSkill(key)
+    if not InputAvailable() then return false end
+    if EnemyCache.countering then return false end
+    local ok, actionId = BeginAction("Skill", 0.32, ActionPriority.OFFENSE, false)
+    if not ok then return false end
     PressKey(key, 0.08)
     RegisterSkill(key)
-
     Schedule(0.3, function()
-        if ActiveAction.Id == actionId and ActiveAction.Name == "RandomSkill" then
-            EndAction("RandomSkill")
-        end
+        if ActiveAction.Id == actionId and ActiveAction.Name == "Skill" then EndAction("Skill") end
     end)
-
     return true
 end
 
 local function ExecuteCancelCombo(target)
-    local ok, actionId = BeginAction(
-        "CancelCombo",
-        0.78,
-        ActionPriority.OFFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
+    if not InputAvailable() then return false end
+    if EnemyCache.countering then return false end
+    local ok, actionId = BeginAction("CancelCombo", 0.78, ActionPriority.OFFENSE, false)
+    if not ok then return false end
     local myChar = LocalPlayer.Character
-
-    if not IsAlive(myChar) or not IsAlive(target) then
-        EndAction("CancelCombo")
-        return false
-    end
-
+    if not IsAlive(myChar) or not IsAlive(target) then EndAction("CancelCombo") return false end
     State.LastM1 = time()
     ClickM1()
-
     Schedule(0.22 + math.random() * 0.03, function()
-        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "CancelCombo" then
-            return
-        end
-
-        if not IsAlive(myChar) or not IsAlive(target) then
-            EndAction("CancelCombo")
-            return
-        end
-
+        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "CancelCombo" then return end
+        if not IsAlive(myChar) or not IsAlive(target) then EndAction("CancelCombo") return end
         ClickM1()
-
         Schedule(0.18 + math.random() * 0.03, function()
-            if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "CancelCombo" then
-                return
-            end
-
-            if not IsAlive(myChar) or not IsAlive(target) then
-                EndAction("CancelCombo")
-                return
-            end
-
+            if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "CancelCombo" then return end
+            if not IsAlive(myChar) or not IsAlive(target) then EndAction("CancelCombo") return end
             local key = GetReadySkill(false)
-
-            if key then
-                PressKey(key, 0.08)
-                RegisterSkill(key)
-            else
-                ClickM1()
-            end
-
+            if key then ExecuteSkill(key) else ClickM1() end
             Schedule(0.25, function()
-                if ActiveAction.Id == actionId and ActiveAction.Name == "CancelCombo" then
-                    EndAction("CancelCombo")
-                end
+                if ActiveAction.Id == actionId and ActiveAction.Name == "CancelCombo" then EndAction("CancelCombo") end
             end)
         end)
     end)
-
     return true
 end
 
 local function ExecutePunish(target)
-    local ok, actionId = BeginAction(
-        "Punish",
-        0.68,
-        ActionPriority.OFFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
+    if not InputAvailable() then return false end
+    local ok, actionId = BeginAction("Punish", 0.68, ActionPriority.OFFENSE, false)
+    if not ok then return false end
     local myChar = LocalPlayer.Character
-
-    if not IsAlive(myChar) or not IsAlive(target) then
-        EndAction("Punish")
-        return false
-    end
-
+    if not IsAlive(myChar) or not IsAlive(target) then EndAction("Punish") return false end
     State.LastM1 = time()
     ClickM1()
-
     Schedule(0.2, function()
-        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Punish" then
-            return
-        end
-
-        if not IsAlive(myChar) or not IsAlive(target) then
-            EndAction("Punish")
-            return
-        end
-
+        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Punish" then return end
+        if not IsAlive(myChar) or not IsAlive(target) then EndAction("Punish") return end
         ClickM1()
-
         Schedule(0.2, function()
-            if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Punish" then
-                return
-            end
-
-            if not IsAlive(myChar) or not IsAlive(target) then
-                EndAction("Punish")
-                return
-            end
-
+            if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Punish" then return end
+            if not IsAlive(myChar) or not IsAlive(target) then EndAction("Punish") return end
             if math.random(1, 3) == 1 then
                 local key = GetReadySkill(false)
-
-                if key then
-                    PressKey(key, 0.08)
-                    RegisterSkill(key)
-                end
+                if key then ExecuteSkill(key) end
             end
-
             Schedule(0.2, function()
-                if ActiveAction.Id == actionId and ActiveAction.Name == "Punish" then
-                    EndAction("Punish")
-                end
+                if ActiveAction.Id == actionId and ActiveAction.Name == "Punish" then EndAction("Punish") end
             end)
         end)
     end)
-
     return true
 end
 
 local function ExecuteBlockBreak(target)
-    if time() - State.BreakerCooldown < SETTINGS.BreakerAttemptCD then
-        return false
-    end
-
+    if not InputAvailable() then return false end
+    if time() - State.BreakerCooldown < 2 then return false end
     local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        return false
-    end
-
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    local tRoot = target and target:FindFirstChild("HumanoidRootPart")
-
-    if not myRoot or not tRoot then
-        return false
-    end
-
-    local ok, actionId = BeginAction(
-        "BlockBreak",
-        0.72,
-        ActionPriority.BLOCK_BREAK,
-        true
-    )
-
-    if not ok then
-        return false
-    end
-
+    if not IsAlive(myChar) then return false end
+    local myRoot = GetRootPart(myChar)
+    local tRoot = target and GetRootPart(target)
+    if not myRoot or not tRoot then return false end
+    local ok, actionId = BeginAction("BlockBreak", 0.72, ActionPriority.BLOCK_BREAK, true)
+    if not ok then return false end
     State.BreakerCooldown = time()
-    Log("Block break attempt")
-
     MovementState.PathWaypoints = {}
     MovementState.CurrentWaypointIndex = 0
     MovementState.AvoidanceDir = nil
-
     local side = (math.random() > 0.5) and 1 or -1
-
     local offset = tRoot.CFrame.RightVector * (side * (10 + math.random() * 3))
         - tRoot.CFrame.LookVector * (5 + math.random() * 2)
-
     local dashTargetPos = tRoot.Position + offset
-
-    myRoot.CFrame = CFrame.lookAt(myRoot.Position, dashTargetPos)
-
-    local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
-
-    if time() - State.LastDash > SETTINGS.DashCD then
-        PressKey(dashKey, 0.05)
-        State.LastDash = time()
+    myRoot.CFrame = MakeLookCFrame(myRoot.Position, dashTargetPos)
+    if IsDashReady("side") then
+        PressKey(SETTINGS.DashKey, 0.05)
+        RegisterDash("side")
     end
-
     Schedule(0.18 + math.random() * 0.04, function()
-        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "BlockBreak" then
-            return
-        end
-
-        if not IsAlive(myChar) or not IsAlive(target) then
-            EndAction("BlockBreak")
-            return
-        end
-
-        local rootNow = myChar:FindFirstChild("HumanoidRootPart")
-        local targetRootNow = target:FindFirstChild("HumanoidRootPart")
-
-        if not rootNow or not targetRootNow then
-            EndAction("BlockBreak")
-            return
-        end
-
-        if (rootNow.Position - targetRootNow.Position).Magnitude > 20 then
-            EndAction("BlockBreak")
-            return
-        end
-
+        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "BlockBreak" then return end
+        if not IsAlive(myChar) or not IsAlive(target) then EndAction("BlockBreak") return end
+        local rootNow = GetRootPart(myChar)
+        local targetRootNow = GetRootPart(target)
+        if not rootNow or not targetRootNow then EndAction("BlockBreak") return end
+        if (rootNow.Position - targetRootNow.Position).Magnitude > 20 then EndAction("BlockBreak") return end
         AimAt(targetRootNow.Position)
-
         local key = GetReadySkill(true)
-
-        if key then
-            PressKey(key, 0.1)
-            RegisterSkill(key)
+        if key then ExecuteSkill(key)
         else
             ClickM1()
-
             Schedule(0.12, function()
                 if ActiveAction.Id == actionId and ActiveAction.Name == "BlockBreak" then
-                    if IsAlive(myChar) then
-                        ClickM1()
-                    end
+                    if IsAlive(myChar) then ClickM1() end
                 end
             end)
         end
-
         Schedule(0.32, function()
-            if ActiveAction.Id == actionId and ActiveAction.Name == "BlockBreak" then
-                EndAction("BlockBreak")
-            end
+            if ActiveAction.Id == actionId and ActiveAction.Name == "BlockBreak" then EndAction("BlockBreak") end
         end)
     end)
-
     return true
 end
 
--- // FLANK // --
-local function IsBehindTarget(myRoot, tRoot)
-    local dir = myRoot.Position - tRoot.Position
+-- // JJS AWAKENING // --
 
-    if dir.Magnitude < 0.001 then
-        return false
-    end
+local function TryAwaken(myChar, dist)
+    if not SETTINGS.UseAwakening then return false end
+    if not InputAvailable() then return false end
+    if time() - State.LastAwaken < SETTINGS.AwakenCD then return false end
+    if State.IsAwakened then return false end
 
-    dir = dir.Unit
+    local hum = myChar:FindFirstChild("Humanoid")
+    if not hum or not hum:IsA("Humanoid") then return false end
+    if hum.MaxHealth <= 0 then return false end
 
-    return tRoot.CFrame.LookVector:Dot(dir) < -0.25
-end
+    local healthRatio = hum.Health / hum.MaxHealth
 
-local function IsFlankPathSafe(myChar, target, myRoot, dest)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {myChar}
-
-    local dir = dest - myRoot.Position
-
-    if dir.Magnitude < 0.5 then
-        return true
-    end
-
-    local result = Workspace:Raycast(myRoot.Position, dir, params)
-
-    if not result then
-        return true
-    end
-
-    if target and result.Instance:IsDescendantOf(target) then
+    if healthRatio <= SETTINGS.AwakenHealthThreshold then
+        PressKey(SETTINGS.AwakenKey, 0.15)
+        State.LastAwaken = time()
+        State.IsAwakened = true
+        LogDebug("Awakening activated!")
         return true
     end
 
     return false
 end
 
-local function ExecuteFlankSkill(target)
-    local preferBreaker = EnemyCache.blocking and math.random() < 0.65
-
-    local key = GetReadySkill(preferBreaker)
-
-    if not key then
-        key = GetReadySkill(false)
+local function TryAwakenKite(target, dist, myRoot, tRoot)
+    if ActiveAction.Name == "AwakenKite" then return true end
+    if not EnemyCache.awakened then return false end
+    local myChar = LocalPlayer.Character
+    if not IsAlive(myChar) then return false end
+    local hum = myChar:FindFirstChild("Humanoid")
+    if not hum or not hum:IsA("Humanoid") then return false end
+    local ok, actionId = BeginAction("AwakenKite", 0.25, ActionPriority.KITE, false)
+    if not ok then return false end
+    MovementState.PathWaypoints = {}
+    MovementState.CurrentWaypointIndex = 0
+    MovementState.AvoidanceDir = nil
+    local away = myRoot.Position - tRoot.Position
+    if away.Magnitude > 0.001 then away = away.Unit else away = Vector3.new(1, 0, 0) end
+    local dest = myRoot.Position + away * SETTINGS.AwakenKiteRange
+    if dist < 30 and IsDashReady("side") then
+        PressKey(SETTINGS.DashKey, 0.05)
+        RegisterDash("side")
     end
-
-    if not key then
-        return ExecuteCancelCombo(target)
-    end
-
-    local ok, actionId = BeginAction(
-        "FlankSkill",
-        0.32,
-        ActionPriority.OFFENSE,
-        false
-    )
-
-    if not ok then
-        return false
-    end
-
-    PressKey(key, 0.08)
-    RegisterSkill(key)
-
-    Schedule(0.3, function()
-        if ActiveAction.Id == actionId and ActiveAction.Name == "FlankSkill" then
-            EndAction("FlankSkill")
-        end
-    end)
-
+    AdvancedMoveTo(hum, myRoot, tRoot, dest, dist)
     return true
 end
 
-local function ExecuteFlankFollowup(target)
-    if not IsAlive(LocalPlayer.Character) or not IsAlive(target) then
-        return
-    end
+-- // DEFENSE // --
 
-    local myChar = LocalPlayer.Character
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    local tRoot = target:FindFirstChild("HumanoidRootPart")
+local function TryParry(target, dist, myRoot, tRoot)
+    if not SETTINGS.AutoParry then return false end
+    if not InputAvailable() then return false end
+    if ActiveAction.Name == "Parry" then return true end
+    if EnemyCache.blocking then return false end
+    if not EnemyCache.attacking then return false end
+    if time() - State.LastParry < SETTINGS.ParryCD then return false end
+    if dist > SETTINGS.ParryRange then return false end
+    local dirToMe = myRoot.Position - tRoot.Position
+    if dirToMe.Magnitude < 0.001 then return false end
+    dirToMe = dirToMe.Unit
+    local enemyFace = tRoot.CFrame.LookVector
+    if enemyFace:Dot(dirToMe) < 0.35 then return false end
+    local reaction = 0.18 + (math.random() * 2 - 1) * 0.05
+    local totalDuration = reaction + 0.28
+    local ok, actionId = BeginAction("Parry", totalDuration, ActionPriority.DEFENSE, false)
+    if not ok then return false end
+    State.LastParry = time()
+    Schedule(reaction, function()
+        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Parry" then return end
+        if not IsAlive(LocalPlayer.Character) or not IsAlive(target) then EndAction("Parry") return end
+        SendKeyRaw(SETTINGS.BlockKey, true)
+        local hold = 0.12 + math.random() * 0.03
+        Schedule(hold, function()
+            if IsAlive(LocalPlayer.Character) then SendKeyRaw(SETTINGS.BlockKey, false) end
+        end)
+        Schedule(hold + 0.05, function()
+            if ActiveAction.Id == actionId and ActiveAction.Name == "Parry" then EndAction("Parry") end
+        end)
+    end)
+    return true
+end
 
-    if not myRoot or not tRoot then
-        return
-    end
+-- // JJS RAGDOLL CANCEL // --
 
-    local dist = (myRoot.Position - tRoot.Position).Magnitude
+local function TryRagdollCancel(myChar)
+    if not SETTINGS.UseRagdollCancel then return false end
+    if not InputAvailable() then return false end
+    if not IsIncapacitated(myChar) then return false end
+    if not IsDashReady("side") then return false end
 
-    AimAt(PredictTargetPosition(tRoot, dist))
+    PressKey(SETTINGS.DashKey, 0.05)
+    RegisterDash("side")
+    LogDebug("Ragdoll cancel!")
+    return true
+end
 
-    if dist > SETTINGS.AttackRange + 6 then
-        return
-    end
+-- // FLANK // --
 
-    if IsIncapacitated(target) and dist < 10 then
-        Log("Flank followup: punish")
-        ExecutePunish(target)
-        return
-    end
-
-    local cfg = SETTINGS.FlankDash
-    local behind = true
-
-    if cfg.CheckBehind then
-        behind = IsBehindTarget(myRoot, tRoot)
-    end
-
-    if not behind and EnemyCache.attacking and SETTINGS.AutoParry then
-        if TryParry(target, dist, myRoot, tRoot) then
-            Log("Flank followup: emergency parry")
-            return
-        end
-    end
-
-    if EnemyCache.blocking and dist < 12 and SETTINGS.BlockBreaker then
-        if State.HitsOnBlock >= SETTINGS.PostureHitsBeforeBreak
-            and time() - State.BreakerCooldown > SETTINGS.BreakerAttemptCD
-        then
-            Log("Flank followup: block break")
-            ExecuteBlockBreak(target)
-            return
-        end
-    end
-
-    local roll = math.random()
-
-    if behind then
-        if roll < 0.45 then
-            Log("Flank followup: cancel combo")
-            ExecuteCancelCombo(target)
-        elseif roll < 0.85 then
-            Log("Flank followup: flank skill")
-            ExecuteFlankSkill(target)
-        else
-            Log("Flank followup: cancel combo backup")
-            ExecuteCancelCombo(target)
-        end
-    else
-        if roll < 0.65 then
-            Log("Flank followup: cancel combo")
-            ExecuteCancelCombo(target)
-        elseif roll < 0.85 then
-            Log("Flank followup: flank skill")
-            ExecuteFlankSkill(target)
-        else
-            Log("Flank followup: quick M1")
-            ExecuteQuickM1()
-        end
-    end
+local function IsBehindTarget(myRoot, tRoot)
+    local dir = myRoot.Position - tRoot.Position
+    if dir.Magnitude < 0.001 then return false end
+    dir = dir.Unit
+    return tRoot.CFrame.LookVector:Dot(dir) < -0.25
 end
 
 local function TryFlankDash(target, dist, myRoot, tRoot)
     local cfg = SETTINGS.FlankDash
-
-    if not cfg or not cfg.Enabled then
-        return false
-    end
-
-    if ActiveAction.Name == "Flank" then
-        return true
-    end
-
-    if ActiveAction.Name ~= nil then
-        return false
-    end
-
-    if time() - State.LastFlank < cfg.Cooldown then
-        return false
-    end
-
-    if cfg.UseDashCooldown and time() - State.LastDash < SETTINGS.DashCD then
-        return false
-    end
-
-    if dist < cfg.MinDist or dist > cfg.MaxDist then
-        return false
-    end
-
-    if EnemyCache.awakened then
-        return false
-    end
-
-    if EnemyCache.attacking or EnemyCache.blocking then
-        return false
-    end
+    if not cfg or not cfg.Enabled then return false end
+    if not InputAvailable() then return false end
+    if ActiveAction.Name == "Flank" then return true end
+    if ActiveAction.Name ~= nil then return false end
+    if time() - State.LastFlank < cfg.Cooldown then return false end
+    if not IsDashReady("side") then return false end
+    if dist < cfg.MinDist or dist > cfg.MaxDist then return false end
+    if EnemyCache.awakened then return false end
+    if EnemyCache.attacking or EnemyCache.blocking then return false end
+    if EnemyCache.countering then return false end
 
     local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        return false
-    end
-
+    if not IsAlive(myChar) then return false end
     local hum = myChar:FindFirstChild("Humanoid")
-    if not hum then
-        return false
-    end
+    if not hum or not hum:IsA("Humanoid") then return false end
 
-    local dirToMe = myRoot.Position - tRoot.Position
-
-    if dirToMe.Magnitude > 0.001 then
-        dirToMe = dirToMe.Unit
-
-        local facingDot = tRoot.CFrame.LookVector:Dot(dirToMe)
-
-        if facingDot < 0.05 then
-            return false
-        end
-    end
-
-    local side = cfg.Side
-
-    if cfg.RandomSide then
-        side = math.random() < 0.5 and -1 or 1
-
-        if side == State.LastFlankSide then
-            side = -side
-        end
-    end
-
+    local side = math.random() < 0.5 and -1 or 1
     local dest = tRoot.Position
         + tRoot.CFrame.RightVector * (cfg.SideOffset * side)
         - tRoot.CFrame.LookVector * cfg.BackOffset
 
     local moveDir = dest - myRoot.Position
     moveDir = Vector3.new(moveDir.X, 0, moveDir.Z)
-
-    if moveDir.Magnitude < 1 then
-        return false
-    end
-
+    if moveDir.Magnitude < 1 then return false end
     moveDir = moveDir.Unit
 
-    if cfg.CheckWall and not IsFlankPathSafe(myChar, target, myRoot, dest) then
-        return false
-    end
-
-    local followDelay = (cfg.FollowupDelay or 0.5)
-        + math.random() * (cfg.FollowupRandom or 0)
-
+    local followDelay = (cfg.FollowupDelay or 0.5) + math.random() * (cfg.FollowupRandom or 0)
     local totalDuration = followDelay + 0.3
 
-    local ok, actionId = BeginAction(
-        "Flank",
-        totalDuration,
-        ActionPriority.FLANK,
-        true
-    )
-
-    if not ok then
-        return false
-    end
+    local ok, actionId = BeginAction("Flank", totalDuration, ActionPriority.FLANK, true)
+    if not ok then return false end
 
     State.LastFlank = time()
     State.LastFlankSide = side
-    State.FlankSide = side
-
-    Log("Flank dash side: " .. tostring(side))
-
     MovementState.PathWaypoints = {}
     MovementState.CurrentWaypointIndex = 0
     MovementState.AvoidanceDir = nil
 
-    hum:MoveTo(myRoot.Position)
+    myRoot.CFrame = MakeLookCFrame(myRoot.Position, myRoot.Position + moveDir)
 
-    local cameraHold = math.max(
-        cfg.CameraHold or 0.62,
-        followDelay + 0.12
-    )
+    PressKey(SETTINGS.DashKey, 0.05)
+    RegisterDash("side")
 
-    ForceCameraMoveDirection(moveDir, cameraHold)
-
-    if cfg.RotateCharacter then
-        myRoot.CFrame = CFrame.lookAt(
-            myRoot.Position,
-            myRoot.Position + moveDir
-        )
-    end
-
-    VirtualInputManager:SendKeyEvent(true, cfg.Key, false, game)
-
-    Schedule(0.18, function()
-        if IsAlive(myChar) then
-            VirtualInputManager:SendKeyEvent(false, cfg.Key, false, game)
-        end
-    end)
-
-    Schedule(0.02 + math.random() * 0.03, function()
-        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Flank" then
-            return
-        end
-
-        if not IsAlive(myChar) then
-            EndAction("Flank")
-            return
-        end
-
-        PressKey(cfg.QKey, 0.06)
-        State.LastDash = time()
-
-        if cfg.FollowupEnabled then
-            Schedule(followDelay, function()
-                if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Flank" then
-                    return
-                end
-
-                if not IsAlive(myChar) or not IsAlive(target) then
-                    EndAction("Flank")
-                    return
-                end
-
-                EndAction("Flank")
-                ExecuteFlankFollowup(target)
-            end)
-        else
-            Schedule(0.25, function()
-                if ActiveAction.Id == actionId and ActiveAction.Name == "Flank" then
-                    EndAction("Flank")
-                end
-            end)
+    Schedule(followDelay, function()
+        if ActiveAction.Id ~= actionId or ActiveAction.Name ~= "Flank" then return end
+        if not IsAlive(myChar) or not IsAlive(target) then EndAction("Flank") return end
+        EndAction("Flank")
+        if dist <= SETTINGS.AttackRange + 6 then
+            if IsBehindTarget(myRoot, tRoot) then
+                ExecuteCancelCombo(target)
+            else
+                ExecuteQuickM1()
+            end
         end
     end)
 
     return true
 end
 
--- // MOVEMENT / COMBAT HANDLERS // --
+-- // MOVEMENT HANDLER // --
+
 local function HandleMovementAndDef(target, dist, myRoot, tRoot)
     if State.ActionBusy then
-        State.StuckCount = 0
-        State.LastPos = myRoot.Position
+        MovementState.StuckFrames = 0
+        MovementState.LastPosition = myRoot.Position
         return
     end
-
     local myChar = LocalPlayer.Character
-    if not IsAlive(myChar) then
-        return
-    end
-
+    if not IsAlive(myChar) then return end
     local hum = myChar:FindFirstChild("Humanoid")
-    if not hum then
-        return
-    end
-
+    if not hum or not hum:IsA("Humanoid") then return end
     local dest = tRoot.Position
-
     if SETTINGS.OrbitMode and dist < 20 and dist > 5 then
         dest = GetOrbitPosition(myRoot, tRoot, dist)
     end
-
-    if SETTINGS.DashGapClose
-        and dist > 35
-        and dist < 100
-        and time() - State.LastDash > SETTINGS.DashCD
-    then
-        local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
-
-        local ok, actionId = BeginAction(
-            "GapCloseDash",
-            0.2,
-            ActionPriority.MOVEMENT,
-            false
-        )
-
+    if SETTINGS.DashGapClose and dist > 35 and dist < 100 and IsDashReady("forward") then
+        local ok, actionId = BeginAction("GapCloseDash", 0.2, ActionPriority.MOVEMENT, false)
         if ok then
-            PressKey(dashKey, 0.05)
-            State.LastDash = time()
+            PressKey(SETTINGS.DashKey, 0.05)
+            RegisterDash("forward")
             return
         end
     end
-
     AdvancedMoveTo(hum, myRoot, tRoot, dest, dist)
 end
 
-local function HandleCombat(target, dist)
-    if State.ActionBusy then
-        return
-    end
+-- // COMBAT HANDLER // --
 
-    if EnemyCache.awakened and dist < SETTINGS.AwakenKiteRange then
-        return
-    end
+local function HandleCombat(target, dist, myRoot, tRoot)
+    if State.ActionBusy then return end
+    if EnemyCache.awakened and dist < SETTINGS.AwakenKiteRange then return end
+    if EnemyCache.countering then return end
 
     local now = time()
     local isBlocking = EnemyCache.blocking
     local isStunned = IsIncapacitated(target)
+    local behindEnemy = IsBehindEnemy(myRoot, tRoot)
 
-    if isBlocking and dist < 20 then
+    if isBlocking and not behindEnemy and dist < 20 then
         if SETTINGS.BlockBreaker then
             if State.HitsOnBlock >= SETTINGS.PostureHitsBeforeBreak then
-                if ExecuteBlockBreak(target) then
-                    State.HitsOnBlock = 0
+                if ExecuteBlockBreak(target) then State.HitsOnBlock = 0
+                elseif now - State.LastM1 > 0.5 then
+                    if ExecuteQuickM1() then State.HitsOnBlock = State.HitsOnBlock + 1 end
                 end
             else
-                if now - State.LastM1 > SETTINGS.M1Cooldown then
-                    if ExecuteQuickM1() then
-                        State.HitsOnBlock = State.HitsOnBlock + 1
-                    end
+                if now - State.LastM1 > 0.5 then
+                    if ExecuteQuickM1() then State.HitsOnBlock = State.HitsOnBlock + 1 end
                 end
             end
+        else
+            if now - State.LastM1 > 0.5 then ExecuteQuickM1() end
         end
-
         return
     else
         State.HitsOnBlock = 0
+    end
+
+    if behindEnemy and dist <= SETTINGS.AttackRange then
+        if now - State.LastM1 > 0.5 then
+            ExecuteQuickM1()
+            return
+        end
     end
 
     if isStunned and dist < 9 then
@@ -1935,211 +1332,186 @@ local function HandleCombat(target, dist)
         return
     end
 
-    if dist > SETTINGS.AttackRange + 3 then
-        return
-    end
+    if dist > SETTINGS.AttackRange + 3 then return end
 
     if dist <= SETTINGS.AttackRange then
-        if now - State.LastM1 > SETTINGS.M1Cooldown + math.random() * 0.08 then
+        if now - State.LastM1 > 0.5 + math.random() * 0.08 then
             local roll = math.random()
-
             if roll < 0.25 then
-                if not ExecuteCancelCombo(target) then
-                    ExecuteQuickM1()
-                end
+                if not ExecuteCancelCombo(target) then ExecuteQuickM1() end
             elseif roll < 0.45 then
-                if not ExecuteRandomSkill(target) then
-                    ExecuteQuickM1()
-                end
+                local key = GetReadySkill(false)
+                if key then ExecuteSkill(key) else ExecuteQuickM1() end
             else
                 ExecuteQuickM1()
             end
-
             return
         end
     end
 end
 
--- // DEATH CLEANUP // --
+-- // DEATH / CLEANUP // --
+
 local DeathConnection = nil
+local HeartbeatConnection = nil
+
+local function ReleaseAllKeys()
+    SendKeyRaw(SETTINGS.BlockKey, false)
+    SendKeyRaw(SETTINGS.DashKey, false)
+    SendKeyRaw(SETTINGS.AwakenKey, false)
+    SendKeyRaw(SETTINGS.SpecialKey, false)
+    SendKeyRaw(Enum.KeyCode.Space, false)
+    SendMouseRaw(false)
+end
 
 local function OnCharacterDeath()
     CancelAllTimers()
     ForceEndAllActions()
-    UnbindFlankCamera()
-
     State.Target = nil
     State.HitsOnBlock = 0
-    State.IsBlocking = false
-    State.StuckCount = 0
     State.IncapacitatedSince = 0
-
+    State.IsAwakened = false
     MovementState.CurrentPath = nil
     MovementState.PathWaypoints = {}
     MovementState.CurrentWaypointIndex = 0
     MovementState.StuckFrames = 0
     MovementState.AvoidanceDir = nil
     MovementState.AvoidanceUntil = 0
+    ReleaseAllKeys()
+end
 
-    pcall(function()
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.D, false, game)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-    end)
+_G.JJS_CombatAgent.Cleanup = function()
+    if HeartbeatConnection then pcall(function() HeartbeatConnection:Disconnect() end) end
+    if DeathConnection then pcall(function() DeathConnection:Disconnect() end) end
+    CancelAllTimers()
+    ForceEndAllActions()
+    ReleaseAllKeys()
 end
 
 -- // MAIN LOOP // --
-RunService.Heartbeat:Connect(function()
-    if not SETTINGS.Enabled then
-        return
+
+HeartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+    MovementState.LastDelta = dt or 0.016
+
+    local now = time()
+    local toExecute = {}
+    for id, timer in pairs(Timers) do
+        if timer.active and timer.gen == TimerGeneration and now >= timer.triggerTime then
+            timer.active = false
+            Timers[id] = nil
+            toExecute[#toExecute + 1] = timer
+        end
+    end
+    for i = 1, #toExecute do
+        local timer = toExecute[i]
+        if timer.gen == TimerGeneration then
+            local ok, err = pcall(timer.callback)
+            if not ok then LogDebug("Timer error: " .. tostring(err)) end
+        end
     end
 
+    if not SETTINGS.Enabled then return end
     UpdateAction()
 
     local myChar = LocalPlayer.Character
-
-    if not IsAlive(myChar) then
-        State.Target = nil
-        return
-    end
+    if not IsAlive(myChar) then State.Target = nil return end
 
     if State.ConnectedChar ~= myChar then
+        if DeathConnection then pcall(function() DeathConnection:Disconnect() end) end
+        DeathConnection = nil
         State.ConnectedChar = myChar
-
-        if DeathConnection then
-            pcall(function()
-                DeathConnection:Disconnect()
-            end)
-        end
-
         local hum = myChar:FindFirstChild("Humanoid")
-        if hum then
+        if hum and hum:IsA("Humanoid") then
             DeathConnection = hum.Died:Connect(OnCharacterDeath)
         end
     end
 
     local incapacitated = IsIncapacitated(myChar)
-
     if incapacitated then
-        if State.IncapacitatedSince == 0 then
-            State.IncapacitatedSince = time()
-        end
-
+        if State.IncapacitatedSince == 0 then State.IncapacitatedSince = time() end
         local incDuration = time() - State.IncapacitatedSince
-
-        if incDuration >= (SETTINGS.SurvivalDebounce or 0.2) then
-            if ActiveAction.Name ~= "Survival" then
-                BeginAction("Survival", 0.35, ActionPriority.SURVIVAL, false)
-
-                PressKey(Enum.KeyCode.Space, 0.08)
-
-                local dashKey = SETTINGS.FlankDash and SETTINGS.FlankDash.QKey or Enum.KeyCode.Q
-
-                if math.random() > 0.75 and time() - State.LastDash > SETTINGS.DashCD then
-                    PressKey(dashKey, 0.05)
-                    State.LastDash = time()
-                end
-            end
+        if incDuration >= 0.15 then
+            TryRagdollCancel(myChar)
         end
-
         return
     else
         State.IncapacitatedSince = 0
     end
 
     local target = State.Target
-
     if not target or not IsAlive(target) then
         target = FindTarget()
         State.Target = target
         State.HitsOnBlock = 0
+        State.LastTargetCheck = time()
         ResetEnemyCache()
     end
 
     if not target then
         ForceEndAllActions()
-
         MovementState.PathWaypoints = {}
         MovementState.CurrentWaypointIndex = 0
         MovementState.AvoidanceDir = nil
-
         return
     end
 
-    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
-    local tRoot = target:FindFirstChild("HumanoidRootPart")
-
+    local myRoot = GetRootPart(myChar)
+    local tRoot = GetRootPart(target)
     if not myRoot or not tRoot then
         ForceEndAllActions()
-
         MovementState.PathWaypoints = {}
         MovementState.CurrentWaypointIndex = 0
         MovementState.AvoidanceDir = nil
-
         return
     end
 
     UpdateEnemyCache(target)
-
     local dist = (myRoot.Position - tRoot.Position).Magnitude
 
-    -- Периодическая проверка видимости цели
     if time() - State.LastTargetCheck > (SETTINGS.TargetRecheckDelay or 2) then
         State.LastTargetCheck = time()
-
         if not CanSeeCharacter(myChar, myRoot, target, tRoot) then
             local newTarget = FindTarget()
-
             if newTarget and newTarget ~= target then
-                State.Target = newTarget
-                target = newTarget
-                State.HitsOnBlock = 0
-                ResetEnemyCache()
-
-                local newTRoot = target:FindFirstChild("HumanoidRootPart")
-
-                if not newTRoot then
+                local newTRoot = GetRootPart(newTarget)
+                if newTRoot then
+                    State.Target = newTarget
+                    target = newTarget
+                    tRoot = newTRoot
+                    State.HitsOnBlock = 0
+                    ResetEnemyCache()
+                    dist = (myRoot.Position - tRoot.Position).Magnitude
+                    UpdateEnemyCache(target)
+                else
                     ForceEndAllActions()
                     return
                 end
-
-                tRoot = newTRoot
-                dist = (myRoot.Position - tRoot.Position).Magnitude
-                UpdateEnemyCache(target)
             end
         end
     end
 
-    AimAt(PredictTargetPosition(tRoot, dist))
+    TryAwaken(myChar, dist)
 
-    -- Приоритетные поведения
-    if TryAwakenKite(target, dist, myRoot, tRoot) then
-        return
+    if not State.MovementLock and ActiveAction.Name ~= "Flank" and ActiveAction.Name ~= "BlockBreak" then
+        AimAt(PredictTargetPosition(tRoot, dist))
     end
 
-    if TryParry(target, dist, myRoot, tRoot) then
-        return
-    end
+    if TryAwakenKite(target, dist, myRoot, tRoot) then return end
+    if TryParry(target, dist, myRoot, tRoot) then return end
+    if TryFlankDash(target, dist, myRoot, tRoot) then return end
 
-    if TryFlankDash(target, dist, myRoot, tRoot) then
-        return
-    end
-
-    -- Обычное поведение
     HandleMovementAndDef(target, dist, myRoot, tRoot)
-
     if dist < SETTINGS.AggroRange then
-        HandleCombat(target, dist)
+        HandleCombat(target, dist, myRoot, tRoot)
     end
 end)
 
--- // STARTUP NOTIFICATION // --
 pcall(function()
     game.StarterGui:SetCore("SendNotification", {
-        Title = "JJS AI v10.0",
-        Text = "Priority ActionManager + Advanced Movement",
-        Duration = 5,
+        Title = "JJS AI",
+        Text = "Jujutsu Shenanigans bot loaded",
+        Duration = 3,
     })
 end)
+
+LogDebug("JJS Combat Agent loaded")
