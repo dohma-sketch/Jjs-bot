@@ -1,0 +1,688 @@
+--[[
+    JJS REMOTE INTERCEPTOR GUI v1.0
+    Draggable window with tabs for Remotes, Stats, Mappings, Log
+    Delta / Lua 5.1 compatible
+]]
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+
+local GUI_CONFIG = {
+    WindowSize = UDim2.new(0, 500, 0, 400),
+    WindowPos = UDim2.new(0.5, -250, 0.5, -200),
+    AccentColor = Color3.fromRGB(65, 105, 225),
+    BgColor = Color3.fromRGB(30, 30, 35),
+    PanelColor = Color3.fromRGB(45, 45, 50),
+    TextColor = Color3.fromRGB(220, 220, 220),
+    MaxLogEntries = 50,
+}
+
+-- ============================================================
+-- GUI CREATION
+-- ============================================================
+
+local function CreateGUI()
+    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+    
+    -- Удаляем старый GUI если есть
+    local oldGui = PlayerGui:FindFirstChild("JJS_RemoteGUI")
+    if oldGui then oldGui:Destroy() end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "JJS_RemoteGUI"
+    ScreenGui.Parent = PlayerGui
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    -- Главное окно
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainWindow"
+    MainFrame.Size = GUI_CONFIG.WindowSize
+    MainFrame.Position = GUI_CONFIG.WindowPos
+    MainFrame.BackgroundColor3 = GUI_CONFIG.BgColor
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.Parent = ScreenGui
+
+    local MainCorner = Instance.new("UICorner")
+    MainCorner.CornerRadius = UDim.new(0, 8)
+    MainCorner.Parent = MainFrame
+
+    -- Заголовок
+    local TitleBar = Instance.new("Frame")
+    TitleBar.Name = "TitleBar"
+    TitleBar.Size = UDim2.new(1, 0, 0, 35)
+    TitleBar.BackgroundColor3 = GUI_CONFIG.AccentColor
+    TitleBar.BorderSizePixel = 0
+    TitleBar.Parent = MainFrame
+
+    local TitleCorner = Instance.new("UICorner")
+    TitleCorner.CornerRadius = UDim.new(0, 8)
+    TitleCorner.Parent = TitleBar
+
+    local TitleLabel = Instance.new("TextLabel")
+    TitleLabel.Size = UDim2.new(1, -70, 1, 0)
+    TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+    TitleLabel.BackgroundTransparency = 1
+    TitleLabel.Text = "JJS Remote Interceptor"
+    TitleLabel.TextColor3 = Color3.new(1, 1, 1)
+    TitleLabel.TextSize = 16
+    TitleLabel.Font = Enum.Font.GothamBold
+    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TitleLabel.Parent = TitleBar
+
+    -- Кнопка закрытия
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Name = "CloseBtn"
+    CloseBtn.Size = UDim2.new(0, 25, 0, 25)
+    CloseBtn.Position = UDim2.new(1, -30, 0, 5)
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+    CloseBtn.BorderSizePixel = 0
+    CloseBtn.Text = "✕"
+    CloseBtn.TextColor3 = Color3.new(1, 1, 1)
+    CloseBtn.TextSize = 14
+    CloseBtn.Parent = TitleBar
+
+    local CloseCorner = Instance.new("UICorner")
+    CloseCorner.CornerRadius = UDim.new(0, 5)
+    CloseCorner.Parent = CloseBtn
+
+    -- Панель вкладок
+    local TabPanel = Instance.new("Frame")
+    TabPanel.Name = "TabPanel"
+    TabPanel.Size = UDim2.new(1, -20, 0, 30)
+    TabPanel.Position = UDim2.new(0, 10, 0, 40)
+    TabPanel.BackgroundTransparency = 1
+    TabPanel.Parent = MainFrame
+
+    local TabLayout = Instance.new("UIListLayout")
+    TabLayout.FillDirection = Enum.FillDirection.Horizontal
+    TabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    TabLayout.Padding = UDim.new(0, 5)
+    TabLayout.Parent = TabPanel
+
+    local function CreateTab(name, order)
+        local Tab = Instance.new("TextButton")
+        Tab.Name = name .. "Tab"
+        Tab.Size = UDim2.new(0, 80, 1, 0)
+        Tab.BackgroundColor3 = GUI_CONFIG.PanelColor
+        Tab.BorderSizePixel = 0
+        Tab.Text = name
+        Tab.TextColor3 = GUI_CONFIG.TextColor
+        Tab.TextSize = 13
+        Tab.Font = Enum.Font.Gotham
+        Tab.LayoutOrder = order
+        Tab.Parent = TabPanel
+
+        local TabCorner = Instance.new("UICorner")
+        TabCorner.CornerRadius = UDim.new(0, 5)
+        TabCorner.Parent = Tab
+
+        return Tab
+    end
+
+    local RemotesTab = CreateTab("Remotes", 1)
+    local StatsTab = CreateTab("Stats", 2)
+    local MappingsTab = CreateTab("Mappings", 3)
+    local LogTab = CreateTab("Log", 4)
+
+    -- Контент-панель
+    local ContentPanel = Instance.new("Frame")
+    ContentPanel.Name = "ContentPanel"
+    ContentPanel.Size = UDim2.new(1, -20, 1, -110)
+    ContentPanel.Position = UDim2.new(0, 10, 0, 75)
+    ContentPanel.BackgroundColor3 = GUI_CONFIG.PanelColor
+    ContentPanel.BorderSizePixel = 0
+    ContentPanel.Parent = MainFrame
+
+    local ContentCorner = Instance.new("UICorner")
+    ContentCorner.CornerRadius = UDim.new(0, 5)
+    ContentCorner.Parent = ContentPanel
+
+    -- Нижняя панель с кнопками
+    local BottomPanel = Instance.new("Frame")
+    BottomPanel.Name = "BottomPanel"
+    BottomPanel.Size = UDim2.new(1, -20, 0, 30)
+    BottomPanel.Position = UDim2.new(0, 10, 1, -35)
+    BottomPanel.BackgroundTransparency = 1
+    BottomPanel.Parent = MainFrame
+
+    local BottomLayout = Instance.new("UIListLayout")
+    BottomLayout.FillDirection = Enum.FillDirection.Horizontal
+    BottomLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    BottomLayout.Padding = UDim.new(0, 5)
+    BottomLayout.Parent = BottomPanel
+
+    local function CreateBottomButton(text, color, order)
+        local Btn = Instance.new("TextButton")
+        Btn.Size = UDim2.new(0, 90, 1, 0)
+        Btn.BackgroundColor3 = color
+        Btn.BorderSizePixel = 0
+        Btn.Text = text
+        Btn.TextColor3 = Color3.new(1, 1, 1)
+        Btn.TextSize = 12
+        Btn.Font = Enum.Font.Gotham
+        Btn.LayoutOrder = order
+        Btn.Parent = BottomPanel
+
+        local BtnCorner = Instance.new("UICorner")
+        BtnCorner.CornerRadius = UDim.new(0, 5)
+        BtnCorner.Parent = Btn
+
+        return Btn
+    end
+
+    local StartStopBtn = CreateBottomButton("Start", Color3.fromRGB(50, 180, 80), 1)
+    local ExportBtn = CreateBottomButton("Export", GUI_CONFIG.AccentColor, 2)
+    local ClearBtn = CreateBottomButton("Clear", Color3.fromRGB(180, 80, 50), 3)
+    local ModeBtn = CreateBottomButton("Mode: discover", Color3.fromRGB(120, 120, 120), 4)
+
+    return {
+        ScreenGui = ScreenGui,
+        MainFrame = MainFrame,
+        CloseBtn = CloseBtn,
+        ContentPanel = ContentPanel,
+        RemotesTab = RemotesTab,
+        StatsTab = StatsTab,
+        MappingsTab = MappingsTab,
+        LogTab = LogTab,
+        StartStopBtn = StartStopBtn,
+        ExportBtn = ExportBtn,
+        ClearBtn = ClearBtn,
+        ModeBtn = ModeBtn,
+    }
+end
+
+-- ============================================================
+-- CONTENT RENDERERS
+-- ============================================================
+
+local function ClearContent(panel)
+    for _, child in pairs(panel:GetChildren()) do
+        if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("ScrollingFrame") then
+            child:Destroy()
+        end
+    end
+end
+
+local function RenderRemotesList(panel, remotes)
+    ClearContent(panel)
+
+    local Scroll = Instance.new("ScrollingFrame")
+    Scroll.Size = UDim2.new(1, 0, 1, 0)
+    Scroll.BackgroundTransparency = 1
+    Scroll.BorderSizePixel = 0
+    Scroll.ScrollBarThickness = 6
+    Scroll.CanvasSize = UDim2.new(0, 0, 0, #remotes * 30 + 10)
+    Scroll.Parent = panel
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 2)
+    Layout.Parent = Scroll
+
+    for i, remoteInfo in pairs(remotes) do
+        local Item = Instance.new("Frame")
+        Item.Size = UDim2.new(1, -10, 0, 25)
+        Item.BackgroundColor3 = GUI_CONFIG.BgColor
+        Item.BorderSizePixel = 0
+        Item.Parent = Scroll
+
+        local ItemCorner = Instance.new("UICorner")
+        ItemCorner.CornerRadius = UDim.new(0, 3)
+        ItemCorner.Parent = Item
+
+        local TypeLabel = Instance.new("TextLabel")
+        TypeLabel.Size = UDim2.new(0, 80, 1, 0)
+        TypeLabel.Position = UDim2.new(0, 5, 0, 0)
+        TypeLabel.BackgroundTransparency = 1
+        TypeLabel.Text = "[" .. remoteInfo.type .. "]"
+        TypeLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+        TypeLabel.TextSize = 11
+        TypeLabel.Font = Enum.Font.Gotham
+        TypeLabel.TextXAlignment = Enum.TextXAlignment.Left
+        TypeLabel.Parent = Item
+
+        local PathLabel = Instance.new("TextLabel")
+        PathLabel.Size = UDim2.new(1, -90, 1, 0)
+        PathLabel.Position = UDim2.new(0, 90, 0, 0)
+        PathLabel.BackgroundTransparency = 1
+        PathLabel.Text = remoteInfo.path
+        PathLabel.TextColor3 = GUI_CONFIG.TextColor
+        PathLabel.TextSize = 11
+        PathLabel.Font = Enum.Font.Code
+        PathLabel.TextXAlignment = Enum.TextXAlignment.Left
+        PathLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        PathLabel.Parent = Item
+    end
+end
+
+local function RenderStats(panel, stats)
+    ClearContent(panel)
+
+    local sorted = {}
+    for key, stat in pairs(stats) do
+        sorted[#sorted + 1] = {key = key, stat = stat}
+    end
+    table.sort(sorted, function(a, b)
+        return a.stat.callCount > b.stat.callCount
+    end)
+
+    local Scroll = Instance.new("ScrollingFrame")
+    Scroll.Size = UDim2.new(1, 0, 1, 0)
+    Scroll.BackgroundTransparency = 1
+    Scroll.BorderSizePixel = 0
+    Scroll.ScrollBarThickness = 6
+    Scroll.CanvasSize = UDim2.new(0, 0, 0, #sorted * 60 + 10)
+    Scroll.Parent = panel
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 3)
+    Layout.Parent = Scroll
+
+    for _, item in pairs(sorted) do
+        local Item = Instance.new("Frame")
+        Item.Size = UDim2.new(1, -10, 0, 55)
+        Item.BackgroundColor3 = GUI_CONFIG.BgColor
+        Item.BorderSizePixel = 0
+        Item.Parent = Scroll
+
+        local ItemCorner = Instance.new("UICorner")
+        ItemCorner.CornerRadius = UDim.new(0, 3)
+        ItemCorner.Parent = Item
+
+        local NameLabel = Instance.new("TextLabel")
+        NameLabel.Size = UDim2.new(1, -10, 0, 18)
+        NameLabel.Position = UDim2.new(0, 5, 0, 2)
+        NameLabel.BackgroundTransparency = 1
+        NameLabel.Text = item.key
+        NameLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+        NameLabel.TextSize = 12
+        NameLabel.Font = Enum.Font.GothamBold
+        NameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        NameLabel.Parent = Item
+
+        local methods = {}
+        for m, c in pairs(item.stat.methods) do
+            methods[#methods + 1] = string.format("%s(%d)", m, c)
+        end
+
+        local MethodLabel = Instance.new("TextLabel")
+        MethodLabel.Size = UDim2.new(1, -10, 0, 15)
+        MethodLabel.Position = UDim2.new(0, 5, 0, 20)
+        MethodLabel.BackgroundTransparency = 1
+        MethodLabel.Text = "Calls: " .. item.stat.callCount .. " | " .. table.concat(methods, ", ")
+        MethodLabel.TextColor3 = GUI_CONFIG.TextColor
+        MethodLabel.TextSize = 11
+        MethodLabel.Font = Enum.Font.Gotham
+        MethodLabel.TextXAlignment = Enum.TextXAlignment.Left
+        MethodLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        MethodLabel.Parent = Item
+
+        if item.stat.sampleArgs then
+            local SampleLabel = Instance.new("TextLabel")
+            SampleLabel.Size = UDim2.new(1, -10, 0, 15)
+            SampleLabel.Position = UDim2.new(0, 5, 0, 37)
+            SampleLabel.BackgroundTransparency = 1
+            SampleLabel.Text = "Sample: " .. item.stat.sampleArgs
+            SampleLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+            SampleLabel.TextSize = 10
+            SampleLabel.Font = Enum.Font.Code
+            SampleLabel.TextXAlignment = Enum.TextXAlignment.Left
+            SampleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            SampleLabel.Parent = Item
+        end
+    end
+end
+
+local function RenderMappings(panel, mappings)
+    ClearContent(panel)
+
+    local mappingCount = 0
+    for _ in pairs(mappings) do mappingCount = mappingCount + 1 end
+
+    local Scroll = Instance.new("ScrollingFrame")
+    Scroll.Size = UDim2.new(1, 0, 1, -40)
+    Scroll.BackgroundTransparency = 1
+    Scroll.BorderSizePixel = 0
+    Scroll.ScrollBarThickness = 6
+    Scroll.CanvasSize = UDim2.new(0, 0, 0, mappingCount * 30 + 10)
+    Scroll.Parent = panel
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.Padding = UDim.new(0, 2)
+    Layout.Parent = Scroll
+
+    for remoteName, mapping in pairs(mappings) do
+        local Item = Instance.new("Frame")
+        Item.Size = UDim2.new(1, -10, 0, 25)
+        Item.BackgroundColor3 = GUI_CONFIG.BgColor
+        Item.BorderSizePixel = 0
+        Item.Parent = Scroll
+
+        local ItemCorner = Instance.new("UICorner")
+        ItemCorner.CornerRadius = UDim.new(0, 3)
+        ItemCorner.Parent = Item
+
+        local Label = Instance.new("TextLabel")
+        Label.Size = UDim2.new(1, -10, 1, 0)
+        Label.Position = UDim2.new(0, 5, 0, 0)
+        Label.BackgroundTransparency = 1
+        Label.Text = string.format("%s → %s (arg %d)", 
+            remoteName, mapping.type, mapping.argIndex or 1)
+        Label.TextColor3 = GUI_CONFIG.TextColor
+        Label.TextSize = 12
+        Label.Font = Enum.Font.Gotham
+        Label.TextXAlignment = Enum.TextXAlignment.Left
+        Label.Parent = Item
+    end
+
+    -- Поле для добавления маппинга
+    local AddFrame = Instance.new("Frame")
+    AddFrame.Size = UDim2.new(1, -10, 0, 35)
+    AddFrame.Position = UDim2.new(0, 0, 1, -38)
+    AddFrame.BackgroundTransparency = 1
+    AddFrame.Parent = panel
+
+    local NameInput = Instance.new("TextBox")
+    NameInput.Name = "NameInput"
+    NameInput.Size = UDim2.new(0, 150, 0, 25)
+    NameInput.Position = UDim2.new(0, 0, 0, 5)
+    NameInput.BackgroundColor3 = GUI_CONFIG.BgColor
+    NameInput.BorderSizePixel = 0
+    NameInput.PlaceholderText = "Remote name"
+    NameInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
+    NameInput.Text = ""
+    NameInput.TextColor3 = GUI_CONFIG.TextColor
+    NameInput.TextSize = 11
+    NameInput.Font = Enum.Font.Code
+    NameInput.Parent = AddFrame
+
+    local NameCorner = Instance.new("UICorner")
+    NameCorner.CornerRadius = UDim.new(0, 3)
+    NameCorner.Parent = NameInput
+
+    local TypeInput = Instance.new("TextBox")
+    TypeInput.Name = "TypeInput"
+    TypeInput.Size = UDim2.new(0, 100, 0, 25)
+    TypeInput.Position = UDim2.new(0, 155, 0, 5)
+    TypeInput.BackgroundColor3 = GUI_CONFIG.BgColor
+    TypeInput.BorderSizePixel = 0
+    TypeInput.PlaceholderText = "attack/block/dash"
+    TypeInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
+    TypeInput.Text = ""
+    TypeInput.TextColor3 = GUI_CONFIG.TextColor
+    TypeInput.TextSize = 11
+    TypeInput.Font = Enum.Font.Code
+    TypeInput.Parent = AddFrame
+
+    local TypeCorner = Instance.new("UICorner")
+    TypeCorner.CornerRadius = UDim.new(0, 3)
+    TypeCorner.Parent = TypeInput
+
+    local AddBtn = Instance.new("TextButton")
+    AddBtn.Name = "AddMappingBtn"
+    AddBtn.Size = UDim2.new(0, 60, 0, 25)
+    AddBtn.Position = UDim2.new(0, 260, 0, 5)
+    AddBtn.BackgroundColor3 = GUI_CONFIG.AccentColor
+    AddBtn.BorderSizePixel = 0
+    AddBtn.Text = "Add"
+    AddBtn.TextColor3 = Color3.new(1, 1, 1)
+    AddBtn.TextSize = 12
+    AddBtn.Font = Enum.Font.Gotham
+    AddBtn.Parent = AddFrame
+
+    local AddCorner = Instance.new("UICorner")
+    AddCorner.CornerRadius = UDim.new(0, 3)
+    AddCorner.Parent = AddBtn
+
+    return {
+        NameInput = NameInput,
+        TypeInput = TypeInput,
+        AddBtn = AddBtn,
+    }
+end
+
+local function RenderLog(panel)
+    ClearContent(panel)
+
+    local Scroll = Instance.new("ScrollingFrame")
+    Scroll.Name = "LogScroll"
+    Scroll.Size = UDim2.new(1, 0, 1, 0)
+    Scroll.BackgroundTransparency = 1
+    Scroll.BorderSizePixel = 0
+    Scroll.ScrollBarThickness = 6
+    Scroll.CanvasSize = UDim2.new(0, 0, 0, 10)
+    Scroll.Parent = panel
+
+    local Layout = Instance.new("UIListLayout")
+    Layout.Name = "LogLayout"
+    Layout.Padding = UDim.new(0, 1)
+    Layout.SortOrder = Enum.SortOrder.LayoutOrder
+    Layout.Parent = Scroll
+
+    return Scroll
+end
+
+local function AddLogEntry(scroll, message, color)
+    color = color or GUI_CONFIG.TextColor
+    
+    local Entry = Instance.new("TextLabel")
+    Entry.Size = UDim2.new(1, -10, 0, 16)
+    Entry.BackgroundTransparency = 1
+    Entry.Text = message
+    Entry.TextColor3 = color
+    Entry.TextSize = 10
+    Entry.Font = Enum.Font.Code
+    Entry.TextXAlignment = Enum.TextXAlignment.Left
+    Entry.TextTruncate = Enum.TextTruncate.AtEnd
+    Entry.LayoutOrder = time() * 1000
+    Entry.Parent = scroll
+
+    -- Обновляем CanvasSize
+    local Layout = scroll:FindFirstChild("LogLayout")
+    if Layout then
+        scroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 10)
+    end
+
+    -- Удаляем старые записи
+    local children = scroll:GetChildren()
+    local count = 0
+    for _, child in pairs(children) do
+        if child:IsA("TextLabel") then count = count + 1 end
+    end
+    if count > GUI_CONFIG.MaxLogEntries then
+        local oldest = nil
+        local oldestOrder = math.huge
+        for _, child in pairs(children) do
+            if child:IsA("TextLabel") and child.LayoutOrder < oldestOrder then
+                oldest = child
+                oldestOrder = child.LayoutOrder
+            end
+        end
+        if oldest then oldest:Destroy() end
+    end
+
+    -- Автоскролл вниз
+    scroll.CanvasPosition = Vector2.new(0, scroll.CanvasSize.Y.Offset)
+end
+
+-- ============================================================
+-- MAIN GUI CONTROLLER
+-- ============================================================
+
+local RemoteInterceptorGUI = {}
+local GUI = nil
+local LogScroll = nil
+local CurrentTab = "Remotes"
+local IsRunning = false
+local CurrentMode = "discover"
+
+function RemoteInterceptorGUI:Init()
+    GUI = CreateGUI()
+    
+    -- Начальный рендер
+    RenderRemotesList(GUI.ContentPanel, {})
+    
+    -- Обработчики вкладок
+    local function SwitchTab(tabName)
+        CurrentTab = tabName
+        
+        -- Сброс стилей всех вкладок
+        local tabs = {GUI.RemotesTab, GUI.StatsTab, GUI.MappingsTab, GUI.LogTab}
+        for _, tab in pairs(tabs) do
+            tab.BackgroundColor3 = GUI_CONFIG.PanelColor
+            tab.TextColor3 = GUI_CONFIG.TextColor
+        end
+        
+        -- Активная вкладка
+        local activeTab = nil
+        if tabName == "Remotes" then activeTab = GUI.RemotesTab
+        elseif tabName == "Stats" then activeTab = GUI.StatsTab
+        elseif tabName == "Mappings" then activeTab = GUI.MappingsTab
+        elseif tabName == "Log" then activeTab = GUI.LogTab end
+        
+        if activeTab then
+            activeTab.BackgroundColor3 = GUI_CONFIG.AccentColor
+            activeTab.TextColor3 = Color3.new(1, 1, 1)
+        end
+        
+        -- Рендер контента
+        if tabName == "Remotes" then
+            RenderRemotesList(GUI.ContentPanel, DiscoveredRemotes)
+        elseif tabName == "Stats" then
+            RenderStats(GUI.ContentPanel, RemoteStats)
+        elseif tabName == "Mappings" then
+            local inputs = RenderMappings(GUI.ContentPanel, CONFIG.EventMap)
+            
+            -- Обработчик добавления маппинга
+            if inputs and inputs.AddBtn then
+                inputs.AddBtn.MouseButton1Click:Connect(function()
+                    local name = inputs.NameInput.Text
+                    local type_ = inputs.TypeInput.Text
+                    
+                    if name ~= "" and type_ ~= "" then
+                        CONFIG.EventMap[name] = {
+                            type = type_,
+                            argIndex = 1,
+                        }
+                        AddLogEntry(LogScroll, "Added mapping: " .. name .. " → " .. type_, 
+                            Color3.fromRGB(100, 255, 100))
+                        RenderMappings(GUI.ContentPanel, CONFIG.EventMap)
+                    end
+                end)
+            end
+        elseif tabName == "Log" then
+            if not LogScroll then
+                LogScroll = RenderLog(GUI.ContentPanel)
+            else
+                ClearContent(GUI.ContentPanel)
+                LogScroll.Parent = GUI.ContentPanel
+            end
+        end
+    end
+
+    GUI.RemotesTab.MouseButton1Click:Connect(function() SwitchTab("Remotes") end)
+    GUI.StatsTab.MouseButton1Click:Connect(function() SwitchTab("Stats") end)
+    GUI.MappingsTab.MouseButton1Click:Connect(function() SwitchTab("Mappings") end)
+    GUI.LogTab.MouseButton1Click:Connect(function() SwitchTab("Log") end)
+
+    -- Переключаем на первую вкладку
+    SwitchTab("Remotes")
+
+    -- Обработчики кнопок
+    GUI.CloseBtn.MouseButton1Click:Connect(function()
+        GUI.ScreenGui:Destroy()
+        RemoteInterceptorGUI:Cleanup()
+    end)
+
+    GUI.StartStopBtn.MouseButton1Click:Connect(function()
+        if IsRunning then
+            RemoteInterceptor:Stop()
+            IsRunning = false
+            GUI.StartStopBtn.Text = "Start"
+            GUI.StartStopBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 80)
+            AddLogEntry(LogScroll, "Interceptor stopped", Color3.fromRGB(255, 100, 100))
+        else
+            RemoteInterceptor:Start()
+            IsRunning = true
+            GUI.StartStopBtn.Text = "Stop"
+            GUI.StartStopBtn.BackgroundColor3 = Color3.fromRGB(220, 80, 50)
+            AddLogEntry(LogScroll, "Interceptor started (mode: " .. CurrentMode .. ")", 
+                Color3.fromRGB(100, 255, 100))
+        end
+    end)
+
+    GUI.ExportBtn.MouseButton1Click:Connect(function()
+        RemoteInterceptor:ExportAllToClipboard()
+        AddLogEntry(LogScroll, "Exported all data to clipboard", 
+            Color3.fromRGB(100, 200, 255))
+    end)
+
+    GUI.ClearBtn.MouseButton1Click:Connect(function()
+        RemoteStats = {}
+        LastLogTime = {}
+        if LogScroll then
+            for _, child in pairs(LogScroll:GetChildren()) do
+                if child:IsA("TextLabel") then child:Destroy() end
+            end
+        end
+        AddLogEntry(LogScroll, "Stats and log cleared", Color3.fromRGB(255, 200, 100))
+    end)
+
+    GUI.ModeBtn.MouseButton1Click:Connect(function()
+        if CurrentMode == "discover" then
+            CurrentMode = "produce"
+            CONFIG.Mode = "produce"
+            GUI.ModeBtn.Text = "Mode: produce"
+            GUI.ModeBtn.BackgroundColor3 = Color3.fromRGB(80, 150, 80)
+        else
+            CurrentMode = "discover"
+            CONFIG.Mode = "discover"
+            GUI.ModeBtn.Text = "Mode: discover"
+            GUI.ModeBtn.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
+        end
+        AddLogEntry(LogScroll, "Mode switched to: " .. CurrentMode, 
+            Color3.fromRGB(255, 200, 100))
+    end)
+
+    AddLogEntry(LogScroll, "GUI initialized. Click Start to begin.", 
+        Color3.fromRGB(200, 200, 200))
+end
+
+function RemoteInterceptorGUI:AddLog(message, color)
+    if LogScroll then
+        AddLogEntry(LogScroll, message, color)
+    end
+end
+
+function RemoteInterceptorGUI:Cleanup()
+    if GUI and GUI.ScreenGui then
+        GUI.ScreenGui:Destroy()
+    end
+    RemoteInterceptor:Stop()
+end
+
+-- ============================================================
+-- INTEGRATION WITH INTERCEPTOR
+-- ============================================================
+
+-- Переопределяем LogDebug чтобы писать в GUI
+local OriginalLogDebug = LogDebug
+LogDebug = function(msg)
+    OriginalLogDebug(msg)
+    RemoteInterceptorGUI:AddLog(msg, GUI_CONFIG.TextColor)
+end
+
+-- ============================================================
+-- START
+-- ============================================================
+
+_G.JJS_RemoteGUI = RemoteInterceptorGUI
+RemoteInterceptorGUI:Init()
+
+LogDebug("GUI loaded. Use tabs to navigate.")
