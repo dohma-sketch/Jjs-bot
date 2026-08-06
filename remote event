@@ -1,688 +1,683 @@
 --[[
-    JJS REMOTE INTERCEPTOR GUI v1.0
-    Draggable window with tabs for Remotes, Stats, Mappings, Log
+    JJS REMOTE INTERCEPTOR v1.2
+    Console-only version (no GUI)
     Delta / Lua 5.1 compatible
+    
+    Commands:
+    RI_Start()      - start interceptor
+    RI_Stop()       - stop interceptor
+    RI_Stats()      - print stats to console
+    RI_Remotes()    - print discovered remotes
+    RI_Export()     - export all to clipboard
+    RI_ExportStats()- export stats to clipboard
+    RI_ExportRemotes() - export remotes to clipboard
+    RI_Add(name, type) - add mapping
+    RI_Mode(mode)   - switch mode ("discover"/"produce")
+    RI_Clear()      - clear stats
 ]]
-
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
 
 -- ============================================================
 -- CONFIG
 -- ============================================================
 
-local GUI_CONFIG = {
-    WindowSize = UDim2.new(0, 500, 0, 400),
-    WindowPos = UDim2.new(0.5, -250, 0.5, -200),
-    AccentColor = Color3.fromRGB(65, 105, 225),
-    BgColor = Color3.fromRGB(30, 30, 35),
-    PanelColor = Color3.fromRGB(45, 45, 50),
-    TextColor = Color3.fromRGB(220, 220, 220),
-    MaxLogEntries = 50,
+local CONFIG = {
+    Mode = "discover",
+    LogToConsole = true,
+    MaxLogArgs = 6,
+    MaxLogsPerSecond = 15,
+    LogThrottle = 0.1,
+    
+    IgnoreNames = {
+        "Heartbeat", "Update", "Tick", "Ping",
+        "KeepAlive", "Render", "Physics",
+    },
+
+    PassiveMode = false,
+
+    EventMap = {},
 }
 
 -- ============================================================
--- GUI CREATION
+-- STATE
 -- ============================================================
 
-local function CreateGUI()
-    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local DiscoveredRemotes = {}
+local RemoteStats = {}
+local ActiveConnections = {}
+local LastLogTime = {}
+local LogCount = 0
+local LastResetTime = time()
+
+local OriginalNamecall = nil
+local HookActive = false
+local InHook = false
+
+local EnemyMemoryRef = nil
+local PerceptionCacheRef = nil
+
+-- ============================================================
+-- UTILITIES
+-- ============================================================
+
+local function LogDebug(msg)
+    if not CONFIG.LogToConsole then return end
     
-    -- Удаляем старый GUI если есть
-    local oldGui = PlayerGui:FindFirstChild("JJS_RemoteGUI")
-    if oldGui then oldGui:Destroy() end
-
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "JJS_RemoteGUI"
-    ScreenGui.Parent = PlayerGui
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-    -- Главное окно
-    local MainFrame = Instance.new("Frame")
-    MainFrame.Name = "MainWindow"
-    MainFrame.Size = GUI_CONFIG.WindowSize
-    MainFrame.Position = GUI_CONFIG.WindowPos
-    MainFrame.BackgroundColor3 = GUI_CONFIG.BgColor
-    MainFrame.BorderSizePixel = 0
-    MainFrame.Active = true
-    MainFrame.Draggable = true
-    MainFrame.Parent = ScreenGui
-
-    local MainCorner = Instance.new("UICorner")
-    MainCorner.CornerRadius = UDim.new(0, 8)
-    MainCorner.Parent = MainFrame
-
-    -- Заголовок
-    local TitleBar = Instance.new("Frame")
-    TitleBar.Name = "TitleBar"
-    TitleBar.Size = UDim2.new(1, 0, 0, 35)
-    TitleBar.BackgroundColor3 = GUI_CONFIG.AccentColor
-    TitleBar.BorderSizePixel = 0
-    TitleBar.Parent = MainFrame
-
-    local TitleCorner = Instance.new("UICorner")
-    TitleCorner.CornerRadius = UDim.new(0, 8)
-    TitleCorner.Parent = TitleBar
-
-    local TitleLabel = Instance.new("TextLabel")
-    TitleLabel.Size = UDim2.new(1, -70, 1, 0)
-    TitleLabel.Position = UDim2.new(0, 10, 0, 0)
-    TitleLabel.BackgroundTransparency = 1
-    TitleLabel.Text = "JJS Remote Interceptor"
-    TitleLabel.TextColor3 = Color3.new(1, 1, 1)
-    TitleLabel.TextSize = 16
-    TitleLabel.Font = Enum.Font.GothamBold
-    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    TitleLabel.Parent = TitleBar
-
-    -- Кнопка закрытия
-    local CloseBtn = Instance.new("TextButton")
-    CloseBtn.Name = "CloseBtn"
-    CloseBtn.Size = UDim2.new(0, 25, 0, 25)
-    CloseBtn.Position = UDim2.new(1, -30, 0, 5)
-    CloseBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
-    CloseBtn.BorderSizePixel = 0
-    CloseBtn.Text = "✕"
-    CloseBtn.TextColor3 = Color3.new(1, 1, 1)
-    CloseBtn.TextSize = 14
-    CloseBtn.Parent = TitleBar
-
-    local CloseCorner = Instance.new("UICorner")
-    CloseCorner.CornerRadius = UDim.new(0, 5)
-    CloseCorner.Parent = CloseBtn
-
-    -- Панель вкладок
-    local TabPanel = Instance.new("Frame")
-    TabPanel.Name = "TabPanel"
-    TabPanel.Size = UDim2.new(1, -20, 0, 30)
-    TabPanel.Position = UDim2.new(0, 10, 0, 40)
-    TabPanel.BackgroundTransparency = 1
-    TabPanel.Parent = MainFrame
-
-    local TabLayout = Instance.new("UIListLayout")
-    TabLayout.FillDirection = Enum.FillDirection.Horizontal
-    TabLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    TabLayout.Padding = UDim.new(0, 5)
-    TabLayout.Parent = TabPanel
-
-    local function CreateTab(name, order)
-        local Tab = Instance.new("TextButton")
-        Tab.Name = name .. "Tab"
-        Tab.Size = UDim2.new(0, 80, 1, 0)
-        Tab.BackgroundColor3 = GUI_CONFIG.PanelColor
-        Tab.BorderSizePixel = 0
-        Tab.Text = name
-        Tab.TextColor3 = GUI_CONFIG.TextColor
-        Tab.TextSize = 13
-        Tab.Font = Enum.Font.Gotham
-        Tab.LayoutOrder = order
-        Tab.Parent = TabPanel
-
-        local TabCorner = Instance.new("UICorner")
-        TabCorner.CornerRadius = UDim.new(0, 5)
-        TabCorner.Parent = Tab
-
-        return Tab
+    local now = time()
+    if now - LastResetTime >= 1 then
+        LogCount = 0
+        LastResetTime = now
     end
+    
+    LogCount = LogCount + 1
+    if LogCount > CONFIG.MaxLogsPerSecond then return end
+    
+    print("[JJS REMOTE] " .. tostring(msg))
+end
 
-    local RemotesTab = CreateTab("Remotes", 1)
-    local StatsTab = CreateTab("Stats", 2)
-    local MappingsTab = CreateTab("Mappings", 3)
-    local LogTab = CreateTab("Log", 4)
+local function SerializeArg(arg, depth)
+    depth = depth or 0
+    if depth > 2 then return "..." end
 
-    -- Контент-панель
-    local ContentPanel = Instance.new("Frame")
-    ContentPanel.Name = "ContentPanel"
-    ContentPanel.Size = UDim2.new(1, -20, 1, -110)
-    ContentPanel.Position = UDim2.new(0, 10, 0, 75)
-    ContentPanel.BackgroundColor3 = GUI_CONFIG.PanelColor
-    ContentPanel.BorderSizePixel = 0
-    ContentPanel.Parent = MainFrame
-
-    local ContentCorner = Instance.new("UICorner")
-    ContentCorner.CornerRadius = UDim.new(0, 5)
-    ContentCorner.Parent = ContentPanel
-
-    -- Нижняя панель с кнопками
-    local BottomPanel = Instance.new("Frame")
-    BottomPanel.Name = "BottomPanel"
-    BottomPanel.Size = UDim2.new(1, -20, 0, 30)
-    BottomPanel.Position = UDim2.new(0, 10, 1, -35)
-    BottomPanel.BackgroundTransparency = 1
-    BottomPanel.Parent = MainFrame
-
-    local BottomLayout = Instance.new("UIListLayout")
-    BottomLayout.FillDirection = Enum.FillDirection.Horizontal
-    BottomLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    BottomLayout.Padding = UDim.new(0, 5)
-    BottomLayout.Parent = BottomPanel
-
-    local function CreateBottomButton(text, color, order)
-        local Btn = Instance.new("TextButton")
-        Btn.Size = UDim2.new(0, 90, 1, 0)
-        Btn.BackgroundColor3 = color
-        Btn.BorderSizePixel = 0
-        Btn.Text = text
-        Btn.TextColor3 = Color3.new(1, 1, 1)
-        Btn.TextSize = 12
-        Btn.Font = Enum.Font.Gotham
-        Btn.LayoutOrder = order
-        Btn.Parent = BottomPanel
-
-        local BtnCorner = Instance.new("UICorner")
-        BtnCorner.CornerRadius = UDim.new(0, 5)
-        BtnCorner.Parent = Btn
-
-        return Btn
+    local t = type(arg)
+    if t == "nil" then return "nil"
+    elseif t == "boolean" then return tostring(arg)
+    elseif t == "number" then return tostring(arg)
+    elseif t == "string" then
+        if #arg > 50 then return '"' .. string.sub(arg, 1, 50) .. '..."' end
+        return '"' .. arg .. '"'
+    elseif t == "table" then
+        local items = {}
+        local count = 0
+        for k, v in pairs(arg) do
+            count = count + 1
+            if count > 5 then
+                items[#items + 1] = "..."
+                break
+            end
+            items[#items + 1] = tostring(k) .. "=" .. SerializeArg(v, depth + 1)
+        end
+        return "{" .. table.concat(items, ", ") .. "}"
+    elseif t == "userdata" then
+        local ok, name = pcall(function() return arg.Name end)
+        if ok and name then return "Instance<" .. name .. ">" end
+        return "userdata"
+    else
+        return t
     end
+end
 
-    local StartStopBtn = CreateBottomButton("Start", Color3.fromRGB(50, 180, 80), 1)
-    local ExportBtn = CreateBottomButton("Export", GUI_CONFIG.AccentColor, 2)
-    local ClearBtn = CreateBottomButton("Clear", Color3.fromRGB(180, 80, 50), 3)
-    local ModeBtn = CreateBottomButton("Mode: discover", Color3.fromRGB(120, 120, 120), 4)
+local function SerializeArgs(args, max)
+    max = max or CONFIG.MaxLogArgs
+    local parts = {}
+    for i = 1, math.min(#args, max) do
+        parts[#parts + 1] = SerializeArg(args[i])
+    end
+    if #args > max then
+        parts[#parts + 1] = "... +" .. (#args - max) .. " more"
+    end
+    return "(" .. table.concat(parts, ", ") .. ")"
+end
 
-    return {
-        ScreenGui = ScreenGui,
-        MainFrame = MainFrame,
-        CloseBtn = CloseBtn,
-        ContentPanel = ContentPanel,
-        RemotesTab = RemotesTab,
-        StatsTab = StatsTab,
-        MappingsTab = MappingsTab,
-        LogTab = LogTab,
-        StartStopBtn = StartStopBtn,
-        ExportBtn = ExportBtn,
-        ClearBtn = ClearBtn,
-        ModeBtn = ModeBtn,
-    }
+local function ShouldIgnore(remoteName)
+    if not remoteName then return true end
+    for _, ignore in pairs(CONFIG.IgnoreNames) do
+        if string.find(remoteName, ignore, 1, true) then return true end
+    end
+    return false
 end
 
 -- ============================================================
--- CONTENT RENDERERS
+-- SAFE INSTANCE CHECKS
 -- ============================================================
 
-local function ClearContent(panel)
-    for _, child in pairs(panel:GetChildren()) do
-        if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("ScrollingFrame") then
-            child:Destroy()
+local function IsRemoteEvent(instance)
+    local ok, className = pcall(function()
+        return instance.ClassName
+    end)
+    return ok and className == "RemoteEvent"
+end
+
+local function IsRemoteFunction(instance)
+    local ok, className = pcall(function()
+        return instance.ClassName
+    end)
+    return ok and className == "RemoteFunction"
+end
+
+local function SafeGetName(instance)
+    local ok, name = pcall(function() return instance.Name end)
+    if ok and name then return name end
+    return tostring(instance)
+end
+
+-- ============================================================
+-- CLIPBOARD
+-- ============================================================
+
+local function SetClipboard(text)
+    if type(setclipboard) == "function" then
+        pcall(function() setclipboard(text) end)
+        return true
+    end
+    
+    local GuiService = game:GetService("GuiService")
+    if GuiService and GuiService.SetClipboard then
+        pcall(function() GuiService:SetClipboard(text) end)
+        return true
+    end
+    
+    if type(writefile) == "function" then
+        local filename = "JJS_Remote_Export.txt"
+        pcall(function() writefile(filename, text) end)
+        LogDebug("Saved to file: " .. filename)
+        return true
+    end
+    
+    LogDebug("ERROR: No clipboard method available")
+    return false
+end
+
+-- ============================================================
+-- DISCOVERY
+-- ============================================================
+
+local function DiscoverRemotes()
+    LogDebug("=== DISCOVERING REMOTES ===")
+    DiscoveredRemotes = {}
+    local count = 0
+
+    local function scan(parent, path)
+        local ok, children = pcall(function()
+            return parent:GetChildren()
+        end)
+        if not ok or not children then return end
+        
+        for _, obj in pairs(children) do
+            local objName = SafeGetName(obj)
+            local objPath = path .. "." .. objName
+
+            if IsRemoteEvent(obj) then
+                count = count + 1
+                DiscoveredRemotes[#DiscoveredRemotes + 1] = {
+                    instance = obj,
+                    path = objPath,
+                    type = "RemoteEvent",
+                }
+            elseif IsRemoteFunction(obj) then
+                count = count + 1
+                DiscoveredRemotes[#DiscoveredRemotes + 1] = {
+                    instance = obj,
+                    path = objPath,
+                    type = "RemoteFunction",
+                }
+            end
+
+            pcall(function() scan(obj, objPath) end)
         end
     end
+
+    pcall(function() scan(game:GetService("ReplicatedStorage"), "ReplicatedStorage") end)
+    pcall(function() scan(game:GetService("ReplicatedFirst"), "ReplicatedFirst") end)
+    pcall(function() scan(game:GetService("Workspace"), "Workspace") end)
+    pcall(function() scan(game:GetService("Lighting"), "Lighting") end)
+    pcall(function() scan(game:GetService("SoundService"), "SoundService") end)
+
+    LogDebug("=== DISCOVERY: " .. count .. " remotes found ===")
+    return count
 end
 
-local function RenderRemotesList(panel, remotes)
-    ClearContent(panel)
+-- ============================================================
+-- STATS
+-- ============================================================
 
-    local Scroll = Instance.new("ScrollingFrame")
-    Scroll.Size = UDim2.new(1, 0, 1, 0)
-    Scroll.BackgroundTransparency = 1
-    Scroll.BorderSizePixel = 0
-    Scroll.ScrollBarThickness = 6
-    Scroll.CanvasSize = UDim2.new(0, 0, 0, #remotes * 30 + 10)
-    Scroll.Parent = panel
+local function GetRemoteKey(remote)
+    local ok, name = pcall(function() return remote.Name end)
+    if ok and name then return name end
+    return tostring(remote)
+end
 
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 2)
-    Layout.Parent = Scroll
+local function RecordRemoteCall(remoteKey, method, args, direction)
+    if not RemoteStats[remoteKey] then
+        RemoteStats[remoteKey] = {
+            callCount = 0,
+            methods = {},
+            lastCall = 0,
+            sampleArgs = nil,
+            direction = direction,
+        }
+    end
 
-    for i, remoteInfo in pairs(remotes) do
-        local Item = Instance.new("Frame")
-        Item.Size = UDim2.new(1, -10, 0, 25)
-        Item.BackgroundColor3 = GUI_CONFIG.BgColor
-        Item.BorderSizePixel = 0
-        Item.Parent = Scroll
+    local stat = RemoteStats[remoteKey]
+    stat.callCount = stat.callCount + 1
+    stat.methods[method] = (stat.methods[method] or 0) + 1
+    stat.lastCall = time()
 
-        local ItemCorner = Instance.new("UICorner")
-        ItemCorner.CornerRadius = UDim.new(0, 3)
-        ItemCorner.Parent = Item
-
-        local TypeLabel = Instance.new("TextLabel")
-        TypeLabel.Size = UDim2.new(0, 80, 1, 0)
-        TypeLabel.Position = UDim2.new(0, 5, 0, 0)
-        TypeLabel.BackgroundTransparency = 1
-        TypeLabel.Text = "[" .. remoteInfo.type .. "]"
-        TypeLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
-        TypeLabel.TextSize = 11
-        TypeLabel.Font = Enum.Font.Gotham
-        TypeLabel.TextXAlignment = Enum.TextXAlignment.Left
-        TypeLabel.Parent = Item
-
-        local PathLabel = Instance.new("TextLabel")
-        PathLabel.Size = UDim2.new(1, -90, 1, 0)
-        PathLabel.Position = UDim2.new(0, 90, 0, 0)
-        PathLabel.BackgroundTransparency = 1
-        PathLabel.Text = remoteInfo.path
-        PathLabel.TextColor3 = GUI_CONFIG.TextColor
-        PathLabel.TextSize = 11
-        PathLabel.Font = Enum.Font.Code
-        PathLabel.TextXAlignment = Enum.TextXAlignment.Left
-        PathLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        PathLabel.Parent = Item
+    if not stat.sampleArgs and #args > 0 then
+        stat.sampleArgs = SerializeArgs(args)
     end
 end
 
-local function RenderStats(panel, stats)
-    ClearContent(panel)
+-- ============================================================
+-- PARSER
+-- ============================================================
 
+local function ParseEvent(remoteName, args)
+    if CONFIG.Mode ~= "produce" then return end
+    if not EnemyMemoryRef then return end
+
+    local mapping = CONFIG.EventMap[remoteName]
+    if not mapping then return end
+
+    pcall(function()
+        local eventType = mapping.type
+        
+        if eventType == "attack" then
+            EnemyMemoryRef:RecordAction("attack")
+            if PerceptionCacheRef then
+                PerceptionCacheRef.attacking = true
+                PerceptionCacheRef.attackStartTime = time()
+            end
+        elseif eventType == "block" then
+            EnemyMemoryRef:RecordAction("block")
+            if PerceptionCacheRef then
+                PerceptionCacheRef.blocking = true
+            end
+        elseif eventType == "dash" then
+            EnemyMemoryRef:RecordAction("dash")
+            if PerceptionCacheRef then
+                PerceptionCacheRef.dashing = true
+            end
+        elseif eventType == "parry" then
+            EnemyMemoryRef:RecordAction("parry")
+        elseif eventType == "awaken" then
+            EnemyMemoryRef:RecordAction("awaken")
+            if PerceptionCacheRef then
+                PerceptionCacheRef.awakened = true
+            end
+        elseif eventType == "counter" then
+            EnemyMemoryRef:RecordAction("counter")
+            if PerceptionCacheRef then
+                PerceptionCacheRef.countering = true
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- THROTTLE
+-- ============================================================
+
+local function CanLog(remoteKey)
+    local now = time()
+    if not LastLogTime[remoteKey] or now - LastLogTime[remoteKey] >= CONFIG.LogThrottle then
+        LastLogTime[remoteKey] = now
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+-- NAMECALL HOOK
+-- ============================================================
+
+local function InstallNamecallHook()
+    if HookActive then return false end
+    if CONFIG.PassiveMode then
+        LogDebug("Passive mode: skipping hook")
+        return false
+    end
+
+    if type(getrawmetatable) ~= "function" then
+        LogDebug("ERROR: getrawmetatable not available")
+        return false
+    end
+    if type(setreadonly) ~= "function" then
+        LogDebug("ERROR: setreadonly not available")
+        return false
+    end
+    if type(newcclosure) ~= "function" then
+        LogDebug("ERROR: newcclosure not available")
+        return false
+    end
+    if type(getnamecallmethod) ~= "function" then
+        LogDebug("ERROR: getnamecallmethod not available")
+        return false
+    end
+
+    local mt = getrawmetatable(game)
+    if not mt then return false end
+
+    OriginalNamecall = mt.__namecall
+    if not OriginalNamecall then return false end
+
+    pcall(function() setreadonly(mt, false) end)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        if InHook then
+            return OriginalNamecall(self, ...)
+        end
+        
+        InHook = true
+        
+        local result = nil
+        local success, err = pcall(function()
+            local method = getnamecallmethod()
+            local args = {...}
+
+            local isRemote = IsRemoteEvent(self) or IsRemoteFunction(self)
+
+            if isRemote then
+                local remoteKey = GetRemoteKey(self)
+
+                if not ShouldIgnore(remoteKey) then
+                    local direction = "unknown"
+                    if method == "FireServer" or method == "InvokeServer" then
+                        direction = "client→server"
+                    elseif method == "FireClient" then
+                        direction = "server→client"
+                    end
+
+                    RecordRemoteCall(remoteKey, method, args, direction)
+
+                    if CONFIG.Mode == "discover" then
+                        if CanLog(remoteKey) then
+                            LogDebug(string.format("[%s] %s:%s %s",
+                                direction, remoteKey, method,
+                                SerializeArgs(args)))
+                        end
+                    end
+
+                    if CONFIG.Mode == "produce" then
+                        ParseEvent(remoteKey, args)
+                    end
+                end
+            end
+
+            result = OriginalNamecall(self, ...)
+        end)
+
+        InHook = false
+        
+        if not success then
+            return OriginalNamecall(self, ...)
+        end
+        
+        return result
+    end)
+
+    pcall(function() setreadonly(mt, true) end)
+    HookActive = true
+    LogDebug("Hook installed")
+    return true
+end
+
+local function RemoveNamecallHook()
+    if not HookActive then return end
+
+    local mt = getrawmetatable(game)
+    if mt and OriginalNamecall then
+        pcall(function() setreadonly(mt, false) end)
+        mt.__namecall = OriginalNamecall
+        pcall(function() setreadonly(mt, true) end)
+    end
+
+    HookActive = false
+    OriginalNamecall = nil
+    InHook = false
+end
+
+-- ============================================================
+-- LISTENERS
+-- ============================================================
+
+local function InstallListeners()
+    local count = 0
+
+    for _, remoteInfo in pairs(DiscoveredRemotes) do
+        local remote = remoteInfo.instance
+
+        if IsRemoteEvent(remote) then
+            local ok, conn = pcall(function()
+                return remote.OnClientEvent:Connect(function(...)
+                    local args = {...}
+                    local remoteKey = GetRemoteKey(remote)
+
+                    if ShouldIgnore(remoteKey) then return end
+
+                    RecordRemoteCall(remoteKey, "OnClientEvent", args, "server→client")
+
+                    if CONFIG.Mode == "discover" then
+                        if CanLog(remoteKey) then
+                            LogDebug(string.format("[server→client] %s %s",
+                                remoteKey, SerializeArgs(args)))
+                        end
+                    end
+
+                    if CONFIG.Mode == "produce" then
+                        ParseEvent(remoteKey, args)
+                    end
+                end)
+            end)
+
+            if ok and conn then
+                ActiveConnections[#ActiveConnections + 1] = conn
+                count = count + 1
+            end
+        end
+    end
+
+    LogDebug("Installed " .. count .. " listeners")
+    return count
+end
+
+local function RemoveListeners()
+    for _, conn in pairs(ActiveConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    ActiveConnections = {}
+end
+
+-- ============================================================
+-- PUBLIC COMMANDS
+-- ============================================================
+
+local IsRunning = false
+
+function RI_Start()
+    if IsRunning then
+        LogDebug("Already running")
+        return
+    end
+    
+    DiscoverRemotes()
+    InstallNamecallHook()
+    InstallListeners()
+    IsRunning = true
+    LogDebug("Interceptor started (mode: " .. CONFIG.Mode .. ")")
+end
+
+function RI_Stop()
+    RemoveNamecallHook()
+    RemoveListeners()
+    IsRunning = false
+    LogDebug("Interceptor stopped")
+end
+
+function RI_Remotes()
+    print("========== DISCOVERED REMOTES ==========")
+    print("Total: " .. #DiscoveredRemotes)
+    for i, r in pairs(DiscoveredRemotes) do
+        print(string.format("%d. [%s] %s", i, r.type, r.path))
+    end
+    print("=========================================")
+end
+
+function RI_Stats()
+    print("========== REMOTE STATS ==========")
     local sorted = {}
-    for key, stat in pairs(stats) do
+    for key, stat in pairs(RemoteStats) do
         sorted[#sorted + 1] = {key = key, stat = stat}
     end
     table.sort(sorted, function(a, b)
         return a.stat.callCount > b.stat.callCount
     end)
 
-    local Scroll = Instance.new("ScrollingFrame")
-    Scroll.Size = UDim2.new(1, 0, 1, 0)
-    Scroll.BackgroundTransparency = 1
-    Scroll.BorderSizePixel = 0
-    Scroll.ScrollBarThickness = 6
-    Scroll.CanvasSize = UDim2.new(0, 0, 0, #sorted * 60 + 10)
-    Scroll.Parent = panel
-
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 3)
-    Layout.Parent = Scroll
-
     for _, item in pairs(sorted) do
-        local Item = Instance.new("Frame")
-        Item.Size = UDim2.new(1, -10, 0, 55)
-        Item.BackgroundColor3 = GUI_CONFIG.BgColor
-        Item.BorderSizePixel = 0
-        Item.Parent = Scroll
-
-        local ItemCorner = Instance.new("UICorner")
-        ItemCorner.CornerRadius = UDim.new(0, 3)
-        ItemCorner.Parent = Item
-
-        local NameLabel = Instance.new("TextLabel")
-        NameLabel.Size = UDim2.new(1, -10, 0, 18)
-        NameLabel.Position = UDim2.new(0, 5, 0, 2)
-        NameLabel.BackgroundTransparency = 1
-        NameLabel.Text = item.key
-        NameLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
-        NameLabel.TextSize = 12
-        NameLabel.Font = Enum.Font.GothamBold
-        NameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        NameLabel.Parent = Item
-
         local methods = {}
         for m, c in pairs(item.stat.methods) do
             methods[#methods + 1] = string.format("%s(%d)", m, c)
         end
-
-        local MethodLabel = Instance.new("TextLabel")
-        MethodLabel.Size = UDim2.new(1, -10, 0, 15)
-        MethodLabel.Position = UDim2.new(0, 5, 0, 20)
-        MethodLabel.BackgroundTransparency = 1
-        MethodLabel.Text = "Calls: " .. item.stat.callCount .. " | " .. table.concat(methods, ", ")
-        MethodLabel.TextColor3 = GUI_CONFIG.TextColor
-        MethodLabel.TextSize = 11
-        MethodLabel.Font = Enum.Font.Gotham
-        MethodLabel.TextXAlignment = Enum.TextXAlignment.Left
-        MethodLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        MethodLabel.Parent = Item
-
+        print(string.format("  %s | calls: %d | %s",
+            item.key, item.stat.callCount, table.concat(methods, ", ")))
         if item.stat.sampleArgs then
-            local SampleLabel = Instance.new("TextLabel")
-            SampleLabel.Size = UDim2.new(1, -10, 0, 15)
-            SampleLabel.Position = UDim2.new(0, 5, 0, 37)
-            SampleLabel.BackgroundTransparency = 1
-            SampleLabel.Text = "Sample: " .. item.stat.sampleArgs
-            SampleLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-            SampleLabel.TextSize = 10
-            SampleLabel.Font = Enum.Font.Code
-            SampleLabel.TextXAlignment = Enum.TextXAlignment.Left
-            SampleLabel.TextTruncate = Enum.TextTruncate.AtEnd
-            SampleLabel.Parent = Item
+            print("    sample: " .. item.stat.sampleArgs)
         end
     end
+    print("===================================")
 end
 
-local function RenderMappings(panel, mappings)
-    ClearContent(panel)
-
-    local mappingCount = 0
-    for _ in pairs(mappings) do mappingCount = mappingCount + 1 end
-
-    local Scroll = Instance.new("ScrollingFrame")
-    Scroll.Size = UDim2.new(1, 0, 1, -40)
-    Scroll.BackgroundTransparency = 1
-    Scroll.BorderSizePixel = 0
-    Scroll.ScrollBarThickness = 6
-    Scroll.CanvasSize = UDim2.new(0, 0, 0, mappingCount * 30 + 10)
-    Scroll.Parent = panel
-
-    local Layout = Instance.new("UIListLayout")
-    Layout.Padding = UDim.new(0, 2)
-    Layout.Parent = Scroll
-
-    for remoteName, mapping in pairs(mappings) do
-        local Item = Instance.new("Frame")
-        Item.Size = UDim2.new(1, -10, 0, 25)
-        Item.BackgroundColor3 = GUI_CONFIG.BgColor
-        Item.BorderSizePixel = 0
-        Item.Parent = Scroll
-
-        local ItemCorner = Instance.new("UICorner")
-        ItemCorner.CornerRadius = UDim.new(0, 3)
-        ItemCorner.Parent = Item
-
-        local Label = Instance.new("TextLabel")
-        Label.Size = UDim2.new(1, -10, 1, 0)
-        Label.Position = UDim2.new(0, 5, 0, 0)
-        Label.BackgroundTransparency = 1
-        Label.Text = string.format("%s → %s (arg %d)", 
-            remoteName, mapping.type, mapping.argIndex or 1)
-        Label.TextColor3 = GUI_CONFIG.TextColor
-        Label.TextSize = 12
-        Label.Font = Enum.Font.Gotham
-        Label.TextXAlignment = Enum.TextXAlignment.Left
-        Label.Parent = Item
+function RI_ExportRemotes()
+    local lines = {}
+    lines[#lines + 1] = "=== DISCOVERED REMOTES ==="
+    lines[#lines + 1] = "Total: " .. #DiscoveredRemotes
+    for i, r in pairs(DiscoveredRemotes) do
+        lines[#lines + 1] = string.format("%d. [%s] %s", i, r.type, r.path)
     end
+    SetClipboard(table.concat(lines, "\n"))
+    LogDebug("Remotes exported to clipboard")
+end
 
-    -- Поле для добавления маппинга
-    local AddFrame = Instance.new("Frame")
-    AddFrame.Size = UDim2.new(1, -10, 0, 35)
-    AddFrame.Position = UDim2.new(0, 0, 1, -38)
-    AddFrame.BackgroundTransparency = 1
-    AddFrame.Parent = panel
+function RI_ExportStats()
+    local lines = {}
+    lines[#lines + 1] = "=== REMOTE STATS ==="
+    
+    local sorted = {}
+    for key, stat in pairs(RemoteStats) do
+        sorted[#sorted + 1] = {key = key, stat = stat}
+    end
+    table.sort(sorted, function(a, b)
+        return a.stat.callCount > b.stat.callCount
+    end)
 
-    local NameInput = Instance.new("TextBox")
-    NameInput.Name = "NameInput"
-    NameInput.Size = UDim2.new(0, 150, 0, 25)
-    NameInput.Position = UDim2.new(0, 0, 0, 5)
-    NameInput.BackgroundColor3 = GUI_CONFIG.BgColor
-    NameInput.BorderSizePixel = 0
-    NameInput.PlaceholderText = "Remote name"
-    NameInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
-    NameInput.Text = ""
-    NameInput.TextColor3 = GUI_CONFIG.TextColor
-    NameInput.TextSize = 11
-    NameInput.Font = Enum.Font.Code
-    NameInput.Parent = AddFrame
+    for _, item in pairs(sorted) do
+        local methods = {}
+        for m, c in pairs(item.stat.methods) do
+            methods[#methods + 1] = string.format("%s(%d)", m, c)
+        end
+        lines[#lines + 1] = string.format("## %s | calls: %d | %s",
+            item.key, item.stat.callCount, table.concat(methods, ", "))
+        if item.stat.sampleArgs then
+            lines[#lines + 1] = "   sample: " .. item.stat.sampleArgs
+        end
+    end
+    
+    SetClipboard(table.concat(lines, "\n"))
+    LogDebug("Stats exported to clipboard")
+end
 
-    local NameCorner = Instance.new("UICorner")
-    NameCorner.CornerRadius = UDim.new(0, 3)
-    NameCorner.Parent = NameInput
+function RI_ExportMappings()
+    local lines = {}
+    lines[#lines + 1] = "=== EVENT MAPPINGS ==="
+    for name, mapping in pairs(CONFIG.EventMap) do
+        lines[#lines + 1] = string.format(
+            "RI_Add(\"%s\", \"%s\", %d)",
+            name, mapping.type, mapping.argIndex or 1)
+    end
+    SetClipboard(table.concat(lines, "\n"))
+    LogDebug("Mappings exported to clipboard")
+end
 
-    local TypeInput = Instance.new("TextBox")
-    TypeInput.Name = "TypeInput"
-    TypeInput.Size = UDim2.new(0, 100, 0, 25)
-    TypeInput.Position = UDim2.new(0, 155, 0, 5)
-    TypeInput.BackgroundColor3 = GUI_CONFIG.BgColor
-    TypeInput.BorderSizePixel = 0
-    TypeInput.PlaceholderText = "attack/block/dash"
-    TypeInput.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
-    TypeInput.Text = ""
-    TypeInput.TextColor3 = GUI_CONFIG.TextColor
-    TypeInput.TextSize = 11
-    TypeInput.Font = Enum.Font.Code
-    TypeInput.Parent = AddFrame
+function RI_ExportAll()
+    local sections = {}
+    
+    -- Remotes
+    sections[#sections + 1] = "=== DISCOVERED REMOTES ==="
+    sections[#sections + 1] = "Total: " .. #DiscoveredRemotes
+    for i, r in pairs(DiscoveredRemotes) do
+        sections[#sections + 1] = string.format("%d. [%s] %s", i, r.type, r.path)
+    end
+    
+    sections[#sections + 1] = ""
+    
+    -- Stats
+    sections[#sections + 1] = "=== REMOTE STATS ==="
+    local sorted = {}
+    for key, stat in pairs(RemoteStats) do
+        sorted[#sorted + 1] = {key = key, stat = stat}
+    end
+    table.sort(sorted, function(a, b)
+        return a.stat.callCount > b.stat.callCount
+    end)
+    for _, item in pairs(sorted) do
+        local methods = {}
+        for m, c in pairs(item.stat.methods) do
+            methods[#methods + 1] = string.format("%s(%d)", m, c)
+        end
+        sections[#sections + 1] = string.format("## %s | calls: %d | %s",
+            item.key, item.stat.callCount, table.concat(methods, ", "))
+        if item.stat.sampleArgs then
+            sections[#sections + 1] = "   sample: " .. item.stat.sampleArgs
+        end
+    end
+    
+    sections[#sections + 1] = ""
+    
+    -- Mappings
+    sections[#sections + 1] = "=== EVENT MAPPINGS ==="
+    for name, mapping in pairs(CONFIG.EventMap) do
+        sections[#sections + 1] = string.format(
+            "RI_Add(\"%s\", \"%s\", %d)",
+            name, mapping.type, mapping.argIndex or 1)
+    end
+    
+    SetClipboard(table.concat(sections, "\n"))
+    LogDebug("All data exported to clipboard")
+end
 
-    local TypeCorner = Instance.new("UICorner")
-    TypeCorner.CornerRadius = UDim.new(0, 3)
-    TypeCorner.Parent = TypeInput
-
-    local AddBtn = Instance.new("TextButton")
-    AddBtn.Name = "AddMappingBtn"
-    AddBtn.Size = UDim2.new(0, 60, 0, 25)
-    AddBtn.Position = UDim2.new(0, 260, 0, 5)
-    AddBtn.BackgroundColor3 = GUI_CONFIG.AccentColor
-    AddBtn.BorderSizePixel = 0
-    AddBtn.Text = "Add"
-    AddBtn.TextColor3 = Color3.new(1, 1, 1)
-    AddBtn.TextSize = 12
-    AddBtn.Font = Enum.Font.Gotham
-    AddBtn.Parent = AddFrame
-
-    local AddCorner = Instance.new("UICorner")
-    AddCorner.CornerRadius = UDim.new(0, 3)
-    AddCorner.Parent = AddBtn
-
-    return {
-        NameInput = NameInput,
-        TypeInput = TypeInput,
-        AddBtn = AddBtn,
+function RI_Add(remoteName, eventType, argIndex)
+    CONFIG.EventMap[remoteName] = {
+        type = eventType,
+        argIndex = argIndex or 1,
     }
+    LogDebug("Added mapping: " .. remoteName .. " → " .. eventType)
 end
 
-local function RenderLog(panel)
-    ClearContent(panel)
-
-    local Scroll = Instance.new("ScrollingFrame")
-    Scroll.Name = "LogScroll"
-    Scroll.Size = UDim2.new(1, 0, 1, 0)
-    Scroll.BackgroundTransparency = 1
-    Scroll.BorderSizePixel = 0
-    Scroll.ScrollBarThickness = 6
-    Scroll.CanvasSize = UDim2.new(0, 0, 0, 10)
-    Scroll.Parent = panel
-
-    local Layout = Instance.new("UIListLayout")
-    Layout.Name = "LogLayout"
-    Layout.Padding = UDim.new(0, 1)
-    Layout.SortOrder = Enum.SortOrder.LayoutOrder
-    Layout.Parent = Scroll
-
-    return Scroll
-end
-
-local function AddLogEntry(scroll, message, color)
-    color = color or GUI_CONFIG.TextColor
-    
-    local Entry = Instance.new("TextLabel")
-    Entry.Size = UDim2.new(1, -10, 0, 16)
-    Entry.BackgroundTransparency = 1
-    Entry.Text = message
-    Entry.TextColor3 = color
-    Entry.TextSize = 10
-    Entry.Font = Enum.Font.Code
-    Entry.TextXAlignment = Enum.TextXAlignment.Left
-    Entry.TextTruncate = Enum.TextTruncate.AtEnd
-    Entry.LayoutOrder = time() * 1000
-    Entry.Parent = scroll
-
-    -- Обновляем CanvasSize
-    local Layout = scroll:FindFirstChild("LogLayout")
-    if Layout then
-        scroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 10)
-    end
-
-    -- Удаляем старые записи
-    local children = scroll:GetChildren()
-    local count = 0
-    for _, child in pairs(children) do
-        if child:IsA("TextLabel") then count = count + 1 end
-    end
-    if count > GUI_CONFIG.MaxLogEntries then
-        local oldest = nil
-        local oldestOrder = math.huge
-        for _, child in pairs(children) do
-            if child:IsA("TextLabel") and child.LayoutOrder < oldestOrder then
-                oldest = child
-                oldestOrder = child.LayoutOrder
-            end
-        end
-        if oldest then oldest:Destroy() end
-    end
-
-    -- Автоскролл вниз
-    scroll.CanvasPosition = Vector2.new(0, scroll.CanvasSize.Y.Offset)
-end
-
--- ============================================================
--- MAIN GUI CONTROLLER
--- ============================================================
-
-local RemoteInterceptorGUI = {}
-local GUI = nil
-local LogScroll = nil
-local CurrentTab = "Remotes"
-local IsRunning = false
-local CurrentMode = "discover"
-
-function RemoteInterceptorGUI:Init()
-    GUI = CreateGUI()
-    
-    -- Начальный рендер
-    RenderRemotesList(GUI.ContentPanel, {})
-    
-    -- Обработчики вкладок
-    local function SwitchTab(tabName)
-        CurrentTab = tabName
-        
-        -- Сброс стилей всех вкладок
-        local tabs = {GUI.RemotesTab, GUI.StatsTab, GUI.MappingsTab, GUI.LogTab}
-        for _, tab in pairs(tabs) do
-            tab.BackgroundColor3 = GUI_CONFIG.PanelColor
-            tab.TextColor3 = GUI_CONFIG.TextColor
-        end
-        
-        -- Активная вкладка
-        local activeTab = nil
-        if tabName == "Remotes" then activeTab = GUI.RemotesTab
-        elseif tabName == "Stats" then activeTab = GUI.StatsTab
-        elseif tabName == "Mappings" then activeTab = GUI.MappingsTab
-        elseif tabName == "Log" then activeTab = GUI.LogTab end
-        
-        if activeTab then
-            activeTab.BackgroundColor3 = GUI_CONFIG.AccentColor
-            activeTab.TextColor3 = Color3.new(1, 1, 1)
-        end
-        
-        -- Рендер контента
-        if tabName == "Remotes" then
-            RenderRemotesList(GUI.ContentPanel, DiscoveredRemotes)
-        elseif tabName == "Stats" then
-            RenderStats(GUI.ContentPanel, RemoteStats)
-        elseif tabName == "Mappings" then
-            local inputs = RenderMappings(GUI.ContentPanel, CONFIG.EventMap)
-            
-            -- Обработчик добавления маппинга
-            if inputs and inputs.AddBtn then
-                inputs.AddBtn.MouseButton1Click:Connect(function()
-                    local name = inputs.NameInput.Text
-                    local type_ = inputs.TypeInput.Text
-                    
-                    if name ~= "" and type_ ~= "" then
-                        CONFIG.EventMap[name] = {
-                            type = type_,
-                            argIndex = 1,
-                        }
-                        AddLogEntry(LogScroll, "Added mapping: " .. name .. " → " .. type_, 
-                            Color3.fromRGB(100, 255, 100))
-                        RenderMappings(GUI.ContentPanel, CONFIG.EventMap)
-                    end
-                end)
-            end
-        elseif tabName == "Log" then
-            if not LogScroll then
-                LogScroll = RenderLog(GUI.ContentPanel)
-            else
-                ClearContent(GUI.ContentPanel)
-                LogScroll.Parent = GUI.ContentPanel
-            end
-        end
-    end
-
-    GUI.RemotesTab.MouseButton1Click:Connect(function() SwitchTab("Remotes") end)
-    GUI.StatsTab.MouseButton1Click:Connect(function() SwitchTab("Stats") end)
-    GUI.MappingsTab.MouseButton1Click:Connect(function() SwitchTab("Mappings") end)
-    GUI.LogTab.MouseButton1Click:Connect(function() SwitchTab("Log") end)
-
-    -- Переключаем на первую вкладку
-    SwitchTab("Remotes")
-
-    -- Обработчики кнопок
-    GUI.CloseBtn.MouseButton1Click:Connect(function()
-        GUI.ScreenGui:Destroy()
-        RemoteInterceptorGUI:Cleanup()
-    end)
-
-    GUI.StartStopBtn.MouseButton1Click:Connect(function()
-        if IsRunning then
-            RemoteInterceptor:Stop()
-            IsRunning = false
-            GUI.StartStopBtn.Text = "Start"
-            GUI.StartStopBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 80)
-            AddLogEntry(LogScroll, "Interceptor stopped", Color3.fromRGB(255, 100, 100))
-        else
-            RemoteInterceptor:Start()
-            IsRunning = true
-            GUI.StartStopBtn.Text = "Stop"
-            GUI.StartStopBtn.BackgroundColor3 = Color3.fromRGB(220, 80, 50)
-            AddLogEntry(LogScroll, "Interceptor started (mode: " .. CurrentMode .. ")", 
-                Color3.fromRGB(100, 255, 100))
-        end
-    end)
-
-    GUI.ExportBtn.MouseButton1Click:Connect(function()
-        RemoteInterceptor:ExportAllToClipboard()
-        AddLogEntry(LogScroll, "Exported all data to clipboard", 
-            Color3.fromRGB(100, 200, 255))
-    end)
-
-    GUI.ClearBtn.MouseButton1Click:Connect(function()
-        RemoteStats = {}
-        LastLogTime = {}
-        if LogScroll then
-            for _, child in pairs(LogScroll:GetChildren()) do
-                if child:IsA("TextLabel") then child:Destroy() end
-            end
-        end
-        AddLogEntry(LogScroll, "Stats and log cleared", Color3.fromRGB(255, 200, 100))
-    end)
-
-    GUI.ModeBtn.MouseButton1Click:Connect(function()
-        if CurrentMode == "discover" then
-            CurrentMode = "produce"
-            CONFIG.Mode = "produce"
-            GUI.ModeBtn.Text = "Mode: produce"
-            GUI.ModeBtn.BackgroundColor3 = Color3.fromRGB(80, 150, 80)
-        else
-            CurrentMode = "discover"
-            CONFIG.Mode = "discover"
-            GUI.ModeBtn.Text = "Mode: discover"
-            GUI.ModeBtn.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
-        end
-        AddLogEntry(LogScroll, "Mode switched to: " .. CurrentMode, 
-            Color3.fromRGB(255, 200, 100))
-    end)
-
-    AddLogEntry(LogScroll, "GUI initialized. Click Start to begin.", 
-        Color3.fromRGB(200, 200, 200))
-end
-
-function RemoteInterceptorGUI:AddLog(message, color)
-    if LogScroll then
-        AddLogEntry(LogScroll, message, color)
+function RI_Mode(mode)
+    if mode == "discover" or mode == "produce" then
+        CONFIG.Mode = mode
+        LogDebug("Mode: " .. mode)
+    else
+        LogDebug("Invalid mode. Use 'discover' or 'produce'")
     end
 end
 
-function RemoteInterceptorGUI:Cleanup()
-    if GUI and GUI.ScreenGui then
-        GUI.ScreenGui:Destroy()
-    end
-    RemoteInterceptor:Stop()
+function RI_Clear()
+    RemoteStats = {}
+    LastLogTime = {}
+    LogDebug("Stats cleared")
+end
+
+function RI_Passive(enabled)
+    CONFIG.PassiveMode = enabled
+    LogDebug("Passive mode: " .. tostring(enabled))
+end
+
+function RI_SetEnemyMemory(memRef, cacheRef)
+    EnemyMemoryRef = memRef
+    PerceptionCacheRef = cacheRef
+    LogDebug("EnemyMemory connected")
 end
 
 -- ============================================================
--- INTEGRATION WITH INTERCEPTOR
+-- CLEANUP
 -- ============================================================
 
--- Переопределяем LogDebug чтобы писать в GUI
-local OriginalLogDebug = LogDebug
-LogDebug = function(msg)
-    OriginalLogDebug(msg)
-    RemoteInterceptorGUI:AddLog(msg, GUI_CONFIG.TextColor)
+if _G.JJS_RemoteInterceptor_Cleanup then
+    pcall(_G.JJS_RemoteInterceptor_Cleanup)
 end
 
--- ============================================================
--- START
--- ============================================================
+_G.JJS_RemoteInterceptor_Cleanup = function()
+    RI_Stop()
+end
 
-_G.JJS_RemoteGUI = RemoteInterceptorGUI
-RemoteInterceptorGUI:Init()
-
-LogDebug("GUI loaded. Use tabs to navigate.")
+LogDebug("Loaded. Commands: RI_Start, RI_Stop, RI_Stats, RI_Remotes, RI_ExportAll")
