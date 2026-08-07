@@ -3,12 +3,13 @@ local OK, ERR = pcall(function()
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then LocalPlayer = Players.PlayerAdded:Wait() end
 
 -- ============================================================
--- STATE
+-- FEED
 -- ============================================================
 
 local Feed = {
@@ -17,6 +18,7 @@ local Feed = {
     dash   = {time = 0, char = nil, dir = nil},
     block  = {start = 0, stop = 0, char = nil, active = false},
     awaken = {time = 0, char = nil},
+    last   = {time = 0, cat = "-", service = "-", effect = "-"},
 }
 _G.JJS_Feed = Feed
 
@@ -38,11 +40,60 @@ local function pickChar(...)
 end
 
 -- ============================================================
--- HOOK KNIT SERVICES
+-- КЛАССИФИКАТОР: по строке-типу и имени сервиса
+-- ============================================================
+
+local function classify(serviceName, effectType)
+    local s = tostring(serviceName):lower()
+    local e = tostring(effectType):lower()
+
+    -- АТАКА
+    if string.find(e, "swing") or string.find(e, "m1") or string.find(e, "punch")
+       or string.find(e, "kick") or string.find(e, "slash") or string.find(e, "strike")
+       or string.find(e, "hit") or string.find(e, "combo") or string.find(e, "uppercut") then
+        return "attack"
+    end
+    -- БЛОК
+    if string.find(e, "block") or string.find(e, "guard") or string.find(s, "block") then
+        return "block"
+    end
+    -- ДЭШ
+    if string.find(e, "dash") or string.find(e, "step") or string.find(e, "evade")
+       or string.find(s, "veilstep") or string.find(s, "movement") then
+        return "dash"
+    end
+    -- ПРОБУЖДЕНИЕ
+    if string.find(e, "awaken") or string.find(e, "domain") or string.find(s, "awaken") then
+        return "awaken"
+    end
+    return "skill"
+end
+
+local function route(cat, who, svcName, effectType)
+    local now = time()
+    Feed.last.time = now
+    Feed.last.cat = cat
+    Feed.last.service = svcName
+    Feed.last.effect = tostring(effectType)
+
+    if cat == "attack" then
+        Feed.attack.time = now; Feed.attack.char = who; Feed.attack.kind = tostring(effectType)
+    elseif cat == "block" then
+        Feed.block.start = now; Feed.block.active = true; Feed.block.char = who
+    elseif cat == "dash" then
+        Feed.dash.time = now; Feed.dash.char = who; Feed.dash.dir = tostring(effectType)
+    elseif cat == "awaken" then
+        Feed.awaken.time = now; Feed.awaken.char = who
+    else
+        Feed.skill.time = now; Feed.skill.char = who; Feed.skill.service = svcName
+    end
+end
+
+-- ============================================================
+-- HOOK ALL SERVICES
 -- ============================================================
 
 local connectedCount = 0
-
 pcall(function()
     local Services = RS.Knit.Knit.Services
     for _, svc in pairs(Services:GetChildren()) do
@@ -54,15 +105,7 @@ pcall(function()
             if effects then
                 hook(effects, function(effectType, ...)
                     local who = pickChar(...)
-                    if effectType == "Swing" then
-                        Feed.attack.time = time()
-                        Feed.attack.char = who
-                        Feed.attack.kind = "M1"
-                    else
-                        Feed.skill.time = time()
-                        Feed.skill.char = who
-                        Feed.skill.service = svcName
-                    end
+                    route(classify(svcName, effectType), who, svcName, effectType)
                 end)
                 connectedCount = connectedCount + 1
             end
@@ -70,9 +113,8 @@ pcall(function()
             local activated = RE:FindFirstChild("Activated")
             if activated then
                 hook(activated, function(...)
-                    Feed.skill.time = time()
-                    Feed.skill.char = pickChar(...)
-                    Feed.skill.service = svcName
+                    local who = pickChar(...)
+                    route(classify(svcName, "activated"), who, svcName, "activated")
                 end)
                 connectedCount = connectedCount + 1
             end
@@ -84,8 +126,7 @@ pcall(function()
         local dash = move.RE:FindFirstChild("Dash")
         if dash then
             hook(dash, function(dir, ...)
-                Feed.dash.time = time()
-                Feed.dash.dir = dir
+                Feed.dash.time = time(); Feed.dash.dir = dir
                 Feed.dash.char = pickChar(...) or LocalPlayer.Character
             end)
             connectedCount = connectedCount + 1
@@ -99,32 +140,91 @@ pcall(function()
                 local isDeact = (child.Name == "Deactivated")
                 hook(child, function(...)
                     local who = pickChar(...)
-                    if isDeact then
-                        Feed.block.stop = time()
-                        Feed.block.active = false
-                    else
-                        Feed.block.start = time()
-                        Feed.block.active = true
-                    end
+                    if isDeact then Feed.block.stop = time(); Feed.block.active = false
+                    else Feed.block.start = time(); Feed.block.active = true end
                     Feed.block.char = who
                 end)
                 connectedCount = connectedCount + 1
             end
         end
     end
+end)
 
-    local custom = Services:FindFirstChild("CustomService")
-    if custom and custom.RE then
-        local awaken = custom.RE:FindFirstChild("Awaken")
-        if awaken then
-            hook(awaken, function(...)
-                Feed.awaken.time = time()
-                Feed.awaken.char = pickChar(...)
-            end)
-            connectedCount = connectedCount + 1
+-- ============================================================
+-- ПРЯМОЙ ОСМОТР (fallback)
+-- ============================================================
+
+local function GetBoolAttr(obj, name)
+    if not obj then return false end
+    local ok, v = pcall(function() return obj:GetAttribute(name) end)
+    return ok and v == true
+end
+
+local function IsBlockingScan(target)
+    if GetBoolAttr(target, "Blocking") then return true end
+    local hum = target:FindFirstChild("Humanoid")
+    if not hum then return false end
+    local anim = hum:FindFirstChild("Animator")
+    if not anim then return false end
+    local ok, tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
+    if not ok then return false end
+    for _, t in pairs(tracks) do
+        if t.IsPlaying and t.Animation and t.Animation.Name then
+            local n = string.lower(t.Animation.Name)
+            if string.find(n, "block") or string.find(n, "guard") or string.find(n, "defend") then
+                return true
+            end
         end
     end
-end)
+    return false
+end
+
+local function IsAwakenedScan(target)
+    if GetBoolAttr(target, "Awakened") or GetBoolAttr(target, "Awake")
+        or GetBoolAttr(target, "Domain") or GetBoolAttr(target, "Transformation") then
+        return true
+    end
+    local vfx = target:FindFirstChild("VFX") or target:FindFirstChild("Effects") or target:FindFirstChild("Particles")
+    if vfx then
+        for _, d in pairs(vfx:GetChildren()) do
+            local n = string.lower(d.Name)
+            if string.find(n, "awaken") or string.find(n, "domain") then return true end
+        end
+    end
+    return false
+end
+
+local function IsDashingScan(target)
+    local root = target:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local v = root.AssemblyLinearVelocity or root.Velocity
+    if not v then return false end
+    return Vector3.new(v.X, 0, v.Z).Magnitude > 40
+end
+
+local function getTarget()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local best = nil
+    local bestDist = 100
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local tr = plr.Character:FindFirstChild("HumanoidRootPart")
+            if tr then
+                local d = (tr.Position - root.Position).Magnitude
+                if d < bestDist then bestDist = d; best = plr.Character end
+            end
+        end
+    end
+    if best then return best end
+    local cands = {Feed.attack.char, Feed.skill.char, Feed.block.char}
+    for _, c in pairs(cands) do
+        if c and c ~= char then return c end
+    end
+    return nil
+end
 
 -- ============================================================
 -- GUI
@@ -141,8 +241,8 @@ ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 360, 0, 260)
-MainFrame.Position = UDim2.new(1, -380, 0, 20)
+MainFrame.Size = UDim2.new(0, 380, 0, 285)
+MainFrame.Position = UDim2.new(1, -400, 0, 20)
 MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
@@ -163,41 +263,38 @@ local TitleLabel = Instance.new("TextLabel")
 TitleLabel.Size = UDim2.new(1, -40, 1, 0)
 TitleLabel.Position = UDim2.new(0, 10, 0, 0)
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "JJS Combat Feed (" .. connectedCount .. " remotes)"
+TitleLabel.Text = "JJS Combat Feed (" .. connectedCount .. ")"
 TitleLabel.TextColor3 = Color3.new(1, 1, 1)
 TitleLabel.TextSize = 13
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 TitleLabel.Parent = TitleBar
 
--- Строки для отображения состояния
-local labels = {}
 local function addLabel(text, y, color)
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -20, 0, 22)
+    lbl.Size = UDim2.new(1, -20, 0, 20)
     lbl.Position = UDim2.new(0, 10, 0, y)
     lbl.BackgroundTransparency = 1
     lbl.Text = text
     lbl.TextColor3 = color or Color3.fromRGB(200, 200, 200)
-    lbl.TextSize = 12
+    lbl.TextSize = 11
     lbl.Font = Enum.Font.Code
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = MainFrame
     return lbl
 end
 
-local statusLbl  = addLabel("Status: connecting...",  35, Color3.fromRGB(150, 150, 150))
-local targetLbl  = addLabel("Target: -",               57)
-local attackLbl  = addLabel("Attack: -",               80)
-local blockLbl   = addLabel("Block: -",               103)
-local dashLbl    = addLabel("Dash: -",                126)
-local awakenLbl  = addLabel("Awaken: -",              149)
-local skillLbl   = addLabel("Last skill: -",          172)
+local statusLbl = addLabel("Status: connecting...", 35, Color3.fromRGB(150, 150, 150))
+local attackLbl = addLabel("Attack: -", 57)
+local blockLbl  = addLabel("Block: -", 78)
+local dashLbl   = addLabel("Dash: -", 99)
+local awakenLbl = addLabel("Awaken: -", 120)
+local skillLbl  = addLabel("Last skill: -", 141)
+local eventLbl  = addLabel("Last event: -", 165, Color3.fromRGB(255, 255, 150))
 
--- Кнопка копирования
 local CopyBtn = Instance.new("TextButton")
 CopyBtn.Size = UDim2.new(1, -20, 0, 26)
-CopyBtn.Position = UDim2.new(0, 10, 0, 205)
+CopyBtn.Position = UDim2.new(0, 10, 0, 230)
 CopyBtn.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
 CopyBtn.BorderSizePixel = 0
 CopyBtn.Text = "Copy snapshot to clipboard"
@@ -211,153 +308,120 @@ BtnCorner.CornerRadius = UDim.new(0, 5)
 BtnCorner.Parent = CopyBtn
 
 -- ============================================================
--- UPDATE LOOP
+-- UPDATE
 -- ============================================================
 
-local function getTargetName()
-    local char = LocalPlayer.Character
-    if not char then return "-" end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return "-" end
-    local best = nil
-    local bestDist = 50
-    for _, plr in pairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local tr = plr.Character:FindFirstChild("HumanoidRootPart")
-            if tr then
-                local d = (tr.Position - root.Position).Magnitude
-                if d < bestDist then
-                    bestDist = d
-                    best = plr.Character
-                end
-            end
-        end
-    end
-    return best and best.Name or "-"
+local function since(t)
+    if t == 0 then return "-" end
+    return string.format("%.2fs", time() - t)
 end
 
 local function updateLabels()
     pcall(function()
-        statusLbl.Text = "Status: running | target: " .. getTargetName()
-
+        local target = getTarget()
         local now = time()
-        local targetChar = nil
-        local char = LocalPlayer.Character
-        if char then
-            local root = char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local bestD = 50
-                for _, plr in pairs(Players:GetPlayers()) do
-                    if plr ~= LocalPlayer and plr.Character then
-                        local tr = plr.Character:FindFirstChild("HumanoidRootPart")
-                        if tr then
-                            local d = (tr.Position - root.Position).Magnitude
-                            if d < bestD then
-                                bestD = d
-                                targetChar = plr.Character
-                            end
-                        end
-                    end
-                end
-            end
-        end
 
-        local function since(t)
-            if t == 0 then return "-" end
-            return string.format("%.2fs ago", now - t)
-        end
+        statusLbl.Text = "Status: running | target: " .. (target and target.Name or "-")
 
-        local function isTarget(char)
-            return char == targetChar
-        end
-
-        if Feed.attack.char == targetChar and Feed.attack.time > 0 then
+        if Feed.attack.char == target and (now - Feed.attack.time) < 1 then
             attackLbl.Text = "Attack: " .. Feed.attack.kind .. " | " .. since(Feed.attack.time)
             attackLbl.TextColor3 = Color3.fromRGB(255, 120, 120)
         else
-            attackLbl.Text = "Attack: -"
-            attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            attackLbl.Text = "Attack: -"; attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        if Feed.block.char == targetChar and Feed.block.active then
-            blockLbl.Text = "Block: ACTIVE"
-            blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
+        local blocking = false
+        if target then
+            if Feed.block.char == target and (now - Feed.block.start) < 1.2 then blocking = true end
+            if IsBlockingScan(target) then blocking = true end
+        end
+        if blocking then
+            blockLbl.Text = "Block: ACTIVE"; blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
         else
-            blockLbl.Text = "Block: " .. since(Feed.block.stop)
-            blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            blockLbl.Text = "Block: -"; blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        if Feed.dash.char == targetChar and Feed.dash.time > 0 and now - Feed.dash.time < 1 then
-            dashLbl.Text = "Dash: " .. tostring(Feed.dash.dir) .. " | " .. since(Feed.dash.time)
-            dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
+        local dashing = false
+        if target then
+            if Feed.dash.char == target and (now - Feed.dash.time) < 0.5 then dashing = true end
+            if IsDashingScan(target) then dashing = true end
+        end
+        if dashing then
+            dashLbl.Text = "Dash: ACTIVE"; dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
         else
-            dashLbl.Text = "Dash: -"
-            dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            dashLbl.Text = "Dash: -"; dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        if Feed.awaken.char == targetChar and Feed.awaken.time > 0 and now - Feed.awaken.time < 10 then
-            awakenLbl.Text = "Awaken: ACTIVE"
-            awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
+        local awakened = false
+        if target then
+            if Feed.awaken.char == target and (now - Feed.awaken.time) < 5 then awakened = true end
+            if IsAwakenedScan(target) then awakened = true end
+        end
+        if awakened then
+            awakenLbl.Text = "Awaken: ACTIVE"; awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
         else
-            awakenLbl.Text = "Awaken: -"
-            awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            awakenLbl.Text = "Awaken: -"; awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        if Feed.skill.char == targetChar and Feed.skill.service then
+        if Feed.skill.char == target and Feed.skill.service and (now - Feed.skill.time) < 3 then
             skillLbl.Text = "Last skill: " .. Feed.skill.service .. " | " .. since(Feed.skill.time)
             skillLbl.TextColor3 = Color3.fromRGB(180, 255, 180)
         else
-            skillLbl.Text = "Last skill: -"
-            skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            skillLbl.Text = "Last skill: -"; skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
+
+        -- Сырое последнее событие (чтобы видеть словарь типов)
+        eventLbl.Text = string.format("Last event: [%s] %s / %s",
+            Feed.last.cat, Feed.last.service, Feed.last.effect)
     end)
 end
 
--- RunService loop
-local RunService = game:GetService("RunService")
 RunService.Heartbeat:Connect(updateLabels)
+
+-- ============================================================
+-- SNAPSHOT
+-- ============================================================
 
 CopyBtn.MouseButton1Click:Connect(function()
     pcall(function()
+        local target = getTarget()
         local now = time()
-        local function since(t)
-            if t == 0 then return "never" end
-            return string.format("%.2fs", now - t)
-        end
+        local blocking = target and ((Feed.block.char == target and (now - Feed.block.start) < 1.2) or IsBlockingScan(target))
+        local awakened = target and ((Feed.awaken.char == target and (now - Feed.awaken.time) < 5) or IsAwakenedScan(target))
+        local dashing = target and ((Feed.dash.char == target and (now - Feed.dash.time) < 0.5) or IsDashingScan(target))
+
         local snap = string.format(
             "JJS Combat Snapshot %s\n" ..
             "Target: %s\n" ..
-            "Attack (M1): %s ago, kind=%s\n" ..
+            "Attack: %s ago, kind=%s\n" ..
             "Skill: %s ago, service=%s\n" ..
-            "Dash: %s ago, dir=%s\n" ..
-            "Block: active=%s, stop=%s ago\n" ..
-            "Awaken: %s ago\n" ..
+            "Dash: active=%s, %s ago\n" ..
+            "Block: active=%s\n" ..
+            "Awaken: active=%s\n" ..
+            "LastEvent: [%s] %s / %s\n" ..
             "Connected remotes: %d",
             os.date(),
-            getTargetName(),
+            target and target.Name or "-",
             since(Feed.attack.time), tostring(Feed.attack.kind),
             since(Feed.skill.time), tostring(Feed.skill.service),
-            since(Feed.dash.time), tostring(Feed.dash.dir),
-            tostring(Feed.block.active), since(Feed.block.stop),
-            since(Feed.awaken.time),
+            tostring(dashing), since(Feed.dash.time),
+            tostring(blocking),
+            tostring(awakened),
+            Feed.last.cat, Feed.last.service, Feed.last.effect,
             connectedCount
         )
+
         if type(setclipboard) == "function" then
-            setclipboard(snap)
-            CopyBtn.Text = "Copied!"
+            setclipboard(snap); CopyBtn.Text = "Copied!"
         elseif type(writefile) == "function" then
-            writefile("JJS_Snapshot.txt", snap)
-            CopyBtn.Text = "Saved to file"
+            writefile("JJS_Snapshot.txt", snap); CopyBtn.Text = "Saved to file"
         else
-            CopyBtn.Text = "No clipboard access"
-            return
+            CopyBtn.Text = "No clipboard access"; return
         end
-        task = task or {}
-        task.wait = task.wait or wait
-        task.wait(1.5)
+        wait(1.5)
         CopyBtn.Text = "Copy snapshot to clipboard"
     end)
-end)
+end
 
 -- ============================================================
 -- CLEANUP
@@ -370,7 +434,7 @@ _G.JJS_FeedGUI_Cleanup = function()
     if ScreenGui then ScreenGui:Destroy() end
 end
 
-print("[JJS FEED] v1.0 ready | " .. connectedCount .. " remotes hooked")
+print("[JJS FEED] v1.2 ready | " .. connectedCount .. " remotes")
 
 end)
 
