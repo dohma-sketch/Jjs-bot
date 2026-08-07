@@ -1,24 +1,17 @@
---[[
-    JJS REMOTE INTERCEPTOR + GUI v2.1
-    FIXED: Players/LocalPlayer scope, definition order
-]]
+local OK, ERR = pcall(function()
+-- ============================================================
+-- ВСЁ ВНУТРИ pcall: строка 1 не может упасть
+-- ============================================================
 
--- ============================================================
--- SERVICES (определены ПЕРВЫМИ)
--- ============================================================
+print("[JJS REMOTE] boot...")
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
-    Players.PlayerAdded:Wait()
-    LocalPlayer = Players.LocalPlayer
+    LocalPlayer = Players.PlayerAdded:Wait()
 end
-
--- ============================================================
--- CONFIG
--- ============================================================
 
 local CONFIG = {
     Mode = "discover",
@@ -32,10 +25,6 @@ local CONFIG = {
     },
     EventMap = {},
 }
-
--- ============================================================
--- STATE
--- ============================================================
 
 local DiscoveredRemotes = {}
 local RemoteStats = {}
@@ -52,7 +41,6 @@ local IsRunning = false
 local EnemyMemoryRef = nil
 local PerceptionCacheRef = nil
 
--- GUI references
 local GuiLogScroll = nil
 local GuiStatusLabel = nil
 
@@ -204,7 +192,7 @@ local function SetClipboard(text)
 end
 
 -- ============================================================
--- INTERCEPTOR LOGIC
+-- DISCOVERY / STATS / PARSER
 -- ============================================================
 
 local function DiscoverRemotes()
@@ -540,7 +528,7 @@ local function DoExportAll()
 end
 
 -- ============================================================
--- GUI (определена ПОСЛЕ всех переменных)
+-- GUI
 -- ============================================================
 
 local function CreateGUI()
@@ -555,7 +543,6 @@ local function CreateGUI()
     ScreenGui.ResetOnSpawn = false
     ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-    -- Main window
     local MainFrame = Instance.new("Frame")
     MainFrame.Name = "MainWindow"
     MainFrame.Size = UDim2.new(0, 480, 0, 380)
@@ -570,7 +557,6 @@ local function CreateGUI()
     MainCorner.CornerRadius = UDim.new(0, 8)
     MainCorner.Parent = MainFrame
 
-    -- Title bar
     local TitleBar = Instance.new("Frame")
     TitleBar.Size = UDim2.new(1, 0, 0, 35)
     TitleBar.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
@@ -606,7 +592,6 @@ local function CreateGUI()
     CloseCorner.CornerRadius = UDim.new(0, 5)
     CloseCorner.Parent = CloseBtn
 
-    -- Status bar
     local StatusLabel = Instance.new("TextLabel")
     StatusLabel.Size = UDim2.new(1, -20, 0, 20)
     StatusLabel.Position = UDim2.new(0, 10, 0, 40)
@@ -620,7 +605,6 @@ local function CreateGUI()
 
     GuiStatusLabel = StatusLabel
 
-    -- Button panel
     local BtnPanel = Instance.new("Frame")
     BtnPanel.Size = UDim2.new(1, -20, 0, 30)
     BtnPanel.Position = UDim2.new(0, 10, 0, 65)
@@ -658,7 +642,6 @@ local function CreateGUI()
     local ClearBtn = MakeButton("Clear", Color3.fromRGB(180, 80, 50), 4)
     local StatsBtn = MakeButton("Stats", Color3.fromRGB(100, 100, 100), 5)
 
-    -- Log panel
     local LogPanel = Instance.new("Frame")
     LogPanel.Size = UDim2.new(1, -20, 1, -110)
     LogPanel.Position = UDim2.new(0, 10, 0, 100)
@@ -687,10 +670,7 @@ local function CreateGUI()
 
     GuiLogScroll = LogScroll
 
-    -- ============================================================
-    -- BUTTON HANDLERS
-    -- ============================================================
-
+    -- Handlers
     CloseBtn.MouseButton1Click:Connect(function()
         pcall(function()
             DoStop()
@@ -730,15 +710,11 @@ local function CreateGUI()
     end)
 
     ExportBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            DoExportAll()
-        end)
+        pcall(function() DoExportAll() end)
     end)
 
     ClearBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            DoClear()
-        end)
+        pcall(function() DoClear() end)
     end)
 
     StatsBtn.MouseButton1Click:Connect(function()
@@ -752,7 +728,7 @@ local function CreateGUI()
                     return a.stat.callCount > b.stat.callCount
                 end)
             end
-            LogDebug("--- STATS (" .. #sorted .. " remotes) ---")
+            LogDebug("--- STATS (" .. #sorted .. ") ---")
             for _, item in pairs(sorted) do
                 local methods = {}
                 for m, c in pairs(item.stat.methods) do
@@ -866,5 +842,18 @@ _G.JJS_RemoteInterceptor_Cleanup = function()
     DoStop()
 end
 
--- GUI создаётся ПОСЛЕ всех определений
+-- GUI создаётся в конце, внутри pcall
 CreateGUI()
+
+print("[JJS REMOTE] v2.2 loaded OK")
+
+end) -- конец pcall
+
+-- ============================================================
+-- ЕСЛИ ВСЁ-ТАКИ УПАЛО: печатаем РЕАЛЬНУЮ ошибку с номером строки
+-- ============================================================
+
+if not OK then
+    warn("[JJS REMOTE] FATAL: " .. tostring(ERR))
+    print("[JJS REMOTE] FATAL: " .. tostring(ERR))
+end
