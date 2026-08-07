@@ -1,889 +1,380 @@
-local JJS_VERSION = "3.0"
-
 local OK, ERR = pcall(function()
-
--- ============================================================
--- SERVICES
--- ============================================================
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local RS = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
-if not LocalPlayer then
-    LocalPlayer = Players.PlayerAdded:Wait()
-end
-
--- ============================================================
--- CONFIG
--- ============================================================
-
-local CONFIG = {
-    Mode = "discover",
-    LogToConsole = true,
-    MaxLogArgs = 6,
-    MaxLogsPerSecond = 15,
-    LogThrottle = 0.1,
-    IgnoreNames = {
-        "Heartbeat", "Update", "Tick", "Ping",
-        "KeepAlive", "Render", "Physics",
-    },
-    EventMap = {},
-}
+if not LocalPlayer then LocalPlayer = Players.PlayerAdded:Wait() end
 
 -- ============================================================
 -- STATE
 -- ============================================================
 
-local DiscoveredRemotes = {}
-local RemoteStats = {}
-local ActiveConnections = {}
-local LastLogTime = {}
-local LogCount = 0
-local LastResetTime = time()
+local Feed = {
+    attack = {time = 0, char = nil, kind = nil},
+    skill  = {time = 0, char = nil, service = nil},
+    dash   = {time = 0, char = nil, dir = nil},
+    block  = {start = 0, stop = 0, char = nil, active = false},
+    awaken = {time = 0, char = nil},
+}
+_G.JJS_Feed = Feed
 
-local OriginalNamecall = nil
-local HookActive = false
-local InHook = false
-local IsRunning = false
+local connections = {}
+local function hook(remote, fn)
+    local ok, conn = pcall(function() return remote.OnClientEvent:Connect(fn) end)
+    if ok and conn then connections[#connections + 1] = conn end
+end
 
-local EnemyMemoryRef = nil
-local PerceptionCacheRef = nil
-
-local GuiLogScroll = nil
-local GuiStatusLabel = nil
-
--- ============================================================
--- UTILITIES
--- ============================================================
-
-local function LogDebug(msg)
-    msg = tostring(msg)
-
-    if CONFIG.LogToConsole then
-        local now = time()
-        if now - LastResetTime >= 1 then
-            LogCount = 0
-            LastResetTime = now
-        end
-        LogCount = LogCount + 1
-        if LogCount <= CONFIG.MaxLogsPerSecond then
-            print("[JJS REMOTE] " .. msg)
+local function pickChar(...)
+    for i = 1, select("#", ...) do
+        local a = select(i, ...)
+        if type(a) == "userdata" then
+            local ok, isModel = pcall(function() return a:IsA("Model") end)
+            if ok and isModel then return a end
         end
     end
-
-    if GuiLogScroll then
-        pcall(function()
-            local Entry = Instance.new("TextLabel")
-            Entry.Size = UDim2.new(1, -10, 0, 16)
-            Entry.BackgroundTransparency = 1
-            Entry.Text = msg
-            Entry.TextColor3 = Color3.fromRGB(200, 200, 200)
-            Entry.TextSize = 10
-            Entry.Font = Enum.Font.Code
-            Entry.TextXAlignment = Enum.TextXAlignment.Left
-            Entry.TextTruncate = Enum.TextTruncate.AtEnd
-            Entry.LayoutOrder = math.floor(time() * 1000)
-            Entry.Parent = GuiLogScroll
-
-            local Layout = GuiLogScroll:FindFirstChild("LogLayout")
-            if Layout then
-                GuiLogScroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 10)
-            end
-
-            local children = GuiLogScroll:GetChildren()
-            local count = 0
-            for _, c in pairs(children) do
-                if c:IsA("TextLabel") then
-                    count = count + 1
-                end
-            end
-            if count > 80 then
-                local oldest = nil
-                local oldestOrder = math.huge
-                for _, c in pairs(children) do
-                    if c:IsA("TextLabel") and c.LayoutOrder < oldestOrder then
-                        oldest = c
-                        oldestOrder = c.LayoutOrder
-                    end
-                end
-                if oldest then
-                    oldest:Destroy()
-                end
-            end
-
-            GuiLogScroll.CanvasPosition = Vector2.new(0, GuiLogScroll.CanvasSize.Y.Offset)
-        end)
-    end
-end
-
-local function UpdateStatus()
-    if not GuiStatusLabel then return end
-    pcall(function()
-        local stateText = IsRunning and "RUNNING" or "STOPPED"
-        local hookText = HookActive and "hook" or "passive"
-        GuiStatusLabel.Text = string.format("[%s] %s | %s | remotes: %d",
-            stateText, CONFIG.Mode, hookText, #DiscoveredRemotes)
-    end)
-end
-
-local function SerializeArg(arg, depth)
-    depth = depth or 0
-    if depth > 2 then return "..." end
-    local t = type(arg)
-    if t == "nil" then return "nil"
-    elseif t == "boolean" then return tostring(arg)
-    elseif t == "number" then return tostring(arg)
-    elseif t == "string" then
-        if #arg > 50 then return '"' .. string.sub(arg, 1, 50) .. '..."' end
-        return '"' .. arg .. '"'
-    elseif t == "table" then
-        local items = {}
-        local count = 0
-        for k, v in pairs(arg) do
-            count = count + 1
-            if count > 5 then
-                items[#items + 1] = "..."
-                break
-            end
-            items[#items + 1] = tostring(k) .. "=" .. SerializeArg(v, depth + 1)
-        end
-        return "{" .. table.concat(items, ", ") .. "}"
-    elseif t == "userdata" then
-        local ok, name = pcall(function() return arg.Name end)
-        if ok and name then return "Instance<" .. tostring(name) .. ">" end
-        return "userdata"
-    else
-        return t
-    end
-end
-
-local function SerializeArgs(args, max)
-    max = max or CONFIG.MaxLogArgs
-    local parts = {}
-    for i = 1, math.min(#args, max) do
-        parts[#parts + 1] = SerializeArg(args[i])
-    end
-    if #args > max then
-        parts[#parts + 1] = "... +" .. (#args - max) .. " more"
-    end
-    return "(" .. table.concat(parts, ", ") .. ")"
-end
-
-local function ShouldIgnore(remoteName)
-    if not remoteName then return true end
-    for _, ignore in pairs(CONFIG.IgnoreNames) do
-        if string.find(remoteName, ignore, 1, true) then return true end
-    end
-    return false
-end
-
-local function GetClassName(instance)
-    local ok, cn = pcall(function() return instance.ClassName end)
-    if ok then return cn end
     return nil
 end
 
-local function SafeGetName(instance)
-    local ok, name = pcall(function() return instance.Name end)
-    if ok and name then return tostring(name) end
-    return tostring(instance)
-end
-
-local function SetClipboard(text)
-    if type(setclipboard) == "function" then
-        pcall(function() setclipboard(text) end)
-        return true
-    end
-    local ok, GuiService = pcall(function() return game:GetService("GuiService") end)
-    if ok and GuiService then
-        pcall(function() GuiService:SetClipboard(text) end)
-        return true
-    end
-    if type(writefile) == "function" then
-        pcall(function() writefile("JJS_Remote_Export.txt", text) end)
-        return true
-    end
-    return false
-end
-
 -- ============================================================
--- DISCOVERY
+-- HOOK KNIT SERVICES
 -- ============================================================
 
-local function DiscoverRemotes()
-    DiscoveredRemotes = {}
-    local count = 0
+local connectedCount = 0
 
-    local function scan(parent, path)
-        local ok, children = pcall(function() return parent:GetChildren() end)
-        if not ok or not children then return end
-        for _, obj in pairs(children) do
-            local objName = SafeGetName(obj)
-            local objPath = path .. "." .. objName
-            local cn = GetClassName(obj)
-            if cn == "RemoteEvent" or cn == "RemoteFunction" then
-                count = count + 1
-                DiscoveredRemotes[#DiscoveredRemotes + 1] = {
-                    instance = obj,
-                    path = objPath,
-                    type = cn,
-                }
-            end
-            pcall(function() scan(obj, objPath) end)
-        end
-    end
+pcall(function()
+    local Services = RS.Knit.Knit.Services
+    for _, svc in pairs(Services:GetChildren()) do
+        local RE = svc:FindFirstChild("RE")
+        if RE then
+            local svcName = svc.Name
 
-    pcall(function() scan(game:GetService("ReplicatedStorage"), "RS") end)
-    pcall(function() scan(game:GetService("ReplicatedFirst"), "RF") end)
-    pcall(function() scan(Workspace, "WS") end)
-    pcall(function() scan(game:GetService("Lighting"), "Lighting") end)
-
-    LogDebug("Found " .. count .. " remotes")
-    return count
-end
-
--- ============================================================
--- STATS
--- ============================================================
-
-local function RecordRemoteCall(remoteKey, method, args, direction)
-    if not RemoteStats[remoteKey] then
-        RemoteStats[remoteKey] = {
-            callCount = 0,
-            methods = {},
-            lastCall = 0,
-            sampleArgs = nil,
-            direction = direction,
-        }
-    end
-    local stat = RemoteStats[remoteKey]
-    stat.callCount = stat.callCount + 1
-    stat.methods[method] = (stat.methods[method] or 0) + 1
-    stat.lastCall = time()
-    if not stat.sampleArgs and #args > 0 then
-        stat.sampleArgs = SerializeArgs(args)
-    end
-end
-
--- ============================================================
--- PARSER
--- ============================================================
-
-local function ParseEvent(remoteName, args)
-    if CONFIG.Mode ~= "produce" then return end
-    if not EnemyMemoryRef then return end
-    local mapping = CONFIG.EventMap[remoteName]
-    if not mapping then return end
-    pcall(function()
-        local eventType = mapping.type
-        if eventType == "attack" then
-            EnemyMemoryRef:RecordAction("attack")
-            if PerceptionCacheRef then
-                PerceptionCacheRef.attacking = true
-                PerceptionCacheRef.attackStartTime = time()
-            end
-        elseif eventType == "block" then
-            EnemyMemoryRef:RecordAction("block")
-            if PerceptionCacheRef then PerceptionCacheRef.blocking = true end
-        elseif eventType == "dash" then
-            EnemyMemoryRef:RecordAction("dash")
-            if PerceptionCacheRef then PerceptionCacheRef.dashing = true end
-        elseif eventType == "parry" then
-            EnemyMemoryRef:RecordAction("parry")
-        elseif eventType == "awaken" then
-            EnemyMemoryRef:RecordAction("awaken")
-            if PerceptionCacheRef then PerceptionCacheRef.awakened = true end
-        elseif eventType == "counter" then
-            EnemyMemoryRef:RecordAction("counter")
-            if PerceptionCacheRef then PerceptionCacheRef.countering = true end
-        end
-    end)
-end
-
--- ============================================================
--- THROTTLE
--- ============================================================
-
-local function CanLog(remoteKey)
-    local now = time()
-    if not LastLogTime[remoteKey] or now - LastLogTime[remoteKey] >= CONFIG.LogThrottle then
-        LastLogTime[remoteKey] = now
-        return true
-    end
-    return false
-end
-
--- ============================================================
--- NAMECALL HOOK (vararg-safe)
--- ============================================================
-
-local function InstallNamecallHook()
-    if HookActive then return false end
-
-    if type(getrawmetatable) ~= "function" then
-        LogDebug("Hook skip: getrawmetatable unavailable")
-        return false
-    end
-
-    local mt = getrawmetatable(game)
-    if not mt then
-        LogDebug("Hook skip: metatable nil")
-        return false
-    end
-
-    OriginalNamecall = mt.__namecall
-    if not OriginalNamecall then
-        LogDebug("Hook skip: no __namecall")
-        return false
-    end
-
-    pcall(function()
-        if type(setreadonly) == "function" then setreadonly(mt, false) end
-    end)
-
-    -- '...' ловим СРАЗУ в теле vararg-функции
-    local hookFunc = function(self, ...)
-        local varargs = {...}
-        local nargs = select("#", ...)
-
-        if InHook then
-            return OriginalNamecall(self, unpack(varargs, 1, nargs))
-        end
-        InHook = true
-
-        local result
-        local ok, err = pcall(function()
-            local method = getnamecallmethod()
-
-            local isRemote = false
-            pcall(function()
-                local cn = self.ClassName
-                isRemote = (cn == "RemoteEvent" or cn == "RemoteFunction")
-            end)
-
-            if isRemote then
-                local remoteKey = SafeGetName(self)
-                if not ShouldIgnore(remoteKey) then
-                    local direction = "unknown"
-                    if method == "FireServer" or method == "InvokeServer" then
-                        direction = "C->S"
-                    elseif method == "FireClient" then
-                        direction = "S->C"
-                    end
-
-                    RecordRemoteCall(remoteKey, method, varargs, direction)
-
-                    if CONFIG.Mode == "discover" then
-                        if CanLog(remoteKey) then
-                            LogDebug(string.format("[%s] %s:%s %s",
-                                direction, remoteKey, method, SerializeArgs(varargs)))
-                        end
-                    end
-
-                    if CONFIG.Mode == "produce" then
-                        ParseEvent(remoteKey, varargs)
-                    end
-                end
-            end
-
-            result = OriginalNamecall(self, unpack(varargs, 1, nargs))
-        end)
-
-        InHook = false
-
-        if not ok then
-            return OriginalNamecall(self, unpack(varargs, 1, nargs))
-        end
-        return result
-    end
-
-    local finalHook = hookFunc
-    if type(newcclosure) == "function" then
-        finalHook = newcclosure(hookFunc)
-    end
-
-    local setOk = pcall(function()
-        mt.__namecall = finalHook
-    end)
-
-    if not setOk then
-        LogDebug("Hook skip: failed to set")
-        return false
-    end
-
-    pcall(function()
-        if type(setreadonly) == "function" then setreadonly(mt, true) end
-    end)
-
-    HookActive = true
-    LogDebug("Hook installed")
-    return true
-end
-
-local function RemoveNamecallHook()
-    if not HookActive then return end
-    local mt = getrawmetatable(game)
-    if mt and OriginalNamecall then
-        pcall(function()
-            if type(setreadonly) == "function" then setreadonly(mt, false) end
-        end)
-        pcall(function() mt.__namecall = OriginalNamecall end)
-        pcall(function()
-            if type(setreadonly) == "function" then setreadonly(mt, true) end
-        end)
-    end
-    HookActive = false
-    OriginalNamecall = nil
-    InHook = false
-    LogDebug("Hook removed")
-end
-
--- ============================================================
--- LISTENERS
--- ============================================================
-
-local function InstallListeners()
-    local count = 0
-    for _, remoteInfo in pairs(DiscoveredRemotes) do
-        local remote = remoteInfo.instance
-        local cn = GetClassName(remote)
-        if cn == "RemoteEvent" then
-            local ok, conn = pcall(function()
-                return remote.OnClientEvent:Connect(function(...)
-                    local args = {...}
-                    local remoteKey = SafeGetName(remote)
-                    if ShouldIgnore(remoteKey) then return end
-                    RecordRemoteCall(remoteKey, "OnClientEvent", args, "S->C")
-                    if CONFIG.Mode == "discover" then
-                        if CanLog(remoteKey) then
-                            LogDebug(string.format("[S->C] %s %s",
-                                remoteKey, SerializeArgs(args)))
-                        end
-                    end
-                    if CONFIG.Mode == "produce" then
-                        ParseEvent(remoteKey, args)
+            local effects = RE:FindFirstChild("Effects")
+            if effects then
+                hook(effects, function(effectType, ...)
+                    local who = pickChar(...)
+                    if effectType == "Swing" then
+                        Feed.attack.time = time()
+                        Feed.attack.char = who
+                        Feed.attack.kind = "M1"
+                    else
+                        Feed.skill.time = time()
+                        Feed.skill.char = who
+                        Feed.skill.service = svcName
                     end
                 end)
-            end)
-            if ok and conn then
-                ActiveConnections[#ActiveConnections + 1] = conn
-                count = count + 1
+                connectedCount = connectedCount + 1
+            end
+
+            local activated = RE:FindFirstChild("Activated")
+            if activated then
+                hook(activated, function(...)
+                    Feed.skill.time = time()
+                    Feed.skill.char = pickChar(...)
+                    Feed.skill.service = svcName
+                end)
+                connectedCount = connectedCount + 1
             end
         end
     end
-    LogDebug("Listeners: " .. count)
-    return count
-end
 
-local function RemoveListeners()
-    for _, conn in pairs(ActiveConnections) do
-        pcall(function() conn:Disconnect() end)
-    end
-    ActiveConnections = {}
-end
-
--- ============================================================
--- START / STOP / ACTIONS
--- ============================================================
-
-local function DoStart()
-    if IsRunning then
-        LogDebug("Already running")
-        return
-    end
-    DiscoverRemotes()
-    local hookOk = InstallNamecallHook()
-    if not hookOk then
-        LogDebug("Hook failed, listeners only")
-    end
-    InstallListeners()
-    IsRunning = true
-    LogDebug("Started (mode: " .. CONFIG.Mode .. ")")
-    UpdateStatus()
-end
-
-local function DoStop()
-    RemoveNamecallHook()
-    RemoveListeners()
-    IsRunning = false
-    LogDebug("Stopped")
-    UpdateStatus()
-end
-
-local function DoClear()
-    RemoteStats = {}
-    LastLogTime = {}
-    LogDebug("Stats cleared")
-    UpdateStatus()
-end
-
-local function DoExportAll()
-    local lines = {}
-    lines[#lines + 1] = "=== DISCOVERED REMOTES ==="
-    lines[#lines + 1] = "Total: " .. #DiscoveredRemotes
-    for i, r in pairs(DiscoveredRemotes) do
-        lines[#lines + 1] = string.format("%d. [%s] %s", i, r.type, r.path)
-    end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "=== REMOTE STATS ==="
-    local sorted = {}
-    for key, stat in pairs(RemoteStats) do
-        sorted[#sorted + 1] = {key = key, stat = stat}
-    end
-    if #sorted > 0 then
-        table.sort(sorted, function(a, b)
-            return a.stat.callCount > b.stat.callCount
-        end)
-    end
-    for _, item in pairs(sorted) do
-        local methods = {}
-        for m, c in pairs(item.stat.methods) do
-            methods[#methods + 1] = string.format("%s(%d)", m, c)
-        end
-        lines[#lines + 1] = string.format("## %s | calls: %d | %s",
-            item.key, item.stat.callCount, table.concat(methods, ", "))
-        if item.stat.sampleArgs then
-            lines[#lines + 1] = "   sample: " .. item.stat.sampleArgs
+    local move = Services:FindFirstChild("MovementService")
+    if move and move.RE then
+        local dash = move.RE:FindFirstChild("Dash")
+        if dash then
+            hook(dash, function(dir, ...)
+                Feed.dash.time = time()
+                Feed.dash.dir = dir
+                Feed.dash.char = pickChar(...) or LocalPlayer.Character
+            end)
+            connectedCount = connectedCount + 1
         end
     end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "=== EVENT MAPPINGS ==="
-    for name, mapping in pairs(CONFIG.EventMap) do
-        lines[#lines + 1] = string.format(
-            'RI_Add("%s", "%s", %d)',
-            name, mapping.type, mapping.argIndex or 1)
+
+    local block = Services:FindFirstChild("BlockService")
+    if block and block.RE then
+        for _, child in pairs(block.RE:GetChildren()) do
+            if child:IsA("RemoteEvent") then
+                local isDeact = (child.Name == "Deactivated")
+                hook(child, function(...)
+                    local who = pickChar(...)
+                    if isDeact then
+                        Feed.block.stop = time()
+                        Feed.block.active = false
+                    else
+                        Feed.block.start = time()
+                        Feed.block.active = true
+                    end
+                    Feed.block.char = who
+                end)
+                connectedCount = connectedCount + 1
+            end
+        end
     end
-    SetClipboard(table.concat(lines, "\n"))
-    LogDebug("Exported to clipboard")
-end
+
+    local custom = Services:FindFirstChild("CustomService")
+    if custom and custom.RE then
+        local awaken = custom.RE:FindFirstChild("Awaken")
+        if awaken then
+            hook(awaken, function(...)
+                Feed.awaken.time = time()
+                Feed.awaken.char = pickChar(...)
+            end)
+            connectedCount = connectedCount + 1
+        end
+    end
+end)
 
 -- ============================================================
 -- GUI
 -- ============================================================
 
-local function CreateGUI()
-    local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local oldGui = PlayerGui:FindFirstChild("JJS_FeedGUI")
+if oldGui then oldGui:Destroy() end
 
-    local oldGui = PlayerGui:FindFirstChild("JJS_RemoteGUI")
-    if oldGui then oldGui:Destroy() end
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "JJS_FeedGUI"
+ScreenGui.Parent = PlayerGui
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "JJS_RemoteGUI"
-    ScreenGui.Parent = PlayerGui
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 360, 0, 260)
+MainFrame.Position = UDim2.new(1, -380, 0, 20)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
 
-    local MainFrame = Instance.new("Frame")
-    MainFrame.Name = "MainWindow"
-    MainFrame.Size = UDim2.new(0, 480, 0, 380)
-    MainFrame.Position = UDim2.new(0.5, -240, 0.5, -190)
-    MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-    MainFrame.BorderSizePixel = 0
-    MainFrame.Active = true
-    MainFrame.Draggable = true
-    MainFrame.Parent = ScreenGui
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 8)
+MainCorner.Parent = MainFrame
 
-    local MainCorner = Instance.new("UICorner")
-    MainCorner.CornerRadius = UDim.new(0, 8)
-    MainCorner.Parent = MainFrame
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, 0, 0, 30)
+TitleBar.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
 
-    local TitleBar = Instance.new("Frame")
-    TitleBar.Size = UDim2.new(1, 0, 0, 35)
-    TitleBar.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
-    TitleBar.BorderSizePixel = 0
-    TitleBar.Parent = MainFrame
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -40, 1, 0)
+TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "JJS Combat Feed (" .. connectedCount .. " remotes)"
+TitleLabel.TextColor3 = Color3.new(1, 1, 1)
+TitleLabel.TextSize = 13
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
 
-    local TitleCorner = Instance.new("UICorner")
-    TitleCorner.CornerRadius = UDim.new(0, 8)
-    TitleCorner.Parent = TitleBar
-
-    local TitleLabel = Instance.new("TextLabel")
-    TitleLabel.Size = UDim2.new(1, -70, 1, 0)
-    TitleLabel.Position = UDim2.new(0, 10, 0, 0)
-    TitleLabel.BackgroundTransparency = 1
-    TitleLabel.Text = "JJS Remote Interceptor v" .. JJS_VERSION
-    TitleLabel.TextColor3 = Color3.new(1, 1, 1)
-    TitleLabel.TextSize = 15
-    TitleLabel.Font = Enum.Font.GothamBold
-    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    TitleLabel.Parent = TitleBar
-
-    local CloseBtn = Instance.new("TextButton")
-    CloseBtn.Size = UDim2.new(0, 25, 0, 25)
-    CloseBtn.Position = UDim2.new(1, -30, 0, 5)
-    CloseBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
-    CloseBtn.BorderSizePixel = 0
-    CloseBtn.Text = "X"
-    CloseBtn.TextColor3 = Color3.new(1, 1, 1)
-    CloseBtn.TextSize = 14
-    CloseBtn.Parent = TitleBar
-
-    local CloseCorner = Instance.new("UICorner")
-    CloseCorner.CornerRadius = UDim.new(0, 5)
-    CloseCorner.Parent = CloseBtn
-
-    local StatusLabel = Instance.new("TextLabel")
-    StatusLabel.Size = UDim2.new(1, -20, 0, 20)
-    StatusLabel.Position = UDim2.new(0, 10, 0, 40)
-    StatusLabel.BackgroundTransparency = 1
-    StatusLabel.Text = "[STOPPED] discover | passive | remotes: 0"
-    StatusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-    StatusLabel.TextSize = 11
-    StatusLabel.Font = Enum.Font.Code
-    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    StatusLabel.Parent = MainFrame
-
-    GuiStatusLabel = StatusLabel
-
-    local BtnPanel = Instance.new("Frame")
-    BtnPanel.Size = UDim2.new(1, -20, 0, 30)
-    BtnPanel.Position = UDim2.new(0, 10, 0, 65)
-    BtnPanel.BackgroundTransparency = 1
-    BtnPanel.Parent = MainFrame
-
-    local BtnLayout = Instance.new("UIListLayout")
-    BtnLayout.FillDirection = Enum.FillDirection.Horizontal
-    BtnLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    BtnLayout.Padding = UDim.new(0, 5)
-    BtnLayout.Parent = BtnPanel
-
-    local function MakeButton(text, color, order)
-        local Btn = Instance.new("TextButton")
-        Btn.Size = UDim2.new(0, 85, 1, 0)
-        Btn.BackgroundColor3 = color
-        Btn.BorderSizePixel = 0
-        Btn.Text = text
-        Btn.TextColor3 = Color3.new(1, 1, 1)
-        Btn.TextSize = 12
-        Btn.Font = Enum.Font.Gotham
-        Btn.LayoutOrder = order
-        Btn.Parent = BtnPanel
-
-        local BtnCorner = Instance.new("UICorner")
-        BtnCorner.CornerRadius = UDim.new(0, 5)
-        BtnCorner.Parent = Btn
-
-        return Btn
-    end
-
-    local StartBtn = MakeButton("Start", Color3.fromRGB(50, 180, 80), 1)
-    local ModeBtn = MakeButton("Mode: discover", Color3.fromRGB(120, 120, 120), 2)
-    local ExportBtn = MakeButton("Export", Color3.fromRGB(65, 105, 225), 3)
-    local ClearBtn = MakeButton("Clear", Color3.fromRGB(180, 80, 50), 4)
-    local StatsBtn = MakeButton("Stats", Color3.fromRGB(100, 100, 100), 5)
-
-    local LogPanel = Instance.new("Frame")
-    LogPanel.Size = UDim2.new(1, -20, 1, -110)
-    LogPanel.Position = UDim2.new(0, 10, 0, 100)
-    LogPanel.BackgroundColor3 = Color3.fromRGB(45, 45, 50)
-    LogPanel.BorderSizePixel = 0
-    LogPanel.Parent = MainFrame
-
-    local LogCorner = Instance.new("UICorner")
-    LogCorner.CornerRadius = UDim.new(0, 5)
-    LogCorner.Parent = LogPanel
-
-    local LogScroll = Instance.new("ScrollingFrame")
-    LogScroll.Size = UDim2.new(1, -6, 1, -6)
-    LogScroll.Position = UDim2.new(0, 3, 0, 3)
-    LogScroll.BackgroundTransparency = 1
-    LogScroll.BorderSizePixel = 0
-    LogScroll.ScrollBarThickness = 5
-    LogScroll.CanvasSize = UDim2.new(0, 0, 0, 10)
-    LogScroll.Parent = LogPanel
-
-    local LogLayout = Instance.new("UIListLayout")
-    LogLayout.Name = "LogLayout"
-    LogLayout.Padding = UDim.new(0, 1)
-    LogLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    LogLayout.Parent = LogScroll
-
-    GuiLogScroll = LogScroll
-
-    -- Handlers
-    CloseBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            DoStop()
-            ScreenGui:Destroy()
-        end)
-    end)
-
-    StartBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            if IsRunning then
-                DoStop()
-                StartBtn.Text = "Start"
-                StartBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 80)
-            else
-                DoStart()
-                StartBtn.Text = "Stop"
-                StartBtn.BackgroundColor3 = Color3.fromRGB(220, 80, 50)
-            end
-            UpdateStatus()
-        end)
-    end)
-
-    ModeBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            if CONFIG.Mode == "discover" then
-                CONFIG.Mode = "produce"
-                ModeBtn.Text = "Mode: produce"
-                ModeBtn.BackgroundColor3 = Color3.fromRGB(80, 150, 80)
-            else
-                CONFIG.Mode = "discover"
-                ModeBtn.Text = "Mode: discover"
-                ModeBtn.BackgroundColor3 = Color3.fromRGB(120, 120, 120)
-            end
-            LogDebug("Mode: " .. CONFIG.Mode)
-            UpdateStatus()
-        end)
-    end)
-
-    ExportBtn.MouseButton1Click:Connect(function()
-        pcall(function() DoExportAll() end)
-    end)
-
-    ClearBtn.MouseButton1Click:Connect(function()
-        pcall(function() DoClear() end)
-    end)
-
-    StatsBtn.MouseButton1Click:Connect(function()
-        pcall(function()
-            local sorted = {}
-            for key, stat in pairs(RemoteStats) do
-                sorted[#sorted + 1] = {key = key, stat = stat}
-            end
-            if #sorted > 0 then
-                table.sort(sorted, function(a, b)
-                    return a.stat.callCount > b.stat.callCount
-                end)
-            end
-            LogDebug("--- STATS (" .. #sorted .. ") ---")
-            for _, item in pairs(sorted) do
-                local methods = {}
-                for m, c in pairs(item.stat.methods) do
-                    methods[#methods + 1] = string.format("%s(%d)", m, c)
-                end
-                LogDebug(string.format("  %s | %d | %s",
-                    item.key, item.stat.callCount, table.concat(methods, ", ")))
-                if item.stat.sampleArgs then
-                    LogDebug("    sample: " .. item.stat.sampleArgs)
-                end
-            end
-        end)
-    end)
-
-    UpdateStatus()
-    LogDebug("GUI ready. Click Start.")
+-- Строки для отображения состояния
+local labels = {}
+local function addLabel(text, y, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -20, 0, 22)
+    lbl.Position = UDim2.new(0, 10, 0, y)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = color or Color3.fromRGB(200, 200, 200)
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.Code
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = MainFrame
+    return lbl
 end
 
+local statusLbl  = addLabel("Status: connecting...",  35, Color3.fromRGB(150, 150, 150))
+local targetLbl  = addLabel("Target: -",               57)
+local attackLbl  = addLabel("Attack: -",               80)
+local blockLbl   = addLabel("Block: -",               103)
+local dashLbl    = addLabel("Dash: -",                126)
+local awakenLbl  = addLabel("Awaken: -",              149)
+local skillLbl   = addLabel("Last skill: -",          172)
+
+-- Кнопка копирования
+local CopyBtn = Instance.new("TextButton")
+CopyBtn.Size = UDim2.new(1, -20, 0, 26)
+CopyBtn.Position = UDim2.new(0, 10, 0, 205)
+CopyBtn.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
+CopyBtn.BorderSizePixel = 0
+CopyBtn.Text = "Copy snapshot to clipboard"
+CopyBtn.TextColor3 = Color3.new(1, 1, 1)
+CopyBtn.TextSize = 12
+CopyBtn.Font = Enum.Font.Gotham
+CopyBtn.Parent = MainFrame
+
+local BtnCorner = Instance.new("UICorner")
+BtnCorner.CornerRadius = UDim.new(0, 5)
+BtnCorner.Parent = CopyBtn
+
 -- ============================================================
--- CONSOLE COMMANDS
+-- UPDATE LOOP
 -- ============================================================
 
-function RI_Start() DoStart() end
-function RI_Stop() DoStop() end
-function RI_Clear() DoClear() end
-function RI_ExportAll() DoExportAll() end
-
-function RI_Remotes()
-    print("========== DISCOVERED REMOTES ==========")
-    print("Total: " .. #DiscoveredRemotes)
-    for i, r in pairs(DiscoveredRemotes) do
-        print(string.format("%d. [%s] %s", i, r.type, r.path))
-    end
-    print("=========================================")
-end
-
-function RI_Stats()
-    print("========== REMOTE STATS ==========")
-    local sorted = {}
-    for key, stat in pairs(RemoteStats) do
-        sorted[#sorted + 1] = {key = key, stat = stat}
-    end
-    if #sorted == 0 then
-        print("  (no data yet)")
-    else
-        table.sort(sorted, function(a, b)
-            return a.stat.callCount > b.stat.callCount
-        end)
-        for _, item in pairs(sorted) do
-            local methods = {}
-            for m, c in pairs(item.stat.methods) do
-                methods[#methods + 1] = string.format("%s(%d)", m, c)
-            end
-            print(string.format("  %s | calls: %d | %s",
-                item.key, item.stat.callCount, table.concat(methods, ", ")))
-            if item.stat.sampleArgs then
-                print("    sample: " .. item.stat.sampleArgs)
+local function getTargetName()
+    local char = LocalPlayer.Character
+    if not char then return "-" end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return "-" end
+    local best = nil
+    local bestDist = 50
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local tr = plr.Character:FindFirstChild("HumanoidRootPart")
+            if tr then
+                local d = (tr.Position - root.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    best = plr.Character
+                end
             end
         end
     end
-    print("===================================")
+    return best and best.Name or "-"
 end
 
-function RI_Add(remoteName, eventType, argIndex)
-    CONFIG.EventMap[remoteName] = {
-        type = eventType,
-        argIndex = argIndex or 1,
-    }
-    LogDebug("Mapping: " .. remoteName .. " -> " .. eventType)
+local function updateLabels()
+    pcall(function()
+        statusLbl.Text = "Status: running | target: " .. getTargetName()
+
+        local now = time()
+        local targetChar = nil
+        local char = LocalPlayer.Character
+        if char then
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local bestD = 50
+                for _, plr in pairs(Players:GetPlayers()) do
+                    if plr ~= LocalPlayer and plr.Character then
+                        local tr = plr.Character:FindFirstChild("HumanoidRootPart")
+                        if tr then
+                            local d = (tr.Position - root.Position).Magnitude
+                            if d < bestD then
+                                bestD = d
+                                targetChar = plr.Character
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        local function since(t)
+            if t == 0 then return "-" end
+            return string.format("%.2fs ago", now - t)
+        end
+
+        local function isTarget(char)
+            return char == targetChar
+        end
+
+        if Feed.attack.char == targetChar and Feed.attack.time > 0 then
+            attackLbl.Text = "Attack: " .. Feed.attack.kind .. " | " .. since(Feed.attack.time)
+            attackLbl.TextColor3 = Color3.fromRGB(255, 120, 120)
+        else
+            attackLbl.Text = "Attack: -"
+            attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+
+        if Feed.block.char == targetChar and Feed.block.active then
+            blockLbl.Text = "Block: ACTIVE"
+            blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
+        else
+            blockLbl.Text = "Block: " .. since(Feed.block.stop)
+            blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+
+        if Feed.dash.char == targetChar and Feed.dash.time > 0 and now - Feed.dash.time < 1 then
+            dashLbl.Text = "Dash: " .. tostring(Feed.dash.dir) .. " | " .. since(Feed.dash.time)
+            dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
+        else
+            dashLbl.Text = "Dash: -"
+            dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+
+        if Feed.awaken.char == targetChar and Feed.awaken.time > 0 and now - Feed.awaken.time < 10 then
+            awakenLbl.Text = "Awaken: ACTIVE"
+            awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
+        else
+            awakenLbl.Text = "Awaken: -"
+            awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+
+        if Feed.skill.char == targetChar and Feed.skill.service then
+            skillLbl.Text = "Last skill: " .. Feed.skill.service .. " | " .. since(Feed.skill.time)
+            skillLbl.TextColor3 = Color3.fromRGB(180, 255, 180)
+        else
+            skillLbl.Text = "Last skill: -"
+            skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+    end)
 end
 
-function RI_Mode(mode)
-    if mode == "discover" or mode == "produce" then
-        CONFIG.Mode = mode
-        LogDebug("Mode: " .. mode)
-        UpdateStatus()
-    end
-end
+-- RunService loop
+local RunService = game:GetService("RunService")
+RunService.Heartbeat:Connect(updateLabels)
 
-function RI_SetEnemyMemory(memRef, cacheRef)
-    EnemyMemoryRef = memRef
-    PerceptionCacheRef = cacheRef
-    LogDebug("EnemyMemory connected")
-end
-
-function RI_Diag()
-    print("========== DIAGNOSTICS ==========")
-    print("getrawmetatable:   " .. type(getrawmetatable))
-    print("setreadonly:       " .. type(setreadonly))
-    print("newcclosure:       " .. type(newcclosure))
-    print("getnamecallmethod: " .. type(getnamecallmethod))
-    print("setclipboard:      " .. type(setclipboard))
-    print("writefile:         " .. type(writefile))
-    print("HookActive:        " .. tostring(HookActive))
-    print("IsRunning:         " .. tostring(IsRunning))
-    print("Mode:              " .. CONFIG.Mode)
-    print("Remotes found:     " .. #DiscoveredRemotes)
-    print("Listeners:         " .. #ActiveConnections)
-    print("=================================")
-end
-
--- ============================================================
--- CLEANUP & INIT
--- ============================================================
-
-if _G.JJS_RemoteInterceptor_Cleanup then
-    pcall(_G.JJS_RemoteInterceptor_Cleanup)
-end
-
-_G.JJS_RemoteInterceptor_Cleanup = function()
-    DoStop()
-end
-
-CreateGUI()
-
-print("[JJS REMOTE] v" .. JJS_VERSION .. " loaded OK")
-
+CopyBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        local now = time()
+        local function since(t)
+            if t == 0 then return "never" end
+            return string.format("%.2fs", now - t)
+        end
+        local snap = string.format(
+            "JJS Combat Snapshot %s\n" ..
+            "Target: %s\n" ..
+            "Attack (M1): %s ago, kind=%s\n" ..
+            "Skill: %s ago, service=%s\n" ..
+            "Dash: %s ago, dir=%s\n" ..
+            "Block: active=%s, stop=%s ago\n" ..
+            "Awaken: %s ago\n" ..
+            "Connected remotes: %d",
+            os.date(),
+            getTargetName(),
+            since(Feed.attack.time), tostring(Feed.attack.kind),
+            since(Feed.skill.time), tostring(Feed.skill.service),
+            since(Feed.dash.time), tostring(Feed.dash.dir),
+            tostring(Feed.block.active), since(Feed.block.stop),
+            since(Feed.awaken.time),
+            connectedCount
+        )
+        if type(setclipboard) == "function" then
+            setclipboard(snap)
+            CopyBtn.Text = "Copied!"
+        elseif type(writefile) == "function" then
+            writefile("JJS_Snapshot.txt", snap)
+            CopyBtn.Text = "Saved to file"
+        else
+            CopyBtn.Text = "No clipboard access"
+            return
+        end
+        task = task or {}
+        task.wait = task.wait or wait
+        task.wait(1.5)
+        CopyBtn.Text = "Copy snapshot to clipboard"
+    end)
 end)
 
 -- ============================================================
--- ERROR REPORT
+-- CLEANUP
 -- ============================================================
 
+if _G.JJS_FeedGUI_Cleanup then pcall(_G.JJS_FeedGUI_Cleanup) end
+
+_G.JJS_FeedGUI_Cleanup = function()
+    for _, c in pairs(connections) do pcall(function() c:Disconnect() end) end
+    if ScreenGui then ScreenGui:Destroy() end
+end
+
+print("[JJS FEED] v1.0 ready | " .. connectedCount .. " remotes hooked")
+
+end)
+
 if not OK then
-    warn("[JJS REMOTE] FATAL: " .. tostring(ERR))
-    print("[JJS REMOTE] FATAL: " .. tostring(ERR))
+    warn("[JJS FEED] FATAL: " .. tostring(ERR))
+    print("[JJS FEED] FATAL: " .. tostring(ERR))
 end
