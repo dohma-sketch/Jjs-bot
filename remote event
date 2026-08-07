@@ -16,6 +16,7 @@ local Feed = {
     block  = {start = 0, stop = 0, char = nil, active = false},
     awaken = {time = 0, char = nil},
     last   = {time = 0, cat = "-", service = "-", effect = "-"},
+    vocab  = {},
 }
 _G.JJS_Feed = Feed
 
@@ -59,12 +60,24 @@ local function classify(serviceName, effectType)
     return "skill"
 end
 
+-- ROUTE + VOCAB
 local function route(cat, who, svcName, effectType)
     local now = time()
     Feed.last.time = now
     Feed.last.cat = cat
     Feed.last.service = svcName
     Feed.last.effect = tostring(effectType)
+
+    -- Запоминаем каждое уникальное событие
+    local key = svcName .. " / " .. tostring(effectType)
+    local v = Feed.vocab[key]
+    if not v then
+        v = {count = 0, cat = cat, last = 0}
+        Feed.vocab[key] = v
+    end
+    v.count = v.count + 1
+    v.cat = cat
+    v.last = now
 
     if cat == "attack" then
         Feed.attack.time = now; Feed.attack.char = who; Feed.attack.kind = tostring(effectType)
@@ -77,6 +90,22 @@ local function route(cat, who, svcName, effectType)
     else
         Feed.skill.time = now; Feed.skill.char = who; Feed.skill.service = svcName
     end
+end
+
+-- СЛОВАРЬ → текст
+local function buildVocab()
+    local rows = {}
+    for key, v in pairs(Feed.vocab) do
+        rows[#rows + 1] = {key = key, count = v.count, cat = v.cat}
+    end
+    table.sort(rows, function(a, b) return a.count > b.count end)
+
+    local out = "JJS Event Vocabulary (" .. #rows .. " unique)\n"
+    for i = 1, #rows do
+        local r = rows[i]
+        out = out .. r.count .. "x [" .. r.cat .. "] " .. r.key .. "\n"
+    end
+    return out
 end
 
 -- HOOK ALL
@@ -278,21 +307,32 @@ local dashLbl   = addLabel("Dash: -", 99)
 local awakenLbl = addLabel("Awaken: -", 120)
 local skillLbl  = addLabel("Last skill: -", 141)
 local eventLbl  = addLabel("Last event: -", 165, Color3.fromRGB(255, 255, 150))
+local vocabLbl  = addLabel("Vocab: 0 unique events", 186, Color3.fromRGB(150, 255, 200))
 
 local CopyBtn = Instance.new("TextButton")
-CopyBtn.Size = UDim2.new(1, -20, 0, 26)
+CopyBtn.Size = UDim2.new(0.5, -15, 0, 26)
 CopyBtn.Position = UDim2.new(0, 10, 0, 230)
 CopyBtn.BackgroundColor3 = Color3.fromRGB(65, 105, 225)
 CopyBtn.BorderSizePixel = 0
-CopyBtn.Text = "Copy snapshot to clipboard"
+CopyBtn.Text = "Snapshot"
 CopyBtn.TextColor3 = Color3.new(1, 1, 1)
 CopyBtn.TextSize = 12
 CopyBtn.Font = Enum.Font.Gotham
 CopyBtn.Parent = MainFrame
 
-local BtnCorner = Instance.new("UICorner")
-BtnCorner.CornerRadius = UDim.new(0, 5)
-BtnCorner.Parent = CopyBtn
+local VocabBtn = Instance.new("TextButton")
+VocabBtn.Size = UDim2.new(0.5, -15, 0, 26)
+VocabBtn.Position = UDim2.new(0.5, 5, 0, 230)
+VocabBtn.BackgroundColor3 = Color3.fromRGB(50, 160, 90)
+VocabBtn.BorderSizePixel = 0
+VocabBtn.Text = "Copy vocabulary"
+VocabBtn.TextColor3 = Color3.new(1, 1, 1)
+VocabBtn.TextSize = 12
+VocabBtn.Font = Enum.Font.Gotham
+VocabBtn.Parent = MainFrame
+
+local c1 = Instance.new("UICorner"); c1.CornerRadius = UDim.new(0, 5); c1.Parent = CopyBtn
+local c2 = Instance.new("UICorner"); c2.CornerRadius = UDim.new(0, 5); c2.Parent = VocabBtn
 
 -- UPDATE
 local function since(t)
@@ -300,14 +340,10 @@ local function since(t)
     return string.format("%.2fs", time() - t)
 end
 
-local function setLine(lbl, active, activeText, color)
-    if active then
-        lbl.Text = activeText
-        lbl.TextColor3 = color
-    else
-        lbl.Text = string.gsub(lbl.Name or "", "", "") .. "-"
-        lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
-    end
+local function countVocab()
+    local n = 0
+    for _ in pairs(Feed.vocab) do n = n + 1 end
+    return n
 end
 
 local function updateLabels()
@@ -317,15 +353,12 @@ local function updateLabels()
         statusLbl.Text = "Status: running | target: " .. (target and target.Name or "-")
 
         local atk = false
-        if target and Feed.attack.char == target and (now - Feed.attack.time) < 1 then
-            atk = true
-        end
+        if target and Feed.attack.char == target and (now - Feed.attack.time) < 1 then atk = true end
         if atk then
             attackLbl.Text = "Attack: " .. tostring(Feed.attack.kind) .. " | " .. since(Feed.attack.time)
             attackLbl.TextColor3 = Color3.fromRGB(255, 120, 120)
         else
-            attackLbl.Text = "Attack: -"
-            attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            attackLbl.Text = "Attack: -"; attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local blocking = false
@@ -334,11 +367,9 @@ local function updateLabels()
             if IsBlockingScan(target) then blocking = true end
         end
         if blocking then
-            blockLbl.Text = "Block: ACTIVE"
-            blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
+            blockLbl.Text = "Block: ACTIVE"; blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
         else
-            blockLbl.Text = "Block: -"
-            blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            blockLbl.Text = "Block: -"; blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local dashing = false
@@ -347,11 +378,9 @@ local function updateLabels()
             if IsDashingScan(target) then dashing = true end
         end
         if dashing then
-            dashLbl.Text = "Dash: ACTIVE"
-            dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
+            dashLbl.Text = "Dash: ACTIVE"; dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
         else
-            dashLbl.Text = "Dash: -"
-            dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            dashLbl.Text = "Dash: -"; dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local awakened = false
@@ -360,40 +389,33 @@ local function updateLabels()
             if IsAwakenedScan(target) then awakened = true end
         end
         if awakened then
-            awakenLbl.Text = "Awaken: ACTIVE"
-            awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
+            awakenLbl.Text = "Awaken: ACTIVE"; awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
         else
-            awakenLbl.Text = "Awaken: -"
-            awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            awakenLbl.Text = "Awaken: -"; awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local sk = false
-        if target and Feed.skill.char == target and Feed.skill.service and (now - Feed.skill.time) < 3 then
-            sk = true
-        end
+        if target and Feed.skill.char == target and Feed.skill.service and (now - Feed.skill.time) < 3 then sk = true end
         if sk then
             skillLbl.Text = "Last skill: " .. Feed.skill.service .. " | " .. since(Feed.skill.time)
             skillLbl.TextColor3 = Color3.fromRGB(180, 255, 180)
         else
-            skillLbl.Text = "Last skill: -"
-            skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            skillLbl.Text = "Last skill: -"; skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         eventLbl.Text = "Last event: [" .. Feed.last.cat .. "] " .. Feed.last.service .. " / " .. Feed.last.effect
+        vocabLbl.Text = "Vocab: " .. countVocab() .. " unique events"
     end)
 end
 
 RunService.Heartbeat:Connect(updateLabels)
 
--- SNAPSHOT (построчная склейка, без длинных скобок)
+-- SNAPSHOT
 CopyBtn.MouseButton1Click:Connect(function()
     pcall(function()
         local target = getTarget()
         local now = time()
-
-        local blocking = false
-        local awakened = false
-        local dashing = false
+        local blocking = false; local awakened = false; local dashing = false
         if target then
             blocking = (Feed.block.char == target and (now - Feed.block.start) < 1.2) or IsBlockingScan(target)
             awakened = (Feed.awaken.char == target and (now - Feed.awaken.time) < 5) or IsAwakenedScan(target)
@@ -411,18 +433,30 @@ CopyBtn.MouseButton1Click:Connect(function()
         snap = snap .. "Connected remotes: " .. connectedCount
 
         if type(setclipboard) == "function" then
-            setclipboard(snap)
-            CopyBtn.Text = "Copied!"
+            setclipboard(snap); CopyBtn.Text = "Copied!"
         elseif type(writefile) == "function" then
-            writefile("JJS_Snapshot.txt", snap)
-            CopyBtn.Text = "Saved to file"
+            writefile("JJS_Snapshot.txt", snap); CopyBtn.Text = "Saved"
         else
-            CopyBtn.Text = "No clipboard access"
-            return
+            CopyBtn.Text = "No access"; return
         end
-
         wait(1.5)
-        CopyBtn.Text = "Copy snapshot to clipboard"
+        CopyBtn.Text = "Snapshot"
+    end)
+end)
+
+-- VOCAB
+VocabBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        local out = buildVocab()
+        if type(setclipboard) == "function" then
+            setclipboard(out); VocabBtn.Text = "Copied!"
+        elseif type(writefile) == "function" then
+            writefile("JJS_Vocab.txt", out); VocabBtn.Text = "Saved"
+        else
+            VocabBtn.Text = "No access"; return
+        end
+        wait(1.5)
+        VocabBtn.Text = "Copy vocabulary"
     end)
 end)
 
@@ -434,7 +468,7 @@ _G.JJS_FeedGUI_Cleanup = function()
     if ScreenGui then ScreenGui:Destroy() end
 end
 
-print("[JJS FEED] v1.3 ready | " .. connectedCount .. " remotes")
+print("[JJS FEED] v1.4 ready | " .. connectedCount .. " remotes")
 
 end)
 
