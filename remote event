@@ -1,8 +1,20 @@
 --[[
-    JJS REMOTE INTERCEPTOR + GUI v2.0
-    Single script, no external dependencies
-    Delta / Lua 5.1 compatible
+    JJS REMOTE INTERCEPTOR + GUI v2.1
+    FIXED: Players/LocalPlayer scope, definition order
 ]]
+
+-- ============================================================
+-- SERVICES (определены ПЕРВЫМИ)
+-- ============================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    Players.PlayerAdded:Wait()
+    LocalPlayer = Players.LocalPlayer
+end
 
 -- ============================================================
 -- CONFIG
@@ -43,14 +55,14 @@ local PerceptionCacheRef = nil
 -- GUI references
 local GuiLogScroll = nil
 local GuiStatusLabel = nil
-local GuiStartBtn = nil
-local GuiModeBtn = nil
 
 -- ============================================================
 -- UTILITIES
 -- ============================================================
 
 local function LogDebug(msg)
+    msg = tostring(msg)
+
     if CONFIG.LogToConsole then
         local now = time()
         if now - LastResetTime >= 1 then
@@ -58,17 +70,17 @@ local function LogDebug(msg)
             LastResetTime = now
         end
         LogCount = LogCount + 1
-        if LogCount > CONFIG.MaxLogsPerSecond then return end
-        print("[JJS REMOTE] " .. tostring(msg))
+        if LogCount <= CONFIG.MaxLogsPerSecond then
+            print("[JJS REMOTE] " .. msg)
+        end
     end
 
-    -- Also write to GUI log if available
     if GuiLogScroll then
         pcall(function()
             local Entry = Instance.new("TextLabel")
             Entry.Size = UDim2.new(1, -10, 0, 16)
             Entry.BackgroundTransparency = 1
-            Entry.Text = tostring(msg)
+            Entry.Text = msg
             Entry.TextColor3 = Color3.fromRGB(200, 200, 200)
             Entry.TextSize = 10
             Entry.Font = Enum.Font.Code
@@ -82,7 +94,6 @@ local function LogDebug(msg)
                 GuiLogScroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 10)
             end
 
-            -- Trim old entries
             local children = GuiLogScroll:GetChildren()
             local count = 0
             for _, c in pairs(children) do
@@ -106,15 +117,13 @@ local function LogDebug(msg)
 end
 
 local function UpdateStatus()
-    if GuiStatusLabel then
-        pcall(function()
-            local modeText = CONFIG.Mode
-            local stateText = IsRunning and "RUNNING" or "STOPPED"
-            local hookText = HookActive and "hook" or "passive"
-            GuiStatusLabel.Text = string.format("[%s] %s | %s | remotes: %d | stats: %d",
-                stateText, modeText, hookText, #DiscoveredRemotes, 0)
-        end)
-    end
+    if not GuiStatusLabel then return end
+    pcall(function()
+        local stateText = IsRunning and "RUNNING" or "STOPPED"
+        local hookText = HookActive and "hook" or "passive"
+        GuiStatusLabel.Text = string.format("[%s] %s | %s | remotes: %d",
+            stateText, CONFIG.Mode, hookText, #DiscoveredRemotes)
+    end)
 end
 
 local function SerializeArg(arg, depth)
@@ -223,7 +232,7 @@ local function DiscoverRemotes()
 
     pcall(function() scan(game:GetService("ReplicatedStorage"), "RS") end)
     pcall(function() scan(game:GetService("ReplicatedFirst"), "RF") end)
-    pcall(function() scan(game:GetService("Workspace"), "WS") end)
+    pcall(function() scan(Workspace, "WS") end)
     pcall(function() scan(game:GetService("Lighting"), "Lighting") end)
 
     LogDebug("Found " .. count .. " remotes")
@@ -456,7 +465,7 @@ local function RemoveListeners()
 end
 
 -- ============================================================
--- START / STOP
+-- START / STOP / ACTIONS
 -- ============================================================
 
 local function DoStart()
@@ -467,7 +476,7 @@ local function DoStart()
     DiscoverRemotes()
     local hookOk = InstallNamecallHook()
     if not hookOk then
-        LogDebug("Hook failed, using listeners only")
+        LogDebug("Hook failed, listeners only")
     end
     InstallListeners()
     IsRunning = true
@@ -492,16 +501,13 @@ end
 
 local function DoExportAll()
     local lines = {}
-
     lines[#lines + 1] = "=== DISCOVERED REMOTES ==="
     lines[#lines + 1] = "Total: " .. #DiscoveredRemotes
     for i, r in pairs(DiscoveredRemotes) do
         lines[#lines + 1] = string.format("%d. [%s] %s", i, r.type, r.path)
     end
-
     lines[#lines + 1] = ""
     lines[#lines + 1] = "=== REMOTE STATS ==="
-
     local sorted = {}
     for key, stat in pairs(RemoteStats) do
         sorted[#sorted + 1] = {key = key, stat = stat}
@@ -522,7 +528,6 @@ local function DoExportAll()
             lines[#lines + 1] = "   sample: " .. item.stat.sampleArgs
         end
     end
-
     lines[#lines + 1] = ""
     lines[#lines + 1] = "=== EVENT MAPPINGS ==="
     for name, mapping in pairs(CONFIG.EventMap) do
@@ -530,13 +535,12 @@ local function DoExportAll()
             'RI_Add("%s", "%s", %d)',
             name, mapping.type, mapping.argIndex or 1)
     end
-
     SetClipboard(table.concat(lines, "\n"))
     LogDebug("Exported to clipboard")
 end
 
 -- ============================================================
--- GUI
+-- GUI (определена ПОСЛЕ всех переменных)
 -- ============================================================
 
 local function CreateGUI()
@@ -593,7 +597,7 @@ local function CreateGUI()
     CloseBtn.Position = UDim2.new(1, -30, 0, 5)
     CloseBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
     CloseBtn.BorderSizePixel = 0
-    CloseBtn.Text = "✕"
+    CloseBtn.Text = "X"
     CloseBtn.TextColor3 = Color3.new(1, 1, 1)
     CloseBtn.TextSize = 14
     CloseBtn.Parent = TitleBar
@@ -654,9 +658,6 @@ local function CreateGUI()
     local ClearBtn = MakeButton("Clear", Color3.fromRGB(180, 80, 50), 4)
     local StatsBtn = MakeButton("Stats", Color3.fromRGB(100, 100, 100), 5)
 
-    GuiStartBtn = StartBtn
-    GuiModeBtn = ModeBtn
-
     -- Log panel
     local LogPanel = Instance.new("Frame")
     LogPanel.Size = UDim2.new(1, -20, 1, -110)
@@ -687,7 +688,7 @@ local function CreateGUI()
     GuiLogScroll = LogScroll
 
     -- ============================================================
-    -- BUTTON HANDLERS (all wrapped in pcall)
+    -- BUTTON HANDLERS
     -- ============================================================
 
     CloseBtn.MouseButton1Click:Connect(function()
@@ -771,7 +772,7 @@ local function CreateGUI()
 end
 
 -- ============================================================
--- CONSOLE COMMANDS (still available)
+-- CONSOLE COMMANDS
 -- ============================================================
 
 function RI_Start() DoStart() end
@@ -820,7 +821,7 @@ function RI_Add(remoteName, eventType, argIndex)
         type = eventType,
         argIndex = argIndex or 1,
     }
-    LogDebug("Mapping: " .. remoteName .. " → " .. eventType)
+    LogDebug("Mapping: " .. remoteName .. " -> " .. eventType)
 end
 
 function RI_Mode(mode)
@@ -865,11 +866,5 @@ _G.JJS_RemoteInterceptor_Cleanup = function()
     DoStop()
 end
 
--- Create GUI
-local LocalPlayer = Players.LocalPlayer
-if not LocalPlayer then
-    Players.PlayerAdded:Wait()
-    LocalPlayer = Players.LocalPlayer
-end
-
+-- GUI создаётся ПОСЛЕ всех определений
 CreateGUI()
