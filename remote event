@@ -8,10 +8,7 @@ local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then LocalPlayer = Players.PlayerAdded:Wait() end
 
--- ============================================================
 -- FEED
--- ============================================================
-
 local Feed = {
     attack = {time = 0, char = nil, kind = nil},
     skill  = {time = 0, char = nil, service = nil},
@@ -39,30 +36,23 @@ local function pickChar(...)
     return nil
 end
 
--- ============================================================
--- КЛАССИФИКАТОР: по строке-типу и имени сервиса
--- ============================================================
-
+-- CLASSIFY
 local function classify(serviceName, effectType)
     local s = tostring(serviceName):lower()
     local e = tostring(effectType):lower()
 
-    -- АТАКА
     if string.find(e, "swing") or string.find(e, "m1") or string.find(e, "punch")
        or string.find(e, "kick") or string.find(e, "slash") or string.find(e, "strike")
        or string.find(e, "hit") or string.find(e, "combo") or string.find(e, "uppercut") then
         return "attack"
     end
-    -- БЛОК
     if string.find(e, "block") or string.find(e, "guard") or string.find(s, "block") then
         return "block"
     end
-    -- ДЭШ
     if string.find(e, "dash") or string.find(e, "step") or string.find(e, "evade")
        or string.find(s, "veilstep") or string.find(s, "movement") then
         return "dash"
     end
-    -- ПРОБУЖДЕНИЕ
     if string.find(e, "awaken") or string.find(e, "domain") or string.find(s, "awaken") then
         return "awaken"
     end
@@ -89,10 +79,7 @@ local function route(cat, who, svcName, effectType)
     end
 end
 
--- ============================================================
--- HOOK ALL SERVICES
--- ============================================================
-
+-- HOOK ALL
 local connectedCount = 0
 pcall(function()
     local Services = RS.Knit.Knit.Services
@@ -126,7 +113,8 @@ pcall(function()
         local dash = move.RE:FindFirstChild("Dash")
         if dash then
             hook(dash, function(dir, ...)
-                Feed.dash.time = time(); Feed.dash.dir = dir
+                Feed.dash.time = time()
+                Feed.dash.dir = dir
                 Feed.dash.char = pickChar(...) or LocalPlayer.Character
             end)
             connectedCount = connectedCount + 1
@@ -140,8 +128,13 @@ pcall(function()
                 local isDeact = (child.Name == "Deactivated")
                 hook(child, function(...)
                     local who = pickChar(...)
-                    if isDeact then Feed.block.stop = time(); Feed.block.active = false
-                    else Feed.block.start = time(); Feed.block.active = true end
+                    if isDeact then
+                        Feed.block.stop = time()
+                        Feed.block.active = false
+                    else
+                        Feed.block.start = time()
+                        Feed.block.active = true
+                    end
                     Feed.block.char = who
                 end)
                 connectedCount = connectedCount + 1
@@ -150,10 +143,7 @@ pcall(function()
     end
 end)
 
--- ============================================================
--- ПРЯМОЙ ОСМОТР (fallback)
--- ============================================================
-
+-- SCAN FALLBACK
 local function GetBoolAttr(obj, name)
     if not obj then return false end
     local ok, v = pcall(function() return obj:GetAttribute(name) end)
@@ -226,10 +216,7 @@ local function getTarget()
     return nil
 end
 
--- ============================================================
 -- GUI
--- ============================================================
-
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local oldGui = PlayerGui:FindFirstChild("JJS_FeedGUI")
 if oldGui then oldGui:Destroy() end
@@ -307,27 +294,38 @@ local BtnCorner = Instance.new("UICorner")
 BtnCorner.CornerRadius = UDim.new(0, 5)
 BtnCorner.Parent = CopyBtn
 
--- ============================================================
 -- UPDATE
--- ============================================================
-
 local function since(t)
     if t == 0 then return "-" end
     return string.format("%.2fs", time() - t)
+end
+
+local function setLine(lbl, active, activeText, color)
+    if active then
+        lbl.Text = activeText
+        lbl.TextColor3 = color
+    else
+        lbl.Text = string.gsub(lbl.Name or "", "", "") .. "-"
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    end
 end
 
 local function updateLabels()
     pcall(function()
         local target = getTarget()
         local now = time()
-
         statusLbl.Text = "Status: running | target: " .. (target and target.Name or "-")
 
-        if Feed.attack.char == target and (now - Feed.attack.time) < 1 then
-            attackLbl.Text = "Attack: " .. Feed.attack.kind .. " | " .. since(Feed.attack.time)
+        local atk = false
+        if target and Feed.attack.char == target and (now - Feed.attack.time) < 1 then
+            atk = true
+        end
+        if atk then
+            attackLbl.Text = "Attack: " .. tostring(Feed.attack.kind) .. " | " .. since(Feed.attack.time)
             attackLbl.TextColor3 = Color3.fromRGB(255, 120, 120)
         else
-            attackLbl.Text = "Attack: -"; attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            attackLbl.Text = "Attack: -"
+            attackLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local blocking = false
@@ -336,9 +334,11 @@ local function updateLabels()
             if IsBlockingScan(target) then blocking = true end
         end
         if blocking then
-            blockLbl.Text = "Block: ACTIVE"; blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
+            blockLbl.Text = "Block: ACTIVE"
+            blockLbl.TextColor3 = Color3.fromRGB(120, 200, 255)
         else
-            blockLbl.Text = "Block: -"; blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            blockLbl.Text = "Block: -"
+            blockLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local dashing = false
@@ -347,9 +347,11 @@ local function updateLabels()
             if IsDashingScan(target) then dashing = true end
         end
         if dashing then
-            dashLbl.Text = "Dash: ACTIVE"; dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
+            dashLbl.Text = "Dash: ACTIVE"
+            dashLbl.TextColor3 = Color3.fromRGB(255, 200, 100)
         else
-            dashLbl.Text = "Dash: -"; dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            dashLbl.Text = "Dash: -"
+            dashLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
         local awakened = false
@@ -358,75 +360,73 @@ local function updateLabels()
             if IsAwakenedScan(target) then awakened = true end
         end
         if awakened then
-            awakenLbl.Text = "Awaken: ACTIVE"; awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
+            awakenLbl.Text = "Awaken: ACTIVE"
+            awakenLbl.TextColor3 = Color3.fromRGB(255, 100, 255)
         else
-            awakenLbl.Text = "Awaken: -"; awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            awakenLbl.Text = "Awaken: -"
+            awakenLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        if Feed.skill.char == target and Feed.skill.service and (now - Feed.skill.time) < 3 then
+        local sk = false
+        if target and Feed.skill.char == target and Feed.skill.service and (now - Feed.skill.time) < 3 then
+            sk = true
+        end
+        if sk then
             skillLbl.Text = "Last skill: " .. Feed.skill.service .. " | " .. since(Feed.skill.time)
             skillLbl.TextColor3 = Color3.fromRGB(180, 255, 180)
         else
-            skillLbl.Text = "Last skill: -"; skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+            skillLbl.Text = "Last skill: -"
+            skillLbl.TextColor3 = Color3.fromRGB(200, 200, 200)
         end
 
-        -- Сырое последнее событие (чтобы видеть словарь типов)
-        eventLbl.Text = string.format("Last event: [%s] %s / %s",
-            Feed.last.cat, Feed.last.service, Feed.last.effect)
+        eventLbl.Text = "Last event: [" .. Feed.last.cat .. "] " .. Feed.last.service .. " / " .. Feed.last.effect
     end)
 end
 
 RunService.Heartbeat:Connect(updateLabels)
 
--- ============================================================
--- SNAPSHOT
--- ============================================================
-
+-- SNAPSHOT (построчная склейка, без длинных скобок)
 CopyBtn.MouseButton1Click:Connect(function()
     pcall(function()
         local target = getTarget()
         local now = time()
-        local blocking = target and ((Feed.block.char == target and (now - Feed.block.start) < 1.2) or IsBlockingScan(target))
-        local awakened = target and ((Feed.awaken.char == target and (now - Feed.awaken.time) < 5) or IsAwakenedScan(target))
-        local dashing = target and ((Feed.dash.char == target and (now - Feed.dash.time) < 0.5) or IsDashingScan(target))
 
-        local snap = string.format(
-            "JJS Combat Snapshot %s\n" ..
-            "Target: %s\n" ..
-            "Attack: %s ago, kind=%s\n" ..
-            "Skill: %s ago, service=%s\n" ..
-            "Dash: active=%s, %s ago\n" ..
-            "Block: active=%s\n" ..
-            "Awaken: active=%s\n" ..
-            "LastEvent: [%s] %s / %s\n" ..
-            "Connected remotes: %d",
-            os.date(),
-            target and target.Name or "-",
-            since(Feed.attack.time), tostring(Feed.attack.kind),
-            since(Feed.skill.time), tostring(Feed.skill.service),
-            tostring(dashing), since(Feed.dash.time),
-            tostring(blocking),
-            tostring(awakened),
-            Feed.last.cat, Feed.last.service, Feed.last.effect,
-            connectedCount
-        )
+        local blocking = false
+        local awakened = false
+        local dashing = false
+        if target then
+            blocking = (Feed.block.char == target and (now - Feed.block.start) < 1.2) or IsBlockingScan(target)
+            awakened = (Feed.awaken.char == target and (now - Feed.awaken.time) < 5) or IsAwakenedScan(target)
+            dashing = (Feed.dash.char == target and (now - Feed.dash.time) < 0.5) or IsDashingScan(target)
+        end
+
+        local snap = "JJS Combat Snapshot " .. os.date() .. "\n"
+        snap = snap .. "Target: " .. (target and target.Name or "-") .. "\n"
+        snap = snap .. "Attack: " .. since(Feed.attack.time) .. " ago, kind=" .. tostring(Feed.attack.kind) .. "\n"
+        snap = snap .. "Skill: " .. since(Feed.skill.time) .. " ago, service=" .. tostring(Feed.skill.service) .. "\n"
+        snap = snap .. "Dash: active=" .. tostring(dashing) .. ", " .. since(Feed.dash.time) .. " ago\n"
+        snap = snap .. "Block: active=" .. tostring(blocking) .. "\n"
+        snap = snap .. "Awaken: active=" .. tostring(awakened) .. "\n"
+        snap = snap .. "LastEvent: [" .. Feed.last.cat .. "] " .. Feed.last.service .. " / " .. Feed.last.effect .. "\n"
+        snap = snap .. "Connected remotes: " .. connectedCount
 
         if type(setclipboard) == "function" then
-            setclipboard(snap); CopyBtn.Text = "Copied!"
+            setclipboard(snap)
+            CopyBtn.Text = "Copied!"
         elseif type(writefile) == "function" then
-            writefile("JJS_Snapshot.txt", snap); CopyBtn.Text = "Saved to file"
+            writefile("JJS_Snapshot.txt", snap)
+            CopyBtn.Text = "Saved to file"
         else
-            CopyBtn.Text = "No clipboard access"; return
+            CopyBtn.Text = "No clipboard access"
+            return
         end
+
         wait(1.5)
         CopyBtn.Text = "Copy snapshot to clipboard"
     end)
-end
+end)
 
--- ============================================================
 -- CLEANUP
--- ============================================================
-
 if _G.JJS_FeedGUI_Cleanup then pcall(_G.JJS_FeedGUI_Cleanup) end
 
 _G.JJS_FeedGUI_Cleanup = function()
@@ -434,7 +434,7 @@ _G.JJS_FeedGUI_Cleanup = function()
     if ScreenGui then ScreenGui:Destroy() end
 end
 
-print("[JJS FEED] v1.2 ready | " .. connectedCount .. " remotes")
+print("[JJS FEED] v1.3 ready | " .. connectedCount .. " remotes")
 
 end)
 
