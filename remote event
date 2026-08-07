@@ -1,9 +1,10 @@
-local OK, ERR = pcall(function()
--- ============================================================
--- ВСЁ ВНУТРИ pcall: строка 1 не может упасть
--- ============================================================
+local JJS_VERSION = "3.0"
 
-print("[JJS REMOTE] boot...")
+local OK, ERR = pcall(function()
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -12,6 +13,10 @@ local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     LocalPlayer = Players.PlayerAdded:Wait()
 end
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
 
 local CONFIG = {
     Mode = "discover",
@@ -25,6 +30,10 @@ local CONFIG = {
     },
     EventMap = {},
 }
+
+-- ============================================================
+-- STATE
+-- ============================================================
 
 local DiscoveredRemotes = {}
 local RemoteStats = {}
@@ -74,7 +83,7 @@ local function LogDebug(msg)
             Entry.Font = Enum.Font.Code
             Entry.TextXAlignment = Enum.TextXAlignment.Left
             Entry.TextTruncate = Enum.TextTruncate.AtEnd
-            Entry.LayoutOrder = time() * 1000
+            Entry.LayoutOrder = math.floor(time() * 1000)
             Entry.Parent = GuiLogScroll
 
             local Layout = GuiLogScroll:FindFirstChild("LogLayout")
@@ -85,7 +94,9 @@ local function LogDebug(msg)
             local children = GuiLogScroll:GetChildren()
             local count = 0
             for _, c in pairs(children) do
-                if c:IsA("TextLabel") then count = count + 1 end
+                if c:IsA("TextLabel") then
+                    count = count + 1
+                end
             end
             if count > 80 then
                 local oldest = nil
@@ -96,7 +107,9 @@ local function LogDebug(msg)
                         oldestOrder = c.LayoutOrder
                     end
                 end
-                if oldest then oldest:Destroy() end
+                if oldest then
+                    oldest:Destroy()
+                end
             end
 
             GuiLogScroll.CanvasPosition = Vector2.new(0, GuiLogScroll.CanvasSize.Y.Offset)
@@ -129,7 +142,10 @@ local function SerializeArg(arg, depth)
         local count = 0
         for k, v in pairs(arg) do
             count = count + 1
-            if count > 5 then items[#items + 1] = "..." break end
+            if count > 5 then
+                items[#items + 1] = "..."
+                break
+            end
             items[#items + 1] = tostring(k) .. "=" .. SerializeArg(v, depth + 1)
         end
         return "{" .. table.concat(items, ", ") .. "}"
@@ -192,7 +208,7 @@ local function SetClipboard(text)
 end
 
 -- ============================================================
--- DISCOVERY / STATS / PARSER
+-- DISCOVERY
 -- ============================================================
 
 local function DiscoverRemotes()
@@ -227,6 +243,10 @@ local function DiscoverRemotes()
     return count
 end
 
+-- ============================================================
+-- STATS
+-- ============================================================
+
 local function RecordRemoteCall(remoteKey, method, args, direction)
     if not RemoteStats[remoteKey] then
         RemoteStats[remoteKey] = {
@@ -245,6 +265,10 @@ local function RecordRemoteCall(remoteKey, method, args, direction)
         stat.sampleArgs = SerializeArgs(args)
     end
 end
+
+-- ============================================================
+-- PARSER
+-- ============================================================
 
 local function ParseEvent(remoteName, args)
     if CONFIG.Mode ~= "produce" then return end
@@ -277,6 +301,10 @@ local function ParseEvent(remoteName, args)
     end)
 end
 
+-- ============================================================
+-- THROTTLE
+-- ============================================================
+
 local function CanLog(remoteKey)
     local now = time()
     if not LastLogTime[remoteKey] or now - LastLogTime[remoteKey] >= CONFIG.LogThrottle then
@@ -287,7 +315,7 @@ local function CanLog(remoteKey)
 end
 
 -- ============================================================
--- NAMECALL HOOK
+-- NAMECALL HOOK (vararg-safe)
 -- ============================================================
 
 local function InstallNamecallHook()
@@ -314,16 +342,19 @@ local function InstallNamecallHook()
         if type(setreadonly) == "function" then setreadonly(mt, false) end
     end)
 
+    -- '...' ловим СРАЗУ в теле vararg-функции
     local hookFunc = function(self, ...)
+        local varargs = {...}
+        local nargs = select("#", ...)
+
         if InHook then
-            return OriginalNamecall(self, ...)
+            return OriginalNamecall(self, unpack(varargs, 1, nargs))
         end
         InHook = true
 
         local result
         local ok, err = pcall(function()
             local method = getnamecallmethod()
-            local args = {...}
 
             local isRemote = false
             pcall(function()
@@ -336,33 +367,33 @@ local function InstallNamecallHook()
                 if not ShouldIgnore(remoteKey) then
                     local direction = "unknown"
                     if method == "FireServer" or method == "InvokeServer" then
-                        direction = "C→S"
+                        direction = "C->S"
                     elseif method == "FireClient" then
-                        direction = "S→C"
+                        direction = "S->C"
                     end
 
-                    RecordRemoteCall(remoteKey, method, args, direction)
+                    RecordRemoteCall(remoteKey, method, varargs, direction)
 
                     if CONFIG.Mode == "discover" then
                         if CanLog(remoteKey) then
                             LogDebug(string.format("[%s] %s:%s %s",
-                                direction, remoteKey, method, SerializeArgs(args)))
+                                direction, remoteKey, method, SerializeArgs(varargs)))
                         end
                     end
 
                     if CONFIG.Mode == "produce" then
-                        ParseEvent(remoteKey, args)
+                        ParseEvent(remoteKey, varargs)
                     end
                 end
             end
 
-            result = OriginalNamecall(self, ...)
+            result = OriginalNamecall(self, unpack(varargs, 1, nargs))
         end)
 
         InHook = false
 
         if not ok then
-            return OriginalNamecall(self, ...)
+            return OriginalNamecall(self, unpack(varargs, 1, nargs))
         end
         return result
     end
@@ -423,10 +454,10 @@ local function InstallListeners()
                     local args = {...}
                     local remoteKey = SafeGetName(remote)
                     if ShouldIgnore(remoteKey) then return end
-                    RecordRemoteCall(remoteKey, "OnClientEvent", args, "S→C")
+                    RecordRemoteCall(remoteKey, "OnClientEvent", args, "S->C")
                     if CONFIG.Mode == "discover" then
                         if CanLog(remoteKey) then
-                            LogDebug(string.format("[S→C] %s %s",
+                            LogDebug(string.format("[S->C] %s %s",
                                 remoteKey, SerializeArgs(args)))
                         end
                     end
@@ -571,7 +602,7 @@ local function CreateGUI()
     TitleLabel.Size = UDim2.new(1, -70, 1, 0)
     TitleLabel.Position = UDim2.new(0, 10, 0, 0)
     TitleLabel.BackgroundTransparency = 1
-    TitleLabel.Text = "JJS Remote Interceptor"
+    TitleLabel.Text = "JJS Remote Interceptor v" .. JJS_VERSION
     TitleLabel.TextColor3 = Color3.new(1, 1, 1)
     TitleLabel.TextSize = 15
     TitleLabel.Font = Enum.Font.GothamBold
@@ -842,15 +873,14 @@ _G.JJS_RemoteInterceptor_Cleanup = function()
     DoStop()
 end
 
--- GUI создаётся в конце, внутри pcall
 CreateGUI()
 
-print("[JJS REMOTE] v2.2 loaded OK")
+print("[JJS REMOTE] v" .. JJS_VERSION .. " loaded OK")
 
-end) -- конец pcall
+end)
 
 -- ============================================================
--- ЕСЛИ ВСЁ-ТАКИ УПАЛО: печатаем РЕАЛЬНУЮ ошибку с номером строки
+-- ERROR REPORT
 -- ============================================================
 
 if not OK then
