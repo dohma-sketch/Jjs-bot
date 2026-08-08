@@ -1,0 +1,1073 @@
+local OK, ERR = pcall(function()
+
+-- ============================================================
+-- SERVICES / CONFIG
+-- ============================================================
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VIM = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then LocalPlayer = Players.PlayerAdded:Wait() end
+
+local CONFIG = {
+    Keys = {
+        Dash = Enum.KeyCode.Q,
+        Block = Enum.KeyCode.F,
+        Awaken = Enum.KeyCode.G,
+        Skill = Enum.KeyCode.Z,
+        Move = Enum.KeyCode.D,
+    },
+    Combat = { AttackRange = 9, SkillRange = 30, ChaseRange = 40 },
+    Movement = { OrbitDist = 8, WallCheckDist = 15 },
+}
+
+local SETTINGS = {
+    AutoCombat = true,
+    AutoDodge = true,
+    DodgeOnDash = true,
+    PunishAfterBlock = true,
+    EvadeAwakened = true,
+    ThreatAwareness = true,
+    AutoSwitchTarget = true,
+    ThreatRange = 45,
+    UseHeal = false,
+    SmartAwaken = true,
+    AwakenScoreThreshold = 50,
+    AwakenDuration = 30,
+    MyCharacter = "Default",
+    Debug = false,
+}
+
+local State = {
+    lastTargetSwitch = 0,
+    preHitHealth = 0, hitTrackAt = 0,
+    lastCancel = 0, lastHeal = 0,
+    prevEnemyBlocking = false, blockSeenAt = 0,
+}
+local MainState = { incapacitatedSince = 0 }
+
+local function LogDebug(msg)
+    if SETTINGS.Debug then print("[BOT] " .. tostring(msg)) end
+end
+
+-- ============================================================
+-- UTILS
+-- ============================================================
+local function IsAlive(char)
+    if not char then return false end
+    local hum = char:FindFirstChild("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function GetHealth(char)
+    local hum = char and char:FindFirstChild("Humanoid")
+    if hum then return hum.Health end
+    return nil
+end
+
+local function PredictPosition(root, dist)
+    if not root then return nil end
+    local vel = root.AssemblyLinearVelocity or root.Velocity or Vector3.new()
+    local lead = math.min(dist * 0.02, 0.4)
+    return root.Position + vel * lead
+end
+
+local function MakeLookCFrame(pos, lookAt)
+    local dir = lookAt - pos
+    if dir.Magnitude < 0.001 then return CFrame.new(pos) end
+    return CFrame.new(pos, pos + Vector3.new(dir.X, 0, dir.Z))
+end
+
+-- ============================================================
+-- TIMER
+-- ============================================================
+local TimerQueue = {}
+local function TimerDelay(dur, fn)
+    table.insert(TimerQueue, {at = time() + dur, fn = fn})
+end
+local function TimerTick()
+    local now = time()
+    for i = #TimerQueue, 1, -1 do
+        local t = TimerQueue[i]
+        if now >= t.at then
+            table.remove(TimerQueue, i)
+            pcall(t.fn)
+        end
+    end
+end
+
+-- ============================================================
+-- INPUT
+-- ============================================================
+local InputSystem = {}
+function InputSystem:SendKey(key, down)
+    pcall(function() VIM:SendKeyEvent(down, key, false, game) end)
+end
+function InputSystem:PressKeySafe(key, dur)
+    self:SendKey(key, true)
+    TimerDelay(dur, function() InputSystem:SendKey(key, false) end)
+end
+function InputSystem:Click(dur)
+    pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0) end)
+    TimerDelay(dur or 0.08, function()
+        pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
+    end)
+end
+
+-- ============================================================
+-- ACTION MANAGER
+-- ============================================================
+local ActionManager = { current = nil, priority = {
+    SURVIVAL = 100, DEFENSE = 80, BLOCK_BREAK = 60, FLANK = 50, OFFENSE = 30, MOVEMENT = 10,
+}}
+function ActionManager:Begin(name, dur, prio, lockMove)
+    if self.current and self.current.priority > prio then return false, self.current.id end
+    local id = math.random(1, 999999)
+    self.current = {name = name, id = id, priority = prio, lockMove = lockMove, untilT = time() + dur}
+    return true, id
+end
+function ActionManager:End(name)
+    if self.current and self.current.name == name then self.current = nil end
+end
+function ActionManager:IsMovementLocked()
+    return self.current and self.current.lockMove and time() < self.current.untilT
+end
+function ActionManager:Tick()
+    if self.current and time() > self.current.untilT then self.current = nil end
+end
+
+-- ============================================================
+-- RESOURCES
+-- ============================================================
+local Resources = { cds = {}, dur = { SideDash = 1.2, ForwardDash = 1.5, Awaken = 60 } }
+function Resources:Use(name) self.cds[name] = time() + (self.dur[name] or 1) end
+function Resources:IsReady(name) return time() >= (self.cds[name] or 0) end
+
+-- ============================================================
+-- COMBAT FEED
+-- ============================================================
+local Feed = {
+    attack = {time = 0, char = nil, kind = nil},
+    skill = {time = 0, char = nil, service = nil},
+    dash = {time = 0, char = nil, dir = nil},
+    block = {start = 0, stop = 0, char = nil, active = false},
+    awaken = {time = 0, char = nil},
+    domain = {time = 0, char = nil},
+    counter = {time = 0, char = nil},
+    hitboxTime = 0, hitboxChar = nil,
+    skillStartup = 0, skillStartupChar = nil,
+    perChar = {},
+    last = {cat = "-", service = "-", effect = "-"},
+}
+_G.JJS_Feed = Feed
+
+local feedConnections = {}
+local function feedHook(remote, fn)
+    local ok, conn = pcall(function() return remote.OnClientEvent:Connect(fn) end)
+    if ok and conn then table.insert(feedConnections, conn) end
+end
+
+local function pickChar(...)
+    for i = 1, select("#", ...) do
+        local a = select(i, ...)
+        if type(a) == "userdata" then
+            local ok, isModel = pcall(function() return a:IsA("Model") end)
+            if ok and isModel then return a end
+        end
+    end
+    return nil
+end
+
+local function classify(serviceName, effectType)
+    local s = tostring(serviceName):lower()
+    local e = tostring(effectType):lower()
+    if string.find(s, "movement") then return "dash" end
+    if string.find(s, "block") then return "block" end
+    if string.find(e, "dash") then return "dash" end
+    if string.find(s, "domain") or string.find(s, "void") or string.find(s, "shrine")
+       or string.find(s, "palace") or string.find(e, "domain") or string.find(e, "barrier") then
+        return "domain"
+    end
+    if string.find(e, "hit") or string.find(e, "swing") or string.find(e, "slash")
+       or string.find(e, "kick") or string.find(e, "strike") or string.find(e, "punch")
+       or string.find(e, "blackflash") or string.find(e, "combo") then
+        return "attack"
+    end
+    if string.find(e, "counter") then return "counter" end
+    if string.find(e, "awaken") then return "awaken" end
+    if string.find(e, "startup") or string.find(e, "start") or string.find(e, "charge") then
+        return "skillstart"
+    end
+    return "skill"
+end
+
+local function route(cat, who, svcName, effectType)
+    local now = time()
+    Feed.last.cat = cat; Feed.last.service = svcName; Feed.last.effect = tostring(effectType)
+
+    if who then
+        local pc = Feed.perChar[who]
+        if not pc then pc = {attack = 0, skill = 0, dash = 0, block = 0, startup = 0}; Feed.perChar[who] = pc end
+        if cat == "attack" then
+            pc.attack = now
+        elseif cat == "skill" or cat == "skillstart" then
+            pc.skill = now
+            if cat == "skillstart" then pc.startup = now end   -- FIX 1
+        elseif cat == "dash" then
+            pc.dash = now
+        elseif cat == "block" then
+            pc.block = now
+        end
+    end
+
+    if cat == "attack" then
+        Feed.attack.time = now; Feed.attack.char = who; Feed.attack.kind = tostring(effectType)
+    elseif cat == "block" then
+        Feed.block.start = now; Feed.block.active = true; Feed.block.char = who
+    elseif cat == "blockend" then                                   -- FIX 2
+        if Feed.block.char == who then
+            Feed.block.active = false
+            Feed.block.stop = now
+        end
+    elseif cat == "dash" then
+        Feed.dash.time = now; Feed.dash.char = who; Feed.dash.dir = tostring(effectType)
+    elseif cat == "awaken" then
+        Feed.awaken.time = now; Feed.awaken.char = who
+    elseif cat == "domain" then
+        Feed.domain.time = now; Feed.domain.char = who
+    elseif cat == "counter" then
+        Feed.counter.time = now; Feed.counter.char = who
+    elseif cat == "hitbox" then
+        Feed.hitboxTime = now; Feed.hitboxChar = who
+        Feed.attack.time = now; Feed.attack.char = who; Feed.attack.kind = "hitbox"
+    elseif cat == "skillstart" then
+        Feed.skillStartup = now; Feed.skillStartupChar = who
+        Feed.skill.time = now; Feed.skill.char = who; Feed.skill.service = svcName
+    else
+        Feed.skill.time = now; Feed.skill.char = who; Feed.skill.service = svcName
+    end
+end
+
+pcall(function()
+    local Services = RS.Knit.Knit.Services
+    for _, svc in pairs(Services:GetChildren()) do
+        local svcName = svc.Name
+        if svcName ~= "AntiCheatService" then
+            local RE = svc:FindFirstChild("RE")
+            if RE then
+                local effects = RE:FindFirstChild("Effects")
+                if effects then
+                    feedHook(effects, function(effectType, ...)
+                        route(classify(svcName, effectType), pickChar(...), svcName, effectType)
+                    end)
+                end
+                local hitbox = RE:FindFirstChild("Hitbox")
+                if hitbox then
+                    feedHook(hitbox, function(...)
+                        route("hitbox", pickChar(...), svcName, "hitbox")
+                    end)
+                end
+            end
+        end
+    end
+    local function svcRE(n) local s = Services:FindFirstChild(n) return s and s:FindFirstChild("RE") end
+    local blockRE = svcRE("BlockService")
+    if blockRE then
+        local act = blockRE:FindFirstChild("Activated")
+        local deact = blockRE:FindFirstChild("Deactivated")
+        if act then feedHook(act, function(...) route("block", pickChar(...), "BlockService", "start") end) end
+        if deact then feedHook(deact, function(...) route("blockend", pickChar(...), "BlockService", "end") end) end
+    end
+    local customRE = svcRE("CustomService")
+    if customRE then
+        local melee = customRE:FindFirstChild("Melee")
+        local awaken = customRE:FindFirstChild("Awaken")
+        if melee then feedHook(melee, function(...) route("attack", pickChar(...), "CustomService", "melee") end) end
+        if awaken then feedHook(awaken, function(...) route("awaken", pickChar(...), "CustomService", "awaken") end) end
+    end
+    local moveRE = svcRE("MovementService")
+    if moveRE then
+        local dash = moveRE:FindFirstChild("Dash")
+        if dash then feedHook(dash, function(dir, ...) route("dash", pickChar(...) or LocalPlayer.Character, "MovementService", dir) end) end
+    end
+    local domainRE = svcRE("DomainService")
+    if domainRE then
+        local act = domainRE:FindFirstChild("Activated")
+        if act then feedHook(act, function(...) route("domain", pickChar(...), "DomainService", "domain") end) end
+    end
+end)
+
+-- ============================================================
+-- WALL AWARENESS (FIX 3: useCache)
+-- ============================================================
+local WallAwareness = { lastScan = 0, cache = nil }
+local BAD_NAMES = {"debree","debris","prop","item","projectile","effect","particle","vfx","weapon","soda"}
+local function IsRealWall(result)
+    if not result then return false end
+    local inst = result.Instance
+    local name = string.lower(inst.Name)
+    for _, bad in pairs(BAD_NAMES) do
+        if string.find(name, bad, 1, true) then return false end
+    end
+    local ok, size = pcall(function() return inst.Size end)
+    if not ok then return false end
+    if size.Y >= 6 then return true end
+    if size.Magnitude >= 12 then return true end
+    return false
+end
+local function WallParams()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local chars = {}
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr.Character then table.insert(chars, plr.Character) end
+    end
+    params.FilterDescendantsInstances = chars
+    return params
+end
+function WallAwareness:GetInfo(rootPart, useCache)
+    local now = time()
+    if useCache ~= false and self.cache and (now - self.lastScan) < 0.3 then
+        return self.cache
+    end
+    self.lastScan = now
+    local params = WallParams()
+    local origin = rootPart.Position + Vector3.new(0, 2, 0)
+    local checkDist = CONFIG.Movement.WallCheckDist
+    local openCount = 0
+    for i = 0, 7 do
+        local ang = math.rad(i * 45)
+        local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+        local hit = Workspace:Raycast(origin, dir * checkDist, params)
+        if not IsRealWall(hit) then openCount = openCount + 1 end
+    end
+    self.cache = { openDirections = openCount, cornered = openCount <= 2, wallsAround = 8 - openCount }
+    return self.cache
+end
+function WallAwareness:FindEscapeDirection(rootPart)
+    local params = WallParams()
+    local origin = rootPart.Position + Vector3.new(0, 2, 0)
+    local checkDist = CONFIG.Movement.WallCheckDist
+    local best = nil; local bestDist = 0
+    for i = 0, 7 do
+        local ang = math.rad(i * 45)
+        local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+        local hit = Workspace:Raycast(origin, dir * checkDist, params)
+        if not IsRealWall(hit) and checkDist > bestDist then
+            bestDist = checkDist; best = dir
+        end
+    end
+    return best
+end
+
+-- ============================================================
+-- PERCEPTION
+-- ============================================================
+local Perception = { target = nil, cache = {} }
+function Perception:UpdateCache(target)
+    local cache = self.cache
+    local now = time()
+    cache.attacking = false; cache.blocking = false; cache.dashing = false
+    cache.awakened = false; cache.stunned = false; cache.countering = false
+
+    local FeedRef = _G.JJS_Feed
+    if FeedRef and target then
+        if FeedRef.attack.char == target and (now - FeedRef.attack.time) < 0.15 then cache.attacking = true end
+        if FeedRef.hitboxChar == target and (now - FeedRef.hitboxTime) < 0.2 then cache.attacking = true end
+        if FeedRef.block.char == target then cache.blocking = FeedRef.block.active end
+        if FeedRef.dash.char == target and (now - FeedRef.dash.time) < 0.15 then cache.dashing = true end
+        if FeedRef.awaken.char == target and (now - FeedRef.awaken.time) < 2 then cache.awakened = true end
+        if FeedRef.counter.char == target and (now - FeedRef.counter.time) < 0.5 then cache.countering = true end
+    end
+
+    if target then
+        local hum = target:FindFirstChild("Humanoid")
+        if hum then
+            cache.stunned = hum:GetState() == Enum.HumanoidStateType.Ragdoll
+                or hum:GetState() == Enum.HumanoidStateType.GettingUp
+        end
+    end
+    return cache
+end
+
+-- ============================================================
+-- THREAT MANAGER
+-- ============================================================
+local ThreatManager = {}
+function ThreatManager:Scan(myRoot)
+    local now = time(); local list = {}
+    local FeedRef = _G.JJS_Feed
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local char = plr.Character
+            local hum = char:FindFirstChild("Humanoid")
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if hum and root and hum.Health > 0 then
+                local dist = (root.Position - myRoot.Position).Magnitude
+                if dist < SETTINGS.ThreatRange then
+                    local pc = (FeedRef and FeedRef.perChar[char]) or nil
+                    local atkT = pc and pc.attack or 0
+                    local sklT = pc and pc.skill or 0
+                    local startT = pc and pc.startup or 0
+                    local attacking = (now - atkT) < 0.35 or (now - sklT) < 0.5
+                    local startingUp = (now - startT) < 0.7
+                    local toUs = myRoot.Position - root.Position
+                    local facing = 0
+                    if toUs.Magnitude > 0.001 then facing = root.CFrame.LookVector:Dot(toUs.Unit) end
+                    local threat = 0
+                    if (attacking or startingUp) and facing > 0.2 then
+                        threat = 100 - dist + facing * 30
+                    elseif dist < 12 and facing > 0.5 then
+                        threat = 50 - dist
+                    end
+                    if threat > 0 then
+                        table.insert(list, {char = char, root = root, dist = dist, threat = threat,
+                            attacking = attacking, predictive = startingUp})
+                    end
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.threat > b.threat end)
+    return list
+end
+function ThreatManager:Top(myRoot)
+    local list = self:Scan(myRoot)
+    return list[1], list
+end
+
+-- ============================================================
+-- DEFENSE
+-- ============================================================
+local function DoDodgeNow(threatRoot, predictive)
+    if not Resources:IsReady("SideDash") then return false end
+    Resources:Use("SideDash")
+    local M = _G.JJS_Metrics
+    if M then
+        M.dodgesUsed = M.dodgesUsed + 1
+        if predictive then M.dodgesSaved = M.dodgesSaved + 1 end
+    end
+
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return false end
+
+    if threatRoot then
+        local away = myRoot.Position - threatRoot.Position
+        away = Vector3.new(away.X, 0, away.Z)
+        if away.Magnitude < 0.001 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+        local perp = Vector3.new(0, 1, 0):Cross(away).Unit
+        if math.random() < 0.5 then perp = -perp end
+        myRoot.CFrame = MakeLookCFrame(myRoot.Position, myRoot.Position + perp)
+        InputSystem:PressKeySafe(CONFIG.Keys.Dash, 0.06)
+    else
+        InputSystem:SendKey(CONFIG.Keys.Move, true)
+        TimerDelay(0.05, function()
+            InputSystem:PressKeySafe(CONFIG.Keys.Dash, 0.06)
+            InputSystem:SendKey(CONFIG.Keys.Move, false)
+        end)
+    end
+    return true
+end
+
+-- ============================================================
+-- SURVIVAL
+-- ============================================================
+local Survival = { lastHideScan = 0, hideSpot = nil, hideScore = 0, mode = "-" }
+local function HasLineOfSight(aRoot, bRoot, params)
+    local from = aRoot.Position + Vector3.new(0, 2, 0)
+    local to = bRoot.Position + Vector3.new(0, 2, 0)
+    local hit = Workspace:Raycast(from, to - from, params)
+    return hit == nil
+end
+local function FindHideSpot(myRoot, enemyRoot, params)
+    local myPos = myRoot.Position; local enemyPos = enemyRoot.Position
+    local up = Vector3.new(0, 2, 0)
+    local best = nil; local bestScore = -math.huge
+    for i = 0, 11 do
+        local ang = math.rad(i * 30)
+        local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
+        local cand = myPos + dir * 12
+        local toCand = Workspace:Raycast(myPos + up, cand - myPos, params)
+        local reachable = (toCand == nil)
+        local los = Workspace:Raycast(enemyPos + up, cand - enemyPos, params)
+        local hidden = (los ~= nil)
+        local score = 0
+        if hidden then score = score + 100 end
+        if reachable then score = score + 50 end
+        score = score + math.min((cand - enemyPos).Magnitude * 0.5, 30)
+        if score > bestScore then bestScore = score; best = cand end
+    end
+    return best, bestScore
+end
+function Survival:Update(ctx)
+    local hum = ctx.myChar:FindFirstChild("Humanoid")
+    if not hum then return end
+    local now = time()
+    local params = WallParams()
+    if now - self.lastHideScan > 0.4 then
+        self.lastHideScan = now
+        self.hideSpot, self.hideScore = FindHideSpot(ctx.myRoot, ctx.tRoot, params)
+    end
+    if ctx.enemyAttacking and ctx.dist < 16 then
+        if Resources:IsReady("SideDash") then
+            self.mode = "DODGE"; DoDodgeNow(ctx.tRoot, false)
+        else
+            self.mode = "BLOCK"
+            InputSystem:SendKey(CONFIG.Keys.Block, true)
+            TimerDelay(0.3, function() InputSystem:SendKey(CONFIG.Keys.Block, false) end)
+        end
+        return
+    end
+    local visible = HasLineOfSight(ctx.tRoot, ctx.myRoot, params)
+    if visible and self.hideSpot and self.hideScore > 120 then
+        self.mode = "HIDE"; hum:MoveTo(self.hideSpot); return
+    end
+    if not visible then
+        self.mode = "HIDDEN"
+        if self.hideSpot then hum:MoveTo(self.hideSpot) end
+        return
+    end
+    self.mode = "KITE"
+    local away = ctx.myRoot.Position - ctx.tRoot.Position
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 0.001 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+    hum:MoveTo(ctx.myRoot.Position + away * 12)
+end
+
+-- ============================================================
+-- DOMAIN COUNTER
+-- ============================================================
+local DomainBarrier = { obj = nil }
+pcall(function()
+    Workspace.DescendantAdded:Connect(function(obj)
+        pcall(function()
+            local n = string.lower(obj.Name)
+            if string.find(n, "domain") or string.find(n, "barrier") or string.find(n, "void")
+               or string.find(n, "shrine") or string.find(n, "palace") then
+                DomainBarrier.obj = obj
+            end
+        end)
+    end)
+end)
+local function GetBarrierInfo()
+    local obj = DomainBarrier.obj
+    if not obj or not obj.Parent then DomainBarrier.obj = nil; return nil, 0 end
+    local center, radius
+    pcall(function()
+        if obj:IsA("BasePart") then center = obj.Position; radius = obj.Size.Magnitude / 2
+        else local cf, size = obj:GetBoundingBox(); center = cf.Position; radius = size.Magnitude / 2 end
+    end)
+    return center, radius
+end
+local DomainCounter = { active = false, caster = nil, untilT = 0, lastDodge = 0 }
+function DomainCounter:Detect(myRoot)
+    local now = time()
+    local FeedRef = _G.JJS_Feed
+    if FeedRef and FeedRef.domain and (now - FeedRef.domain.time) < 0.5 then
+        self.caster = FeedRef.domain.char
+        self.untilT = now + 10
+        if not self.active then
+            local M = _G.JJS_Metrics
+            if M then M.domainsSeen = M.domainsSeen + 1 end
+        end
+        self.active = true
+    end
+    if DomainBarrier.obj and DomainBarrier.obj.Parent then
+        self.active = true; self.untilT = now + 2
+    end
+    if now > self.untilT then
+        if self.active then
+            local M = _G.JJS_Metrics
+            if M and IsAlive(LocalPlayer.Character) then M.domainsSurvived = M.domainsSurvived + 1 end
+        end
+        self.active = false; self.caster = nil
+    end
+    return self.active
+end
+function DomainCounter:Escape(ctx)
+    local hum = ctx.myChar:FindFirstChild("Humanoid")
+    if not hum then return end
+    local center, radius = GetBarrierInfo()
+    local away
+    if center then away = ctx.myRoot.Position - center
+    elseif self.caster then
+        local cr = self.caster:FindFirstChild("HumanoidRootPart")
+        away = cr and (ctx.myRoot.Position - cr.Position) or nil
+    end
+    if not away or away.Magnitude < 0.001 then away = Vector3.new(1, 0, 0)
+    else away = Vector3.new(away.X, 0, away.Z).Unit end
+    hum:MoveTo(ctx.myRoot.Position + away * (radius or 30))
+    if Resources:IsReady("ForwardDash") and (time() - self.lastDodge) > 1 then
+        self.lastDodge = time(); Resources:Use("ForwardDash")
+        InputSystem:PressKeySafe(CONFIG.Keys.Dash, 0.06)
+    end
+end
+
+-- ============================================================
+-- SMART AWAKENING
+-- ============================================================
+local Awakening = { isAwakened = false, awakenedAt = 0 }
+function Awakening:Update()
+    if self.isAwakened and (time() - self.awakenedAt) > SETTINGS.AwakenDuration then
+        self.isAwakened = false
+    end
+    return self.isAwakened
+end
+local function ScoreAwaken(ctx)
+    if Awakening.isAwakened then return 0 end
+    if not Resources:IsReady("Awaken") then return 0 end
+    if ctx.incapacitated then return 0 end
+    if not ctx.target then return 0 end
+    local score = 0
+    if ctx.enemyHealthRatio and ctx.enemyHealthRatio < 0.35 and ctx.dist < 25 then score = score + 40 end
+    if ctx.enemyStunned then score = score + 25 end
+    if ctx.myHealthRatio < 0.4 and ctx.enemyAwakened then score = score + 45 end
+    if ctx.myHealthRatio < 0.25 then score = score + 30 end
+    if ctx.enemyHealthRatio and ctx.enemyHealthRatio > 0.8 and ctx.myHealthRatio > 0.6 then score = score - 30 end
+    if ctx.dist > 40 then score = score - 20 end
+    return score
+end
+function Awakening:SmartUpdate(ctx)
+    if not SETTINGS.SmartAwaken then return false end
+    self:Update()
+    if ScoreAwaken(ctx) >= SETTINGS.AwakenScoreThreshold then
+        Resources:Use("Awaken")
+        InputSystem:PressKeySafe(CONFIG.Keys.Awaken, 0.15)
+        self.isAwakened = true; self.awakenedAt = time()
+        local M = _G.JJS_Metrics
+        if M then M.awakensUsed = M.awakensUsed + 1 end
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+-- HIT CONFIRM
+-- ============================================================
+local function StartHitTrack(ctx)
+    State.preHitHealth = GetHealth(ctx.target) or 0
+    State.hitTrackAt = time()
+end
+local function ConfirmHit(ctx)
+    if not State.preHitHealth or State.preHitHealth == 0 then return nil end
+    if (time() - State.hitTrackAt) < 0.15 then return nil end
+    if (time() - State.hitTrackAt) > 1.5 then return nil end
+    local cur = GetHealth(ctx.target)
+    if not cur then return nil end
+    if cur < State.preHitHealth then return true end
+    if ctx.enemyStunned then return true end
+    return false
+end
+
+-- ============================================================
+-- COMBO LIBRARY
+-- ============================================================
+local COMBO_LIBRARY = {
+    Default = { {"M1","M1","Skill"}, {"M1","M1","M1","M1"} },
+    Gojo = { {"M1","M1","Skill"}, {"Skill","M1","M1"} },
+    Sukuna = { {"M1","M1","Skill"}, {"M1","M1","M1","M1"} },
+}
+local function GetComboSequence(ctx)
+    local lib = COMBO_LIBRARY[SETTINGS.MyCharacter] or COMBO_LIBRARY.Default
+    if ctx.enemyStunned or ctx.behindEnemy then
+        return lib[2] or {"M1","M1","M1","M1"}
+    end
+    return lib[1] or {"M1","M1","Skill"}
+end
+
+-- ============================================================
+-- COMBAT EXECUTOR (FIX 6: tool:Activate)
+-- ============================================================
+local CombatExecutor = {}
+function CombatExecutor:M1(ctx)
+    StartHitTrack(ctx)
+    pcall(function()
+        local tool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
+        if tool then tool:Activate() end
+    end)
+    InputSystem:Click(0.08)
+end
+function CombatExecutor:Skill(ctx)
+    InputSystem:PressKeySafe(CONFIG.Keys.Skill, 0.1)
+end
+
+-- ============================================================
+-- PLAN EXECUTOR
+-- ============================================================
+local PlanExecutor = { queue = {}, stepAt = 0 }
+function PlanExecutor:StartPattern(seq)
+    self.queue = seq
+    self.stepAt = 0
+end
+function PlanExecutor:Tick(ctx)
+    if #self.queue == 0 then return false end
+    local now = time()
+    if now < self.stepAt then return true end
+    local step = table.remove(self.queue, 1)
+    self.stepAt = now + 0.25
+    if step == "M1" then CombatExecutor:M1(ctx)
+    elseif step == "Skill" then CombatExecutor:Skill(ctx) end
+    return #self.queue > 0
+end
+
+-- ============================================================
+-- STRATEGY
+-- ============================================================
+local Strategy = {}
+function Strategy:Decide(ctx)
+    local best = nil; local bestScore = 0
+
+    local combo = 0
+    if ctx.dist <= CONFIG.Combat.AttackRange and not ctx.enemyBlocking and not ctx.enemyCountering then
+        combo = 30
+        local hit = ConfirmHit(ctx)
+        if hit == true then combo = combo + 15 end
+        if hit == false then combo = combo - 10 end
+        if ctx.enemyStunned or ctx.behindEnemy then combo = combo + 20 end
+        if ctx.cornered then combo = combo - 15 end
+        if ctx.enemyCornered then combo = combo + 10 end
+        if Awakening.isAwakened then combo = combo + 20 end
+    end
+    if combo > bestScore then bestScore = combo; best = "Combo" end
+
+    local blockBreak = 0
+    if ctx.enemyBlocking and ctx.dist <= CONFIG.Combat.AttackRange then
+        blockBreak = 40
+    end
+    if blockBreak > bestScore then bestScore = blockBreak; best = "BlockBreak" end
+
+    local skill = 0
+    if ctx.dist <= CONFIG.Combat.SkillRange and ctx.hasLOS and not ctx.enemyCountering then
+        skill = 25
+        if ctx.enemyStunned then skill = skill + 10 end
+    end
+    if skill > bestScore then bestScore = skill; best = "Skill" end
+
+    local chase = 0
+    if ctx.dist > CONFIG.Combat.AttackRange and ctx.dist < CONFIG.Combat.ChaseRange then
+        chase = 15
+    end
+    if chase > bestScore then bestScore = chase; best = "Chase" end
+
+    return best
+end
+
+-- ============================================================
+-- MOVEMENT
+-- ============================================================
+local MovementController = { lastMoveTo = 0, stuckSince = 0, lastPos = nil }
+local function MoveTo(hum, pos)
+    local now = time()
+    if now - MovementController.lastMoveTo > 0.08 then
+        MovementController.lastMoveTo = now
+        hum:MoveTo(pos)
+    end
+end
+function MovementController:Update(ctx, hum)
+    if ActionManager:IsMovementLocked() then return end
+    local myRoot = ctx.myRoot
+
+    if ctx.cornered then
+        local esc = WallAwareness:FindEscapeDirection(myRoot)
+        if esc then MoveTo(hum, myRoot.Position + esc * 10) end
+        return
+    end
+
+    if ctx.enemyAwakened and SETTINGS.EvadeAwakened then
+        Survival:Update(ctx)
+        return
+    end
+
+    if MovementController.lastPos then
+        local moved = (myRoot.Position - MovementController.lastPos).Magnitude
+        if moved < 0.5 then
+            if MovementController.stuckSince == 0 then MovementController.stuckSince = time() end
+            if time() - MovementController.stuckSince > 1 then
+                local esc = WallAwareness:FindEscapeDirection(myRoot)
+                if esc then MoveTo(hum, myRoot.Position + esc * 8) end
+                MovementController.stuckSince = 0
+            end
+        else
+            MovementController.stuckSince = 0
+        end
+    end
+    MovementController.lastPos = myRoot.Position
+
+    if not ctx.target then return end
+
+    if ctx.dist > CONFIG.Combat.AttackRange then
+        MoveTo(hum, ctx.tRoot.Position)
+    else
+        local toEnemy = ctx.tRoot.Position - myRoot.Position
+        toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+        if toEnemy.Magnitude > 0.001 then toEnemy = toEnemy.Unit end
+        local side = Vector3.new(0, 1, 0):Cross(toEnemy).Unit
+        local orbitPos = ctx.tRoot.Position - toEnemy * CONFIG.Movement.OrbitDist + side * 3
+        MoveTo(hum, orbitPos)
+    end
+end
+
+-- ============================================================
+-- METRICS + GUI
+-- ============================================================
+local Metrics = {
+    startedAt = time(), deaths = 0, kills = 0,
+    m1Hits = 0, m1Whiffs = 0, dodgesUsed = 0, dodgesSaved = 0,
+    domainsSeen = 0, domainsSurvived = 0, awakensUsed = 0, blocksDone = 0,
+}
+_G.JJS_Metrics = Metrics
+local FightLog = { events = {} }
+_G.JJS_FightLog = FightLog
+function FightLog:Record(ev)
+    ev.t = math.floor(time() - Metrics.startedAt)
+    table.insert(self.events, ev)
+    if #self.events > 800 then table.remove(self.events, 1) end
+end
+function FightLog:Export()
+    local lines = {"=== FIGHT LOG (" .. #self.events .. ") ==="}
+    for _, e in pairs(self.events) do
+        local parts = {}
+        for k, v in pairs(e) do parts[#parts+1] = k .. "=" .. tostring(v) end
+        lines[#lines+1] = table.concat(parts, " ")
+    end
+    if type(setclipboard) == "function" then setclipboard(table.concat(lines, "\n")) end
+    return #self.events
+end
+local function pct(a, b) if b <= 0 then return 0 end return math.floor(a / b * 100) end
+
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local oldGui = PlayerGui:FindFirstChild("JJS_BotGUI")
+if oldGui then oldGui:Destroy() end
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "JJS_BotGUI"; ScreenGui.Parent = PlayerGui
+ScreenGui.ResetOnSpawn = false; ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local Main = Instance.new("Frame")
+Main.Size = UDim2.new(0, 300, 0, 90); Main.Position = UDim2.new(0, 10, 1, -100)
+Main.BackgroundColor3 = Color3.fromRGB(20, 20, 25); Main.BackgroundTransparency = 0.2
+Main.BorderSizePixel = 0; Main.Parent = ScreenGui
+local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(0, 6); mc.Parent = Main
+local StatLbl = Instance.new("TextLabel")
+StatLbl.Size = UDim2.new(1, -10, 0, 40); StatLbl.Position = UDim2.new(0, 5, 0, 5)
+StatLbl.BackgroundTransparency = 1; StatLbl.Text = "loading..."
+StatLbl.TextColor3 = Color3.fromRGB(120, 255, 160); StatLbl.TextSize = 11
+StatLbl.Font = Enum.Font.Code; StatLbl.TextXAlignment = Enum.TextXAlignment.Left
+StatLbl.TextWrapped = true; StatLbl.Parent = Main
+local ExportBtn = Instance.new("TextButton")
+ExportBtn.Size = UDim2.new(0.5, -8, 0, 22); ExportBtn.Position = UDim2.new(0, 5, 1, -28)
+ExportBtn.BackgroundColor3 = Color3.fromRGB(65, 105, 225); ExportBtn.BorderSizePixel = 0
+ExportBtn.Text = "Export log"; ExportBtn.TextColor3 = Color3.new(1,1,1)
+ExportBtn.TextSize = 11; ExportBtn.Font = Enum.Font.Gotham; ExportBtn.Parent = Main
+local ec = Instance.new("UICorner"); ec.CornerRadius = UDim.new(0,4); ec.Parent = ExportBtn
+
+local wasAlive = true
+
+-- ============================================================
+-- MAIN LOOP (FIX 4: death before early-return; FIX 5: offense gate)
+-- ============================================================
+RunService.Heartbeat:Connect(function(dt)
+    pcall(function()
+        TimerTick()
+        ActionManager:Tick()
+
+        local myChar = LocalPlayer.Character
+        local hum0 = myChar and myChar:FindFirstChild("Humanoid")
+        local aliveNow = hum0 and hum0.Health > 0
+
+        -- death detect BEFORE early return
+        if wasAlive and not aliveNow then
+            Metrics.deaths = Metrics.deaths + 1
+            FightLog:Record({type = "DEATH"})
+        end
+        wasAlive = aliveNow
+
+        if not myChar or not aliveNow then return end
+        local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+        local hum = hum0
+        if not myRoot then return end
+
+        local incapacitated = hum:GetState() == Enum.HumanoidStateType.Ragdoll
+        if incapacitated then
+            if MainState.incapacitatedSince == 0 then MainState.incapacitatedSince = time() end
+            local sinceInc = time() - MainState.incapacitatedSince
+            local top0 = ThreatManager:Top(myRoot)
+            local realCombo = top0 and top0.attacking and top0.dist < 15
+            if sinceInc > 0.3 and realCombo and Resources:IsReady("SideDash") then
+                Resources:Use("SideDash")
+                InputSystem:PressKeySafe(CONFIG.Keys.Dash, 0.06)
+            end
+            return
+        else
+            MainState.incapacitatedSince = 0
+        end
+
+        -- target
+        local target = nil; local tRoot = nil; local dist = math.huge
+        local bestD = 60
+        for _, plr in pairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                local tr = plr.Character:FindFirstChild("HumanoidRootPart")
+                local ph = plr.Character:FindFirstChild("Humanoid")
+                if tr and ph and ph.Health > 0 then
+                    local d = (tr.Position - myRoot.Position).Magnitude
+                    if d < bestD then bestD = d; target = plr.Character; tRoot = tr end
+                end
+            end
+        end
+        if not target then return end
+        dist = bestD
+
+        Perception:UpdateCache(target)
+        local cache = Perception.cache
+
+        -- 360 threats
+        if SETTINGS.ThreatAwareness then
+            local top = ThreatManager:Top(myRoot)
+            if top and (top.attacking or top.predictive) and top.dist < 20 then
+                if SETTINGS.AutoSwitchTarget and top.char ~= target and top.threat > 70
+                   and (time() - State.lastTargetSwitch) > 2 then
+                    State.lastTargetSwitch = time()
+                    target = top.char; tRoot = top.root; dist = top.dist
+                    Perception:UpdateCache(target)
+                    cache = Perception.cache
+                end
+                if SETTINGS.AutoDodge and DoDodgeNow(top.root, top.predictive) then
+                    return
+                end
+            end
+        end
+
+        -- context
+        local myWall = WallAwareness:GetInfo(myRoot)
+        local enemyWall = tRoot and WallAwareness:GetInfo(tRoot, false) or nil   -- FIX 3
+        local hasLOS = true
+        pcall(function()
+            local params = WallParams()
+            local from = myRoot.Position + Vector3.new(0, 2, 0)
+            local to = tRoot.Position + Vector3.new(0, 2, 0)
+            hasLOS = Workspace:Raycast(from, to - from, params) == nil
+        end)
+        local behindEnemy = false
+        pcall(function()
+            local toMe = (myRoot.Position - tRoot.Position).Unit
+            behindEnemy = tRoot.CFrame.LookVector:Dot(toMe) > 0.5
+        end)
+
+        local ctx = {
+            myChar = myChar, myRoot = myRoot, target = target, tRoot = tRoot, dist = dist,
+            incapacitated = incapacitated,
+            myHealthRatio = hum.Health / hum.MaxHealth,
+            enemyHealthRatio = (function()
+                local eh = GetHealth(target)
+                local eh2 = target:FindFirstChild("Humanoid")
+                if eh and eh2 then return eh / eh2.MaxHealth end
+                return 1
+            end)(),
+            enemyAttacking = cache.attacking, enemyBlocking = cache.blocking,
+            enemyDashing = cache.dashing, enemyAwakened = cache.awakened,
+            enemyStunned = cache.stunned, enemyCountering = cache.countering,
+            cornered = myWall.cornered, enemyCornered = enemyWall and enemyWall.cornered or false,
+            hasLOS = hasLOS, behindEnemy = behindEnemy,
+            sideDashReady = Resources:IsReady("SideDash"),
+        }
+
+        -- domain
+        if DomainCounter:Detect(myRoot) then
+            DomainCounter:Escape(ctx)
+            return
+        end
+
+        -- awaken
+        Awakening:SmartUpdate(ctx)
+
+        -- punish on block end
+        if SETTINGS.PunishAfterBlock then
+            if ctx.enemyBlocking then
+                State.blockSeenAt = time(); State.prevEnemyBlocking = true
+            elseif State.prevEnemyBlocking and (time() - State.blockSeenAt) < 1
+                and ctx.dist <= CONFIG.Combat.AttackRange and not ctx.enemyCountering then
+                State.prevEnemyBlocking = false
+                PlanExecutor:StartPattern(GetComboSequence(ctx))
+            else
+                State.prevEnemyBlocking = false
+            end
+        end
+
+        -- decide + execute (FIX 5: no offense while evading awakened)
+        if SETTINGS.AutoCombat
+           and not (ctx.enemyAwakened and SETTINGS.EvadeAwakened) then
+            if PlanExecutor:Tick(ctx) then
+                -- combo running
+            else
+                local action = Strategy:Decide(ctx)
+                if action == "Combo" then
+                    PlanExecutor:StartPattern(GetComboSequence(ctx))
+                elseif action == "BlockBreak" then
+                    CombatExecutor:Skill(ctx)
+                    Metrics.blocksDone = Metrics.blocksDone + 1
+                elseif action == "Skill" then
+                    CombatExecutor:Skill(ctx)
+                end
+            end
+        end
+
+        -- movement
+        MovementController:Update(ctx, hum)
+
+        -- face target
+        if not ActionManager:IsMovementLocked() then
+            local aim = PredictPosition(tRoot, dist)
+            if aim then myRoot.CFrame = MakeLookCFrame(myRoot.Position, aim) end
+        end
+
+        -- kill detect
+        if GetHealth(target) == 0 then
+            Metrics.kills = Metrics.kills + 1
+            FightLog:Record({type = "KILL", vs = target.Name})
+        end
+    end)
+end)
+
+-- overlay update
+local lastUpd = 0
+RunService.Heartbeat:Connect(function()
+    local now = time()
+    if now - lastUpd < 1 then return end
+    lastUpd = now
+    pcall(function()
+        StatLbl.Text = string.format(
+            "K/D %d/%d | M1 %d%% | Dodge %d%% | Dom %d%% | AW %d | Blk %d",
+            Metrics.kills, Metrics.deaths,
+            pct(Metrics.m1Hits, Metrics.m1Hits + Metrics.m1Whiffs),
+            pct(Metrics.dodgesSaved, Metrics.dodgesUsed),
+            pct(Metrics.domainsSurvived, Metrics.domainsSeen),
+            Metrics.awakensUsed, Metrics.blocksDone)
+    end)
+end)
+
+ExportBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        local n = FightLog:Export()
+        ExportBtn.Text = "Copied " .. n
+        wait(1.5)
+        ExportBtn.Text = "Export log"
+    end)
+end)
+
+-- cleanup
+if _G.JJS_Bot_Cleanup then pcall(_G.JJS_Bot_Cleanup) end
+_G.JJS_Bot_Cleanup = function()
+    for _, c in pairs(feedConnections) do pcall(function() c:Disconnect() end) end
+    if ScreenGui then ScreenGui:Destroy() end
+end
+
+print("[BOT] v17 assembled ready")
+end)
+
+if not OK then
+    warn("[BOT] FATAL: " .. tostring(ERR))
+    print("[BOT] FATAL: " .. tostring(ERR))
+end
