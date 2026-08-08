@@ -8,6 +8,7 @@ local Workspace = game:GetService("Workspace")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local VIM = game:GetService("VirtualInputManager")
+local PathS = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then LocalPlayer = Players.PlayerAdded:Wait() end
@@ -18,40 +19,39 @@ local CONFIG = {
         Block = Enum.KeyCode.F,
         Awaken = Enum.KeyCode.G,
         Skill = Enum.KeyCode.Z,
+        Skill2 = Enum.KeyCode.X,
         Move = Enum.KeyCode.D,
+        Jump = Enum.KeyCode.Space,
     },
-    Combat = { AttackRange = 9, SkillRange = 30, ChaseRange = 40 },
-    Movement = { OrbitDist = 8, WallCheckDist = 15 },
+    Combat = { AttackRange = 7, SkillRange = 30, ChaseRange = 45 },
+    Movement = { OrbitDist = 6, WallCheckDist = 15 },
 }
 
 local SETTINGS = {
     AutoCombat = true,
     AutoDodge = true,
-    DodgeOnDash = true,
     PunishAfterBlock = true,
     EvadeAwakened = true,
     ThreatAwareness = true,
     AutoSwitchTarget = true,
     ThreatRange = 45,
-    UseHeal = false,
-    SmartAwaken = true,
-    AwakenScoreThreshold = 50,
-    AwakenDuration = 30,
+    UseHeal = false, HealThreshold = 0.5, HealCD = 8, HealKey = Enum.KeyCode.Four,
+    SmartAwaken = true, AwakenScoreThreshold = 50, AwakenDuration = 30,
     MyCharacter = "Default",
+    Pathfind = true,
+    UseJump = true,
     Debug = false,
 }
 
 local State = {
-    lastTargetSwitch = 0,
-    preHitHealth = 0, hitTrackAt = 0,
+    lastTargetSwitch = 0, preHitHealth = 0, hitTrackAt = 0,
     lastCancel = 0, lastHeal = 0,
     prevEnemyBlocking = false, blockSeenAt = 0,
+    lastKillTarget = nil, orbitDir = 1,
 }
 local MainState = { incapacitatedSince = 0 }
 
-local function LogDebug(msg)
-    if SETTINGS.Debug then print("[BOT] " .. tostring(msg)) end
-end
+local function LogDebug(m) if SETTINGS.Debug then print("[BOT] " .. tostring(m)) end end
 
 -- ============================================================
 -- UTILS
@@ -61,20 +61,21 @@ local function IsAlive(char)
     local hum = char:FindFirstChild("Humanoid")
     return hum and hum.Health > 0
 end
-
 local function GetHealth(char)
     local hum = char and char:FindFirstChild("Humanoid")
     if hum then return hum.Health end
     return nil
 end
-
+local function GetBoolAttr(obj, name)
+    if not obj then return false end
+    local ok, v = pcall(function() return obj:GetAttribute(name) end)
+    return ok and v == true
+end
 local function PredictPosition(root, dist)
     if not root then return nil end
     local vel = root.AssemblyLinearVelocity or root.Velocity or Vector3.new()
-    local lead = math.min(dist * 0.02, 0.4)
-    return root.Position + vel * lead
+    return root.Position + vel * math.min(dist * 0.02, 0.4)
 end
-
 local function MakeLookCFrame(pos, lookAt)
     local dir = lookAt - pos
     if dir.Magnitude < 0.001 then return CFrame.new(pos) end
@@ -85,22 +86,17 @@ end
 -- TIMER
 -- ============================================================
 local TimerQueue = {}
-local function TimerDelay(dur, fn)
-    table.insert(TimerQueue, {at = time() + dur, fn = fn})
-end
+local function TimerDelay(dur, fn) table.insert(TimerQueue, {at = time() + dur, fn = fn}) end
 local function TimerTick()
     local now = time()
     for i = #TimerQueue, 1, -1 do
         local t = TimerQueue[i]
-        if now >= t.at then
-            table.remove(TimerQueue, i)
-            pcall(t.fn)
-        end
+        if now >= t.at then table.remove(TimerQueue, i); pcall(t.fn) end
     end
 end
 
 -- ============================================================
--- INPUT
+-- INPUT (FIX 1,30: mouse1click + jump)
 -- ============================================================
 local InputSystem = {}
 function InputSystem:SendKey(key, down)
@@ -110,19 +106,23 @@ function InputSystem:PressKeySafe(key, dur)
     self:SendKey(key, true)
     TimerDelay(dur, function() InputSystem:SendKey(key, false) end)
 end
-function InputSystem:Click(dur)
+function InputSystem:Click()
+    if type(mouse1click) == "function" then pcall(mouse1click); return end
+    if type(click) == "function" then pcall(click); return end
     pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0) end)
-    TimerDelay(dur or 0.08, function()
+    TimerDelay(0.08, function()
         pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
     end)
 end
+function InputSystem:Jump()
+    if SETTINGS.UseJump then self:PressKeySafe(CONFIG.Keys.Jump, 0.1) end
+end
 
 -- ============================================================
--- ACTION MANAGER
+-- ACTION MANAGER / RESOURCES (FIX 20: skill CD)
 -- ============================================================
 local ActionManager = { current = nil, priority = {
-    SURVIVAL = 100, DEFENSE = 80, BLOCK_BREAK = 60, FLANK = 50, OFFENSE = 30, MOVEMENT = 10,
-}}
+    SURVIVAL = 100, DEFENSE = 80, BLOCK_BREAK = 60, OFFENSE = 30, MOVEMENT = 10 }}
 function ActionManager:Begin(name, dur, prio, lockMove)
     if self.current and self.current.priority > prio then return false, self.current.id end
     local id = math.random(1, 999999)
@@ -139,12 +139,9 @@ function ActionManager:Tick()
     if self.current and time() > self.current.untilT then self.current = nil end
 end
 
--- ============================================================
--- RESOURCES
--- ============================================================
-local Resources = { cds = {}, dur = { SideDash = 1.2, ForwardDash = 1.5, Awaken = 60 } }
-function Resources:Use(name) self.cds[name] = time() + (self.dur[name] or 1) end
-function Resources:IsReady(name) return time() >= (self.cds[name] or 0) end
+local Resources = { cds = {}, dur = { SideDash = 1.2, ForwardDash = 1.5, Awaken = 60, Skill = 2 } }
+function Resources:Use(n) self.cds[n] = time() + (self.dur[n] or 1) end
+function Resources:IsReady(n) return time() >= (self.cds[n] or 0) end
 
 -- ============================================================
 -- COMBAT FEED
@@ -198,7 +195,8 @@ local function classify(serviceName, effectType)
     end
     if string.find(e, "counter") then return "counter" end
     if string.find(e, "awaken") then return "awaken" end
-    if string.find(e, "startup") or string.find(e, "start") or string.find(e, "charge") then
+    -- FIX 12: только явные windup-слова, без "start/charge" ложных
+    if string.find(e, "startup") or string.find(e, "windup") or string.find(e, "build") then
         return "skillstart"
     end
     return "skill"
@@ -207,31 +205,22 @@ end
 local function route(cat, who, svcName, effectType)
     local now = time()
     Feed.last.cat = cat; Feed.last.service = svcName; Feed.last.effect = tostring(effectType)
-
     if who then
         local pc = Feed.perChar[who]
         if not pc then pc = {attack = 0, skill = 0, dash = 0, block = 0, startup = 0}; Feed.perChar[who] = pc end
-        if cat == "attack" then
-            pc.attack = now
+        if cat == "attack" then pc.attack = now
         elseif cat == "skill" or cat == "skillstart" then
             pc.skill = now
-            if cat == "skillstart" then pc.startup = now end   -- FIX 1
-        elseif cat == "dash" then
-            pc.dash = now
-        elseif cat == "block" then
-            pc.block = now
-        end
+            if cat == "skillstart" then pc.startup = now end
+        elseif cat == "dash" then pc.dash = now
+        elseif cat == "block" then pc.block = now end
     end
-
     if cat == "attack" then
         Feed.attack.time = now; Feed.attack.char = who; Feed.attack.kind = tostring(effectType)
     elseif cat == "block" then
         Feed.block.start = now; Feed.block.active = true; Feed.block.char = who
-    elseif cat == "blockend" then                                   -- FIX 2
-        if Feed.block.char == who then
-            Feed.block.active = false
-            Feed.block.stop = now
-        end
+    elseif cat == "blockend" then
+        if Feed.block.char == who then Feed.block.active = false; Feed.block.stop = now end
     elseif cat == "dash" then
         Feed.dash.time = now; Feed.dash.char = who; Feed.dash.dir = tostring(effectType)
     elseif cat == "awaken" then
@@ -266,9 +255,7 @@ pcall(function()
                 end
                 local hitbox = RE:FindFirstChild("Hitbox")
                 if hitbox then
-                    feedHook(hitbox, function(...)
-                        route("hitbox", pickChar(...), svcName, "hitbox")
-                    end)
+                    feedHook(hitbox, function(...) route("hitbox", pickChar(...), svcName, "hitbox") end)
                 end
             end
         end
@@ -301,7 +288,7 @@ pcall(function()
 end)
 
 -- ============================================================
--- WALL AWARENESS (FIX 3: useCache)
+-- WALL AWARENESS (FIX 16,17,18: меньше ложных углов, детект края, лучший побег)
 -- ============================================================
 local WallAwareness = { lastScan = 0, cache = nil }
 local BAD_NAMES = {"debree","debris","prop","item","projectile","effect","particle","vfx","weapon","soda"}
@@ -314,8 +301,8 @@ local function IsRealWall(result)
     end
     local ok, size = pcall(function() return inst.Size end)
     if not ok then return false end
-    if size.Y >= 6 then return true end
-    if size.Magnitude >= 12 then return true end
+    if size.Y >= 8 then return true end        -- выше порог
+    if size.Magnitude >= 16 then return true end
     return false
 end
 local function WallParams()
@@ -328,11 +315,14 @@ local function WallParams()
     params.FilterDescendantsInstances = chars
     return params
 end
+local function IsEdgeAhead(rootPart, dir)
+    local from = rootPart.Position + dir * 4 + Vector3.new(0, 1, 0)
+    local hit = Workspace:Raycast(from, Vector3.new(0, -12, 0), WallParams())
+    return hit == nil
+end
 function WallAwareness:GetInfo(rootPart, useCache)
     local now = time()
-    if useCache ~= false and self.cache and (now - self.lastScan) < 0.3 then
-        return self.cache
-    end
+    if useCache ~= false and self.cache and (now - self.lastScan) < 0.3 then return self.cache end
     self.lastScan = now
     local params = WallParams()
     local origin = rootPart.Position + Vector3.new(0, 2, 0)
@@ -342,9 +332,11 @@ function WallAwareness:GetInfo(rootPart, useCache)
         local ang = math.rad(i * 45)
         local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
         local hit = Workspace:Raycast(origin, dir * checkDist, params)
-        if not IsRealWall(hit) then openCount = openCount + 1 end
+        if not IsRealWall(hit) and not IsEdgeAhead(rootPart, dir) then
+            openCount = openCount + 1
+        end
     end
-    self.cache = { openDirections = openCount, cornered = openCount <= 2, wallsAround = 8 - openCount }
+    self.cache = { openDirections = openCount, cornered = openCount <= 1, wallsAround = 8 - openCount }
     return self.cache
 end
 function WallAwareness:FindEscapeDirection(rootPart)
@@ -356,50 +348,91 @@ function WallAwareness:FindEscapeDirection(rootPart)
         local ang = math.rad(i * 45)
         local dir = Vector3.new(math.cos(ang), 0, math.sin(ang))
         local hit = Workspace:Raycast(origin, dir * checkDist, params)
-        if not IsRealWall(hit) and checkDist > bestDist then
-            bestDist = checkDist; best = dir
+        local clear = not IsRealWall(hit) and not IsEdgeAhead(rootPart, dir)
+        local d = 0
+        if clear then
+            d = hit and (hit.Position - rootPart.Position).Magnitude or checkDist
         end
+        if clear and d > bestDist then bestDist = d; best = dir end   -- FIX 18: лучший
     end
     return best
 end
 
 -- ============================================================
--- PERCEPTION
+-- PATHFINDING (FIX 2,8: обход стен + прыжок)
+-- ============================================================
+local Pathfinding = { points = {}, idx = 1, computing = false, lastCompute = 0 }
+local function ComputePath(from, to)
+    if Pathfinding.computing then return end
+    Pathfinding.computing = true
+    pcall(function()
+        task.defer(function()
+            local pf = PathS:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true})
+            local ok = pcall(function() pf:ComputeAsync(from, to) end)
+            if ok and pf.Status == Enum.PathStatus.Success then
+                Pathfinding.points = pf:GetWaypoints()
+                Pathfinding.idx = 2
+            else
+                Pathfinding.points = {}
+            end
+            Pathfinding.computing = false
+        end)
+    end)
+end
+local function FollowPath(hum, myRoot)
+    local pts = Pathfinding.points
+    if #pts == 0 then return false end
+    local wp = pts[Pathfinding.idx]
+    if not wp then Pathfinding.points = {}; return false end
+    if wp.Action == Enum.PathWaypointAction.Jump then InputSystem:Jump() end
+    hum:MoveTo(wp.Position)
+    if (myRoot.Position - wp.Position).Magnitude < 4 then
+        Pathfinding.idx = Pathfinding.idx + 1
+    end
+    return true
+end
+
+-- ============================================================
+-- PERCEPTION (FIX 5: таймаут блока)
 -- ============================================================
 local Perception = { target = nil, cache = {} }
 function Perception:UpdateCache(target)
     local cache = self.cache
     local now = time()
     cache.attacking = false; cache.blocking = false; cache.dashing = false
-    cache.awakened = false; cache.stunned = false; cache.countering = false
-
-    local FeedRef = _G.JJS_Feed
-    if FeedRef and target then
-        if FeedRef.attack.char == target and (now - FeedRef.attack.time) < 0.15 then cache.attacking = true end
-        if FeedRef.hitboxChar == target and (now - FeedRef.hitboxTime) < 0.2 then cache.attacking = true end
-        if FeedRef.block.char == target then cache.blocking = FeedRef.block.active end
-        if FeedRef.dash.char == target and (now - FeedRef.dash.time) < 0.15 then cache.dashing = true end
-        if FeedRef.awaken.char == target and (now - FeedRef.awaken.time) < 2 then cache.awakened = true end
-        if FeedRef.counter.char == target and (now - FeedRef.counter.time) < 0.5 then cache.countering = true end
+    cache.awakened = false; cache.stunned = false; cache.countering = false; cache.ragdolled = false
+    local F = _G.JJS_Feed
+    if F and target then
+        if F.attack.char == target and (now - F.attack.time) < 0.2 then cache.attacking = true end
+        if F.hitboxChar == target and (now - F.hitboxTime) < 0.25 then cache.attacking = true end
+        if F.block.char == target and F.block.active and (now - F.block.start) < 2 then
+            cache.blocking = true
+        end
+        if F.dash.char == target and (now - F.dash.time) < 0.2 then cache.dashing = true end
+        if F.awaken.char == target and (now - F.awaken.time) < 2 then cache.awakened = true end
+        if F.counter.char == target and (now - F.counter.time) < 0.5 then cache.countering = true end
     end
-
     if target then
         local hum = target:FindFirstChild("Humanoid")
         if hum then
-            cache.stunned = hum:GetState() == Enum.HumanoidStateType.Ragdoll
-                or hum:GetState() == Enum.HumanoidStateType.GettingUp
+            local st = hum:GetState()
+            cache.ragdolled = st == Enum.HumanoidStateType.Ragdoll
+            cache.stunned = cache.ragdolled or st == Enum.HumanoidStateType.GettingUp
         end
     end
     return cache
 end
 
 -- ============================================================
--- THREAT MANAGER
+-- THREAT MANAGER (FIX 15: кеш скана)
 -- ============================================================
-local ThreatManager = {}
+local ThreatManager = { lastScan = 0, cached = nil }
 function ThreatManager:Scan(myRoot)
-    local now = time(); local list = {}
-    local FeedRef = _G.JJS_Feed
+    local now = time()
+    if self.cached and (now - self.lastScan) < 0.1 then return self.cached end
+    self.lastScan = now
+    local list = {}
+    local F = _G.JJS_Feed
     for _, plr in pairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
             local char = plr.Character
@@ -408,12 +441,12 @@ function ThreatManager:Scan(myRoot)
             if hum and root and hum.Health > 0 then
                 local dist = (root.Position - myRoot.Position).Magnitude
                 if dist < SETTINGS.ThreatRange then
-                    local pc = (FeedRef and FeedRef.perChar[char]) or nil
+                    local pc = (F and F.perChar[char]) or nil
                     local atkT = pc and pc.attack or 0
                     local sklT = pc and pc.skill or 0
                     local startT = pc and pc.startup or 0
                     local attacking = (now - atkT) < 0.35 or (now - sklT) < 0.5
-                    local startingUp = (now - startT) < 0.7
+                    local startingUp = (now - startT) < 0.5   -- FIX 13: уже окно
                     local toUs = myRoot.Position - root.Position
                     local facing = 0
                     if toUs.Magnitude > 0.001 then facing = root.CFrame.LookVector:Dot(toUs.Unit) end
@@ -432,6 +465,7 @@ function ThreatManager:Scan(myRoot)
         end
     end
     table.sort(list, function(a, b) return a.threat > b.threat end)
+    self.cached = list
     return list
 end
 function ThreatManager:Top(myRoot)
@@ -450,11 +484,9 @@ local function DoDodgeNow(threatRoot, predictive)
         M.dodgesUsed = M.dodgesUsed + 1
         if predictive then M.dodgesSaved = M.dodgesSaved + 1 end
     end
-
     local myChar = LocalPlayer.Character
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
     if not myRoot then return false end
-
     if threatRoot then
         local away = myRoot.Position - threatRoot.Position
         away = Vector3.new(away.X, 0, away.Z)
@@ -480,8 +512,7 @@ local Survival = { lastHideScan = 0, hideSpot = nil, hideScore = 0, mode = "-" }
 local function HasLineOfSight(aRoot, bRoot, params)
     local from = aRoot.Position + Vector3.new(0, 2, 0)
     local to = bRoot.Position + Vector3.new(0, 2, 0)
-    local hit = Workspace:Raycast(from, to - from, params)
-    return hit == nil
+    return Workspace:Raycast(from, to - from, params) == nil
 end
 local function FindHideSpot(myRoot, enemyRoot, params)
     local myPos = myRoot.Position; local enemyPos = enemyRoot.Position
@@ -513,8 +544,7 @@ function Survival:Update(ctx)
         self.hideSpot, self.hideScore = FindHideSpot(ctx.myRoot, ctx.tRoot, params)
     end
     if ctx.enemyAttacking and ctx.dist < 16 then
-        if Resources:IsReady("SideDash") then
-            self.mode = "DODGE"; DoDodgeNow(ctx.tRoot, false)
+        if Resources:IsReady("SideDash") then self.mode = "DODGE"; DoDodgeNow(ctx.tRoot, false)
         else
             self.mode = "BLOCK"
             InputSystem:SendKey(CONFIG.Keys.Block, true)
@@ -527,8 +557,7 @@ function Survival:Update(ctx)
         self.mode = "HIDE"; hum:MoveTo(self.hideSpot); return
     end
     if not visible then
-        self.mode = "HIDDEN"
-        if self.hideSpot then hum:MoveTo(self.hideSpot) end
+        self.mode = "HIDDEN"   -- FIX 26: стоим, не лезем в стену
         return
     end
     self.mode = "KITE"
@@ -539,7 +568,7 @@ function Survival:Update(ctx)
 end
 
 -- ============================================================
--- DOMAIN COUNTER
+-- DOMAIN COUNTER (FIX 24,25)
 -- ============================================================
 local DomainBarrier = { obj = nil }
 pcall(function()
@@ -561,30 +590,32 @@ local function GetBarrierInfo()
         if obj:IsA("BasePart") then center = obj.Position; radius = obj.Size.Magnitude / 2
         else local cf, size = obj:GetBoundingBox(); center = cf.Position; radius = size.Magnitude / 2 end
     end)
+    if radius and radius > 60 then radius = 60 end   -- FIX 25: кламп
     return center, radius
 end
-local DomainCounter = { active = false, caster = nil, untilT = 0, lastDodge = 0 }
-function DomainCounter:Detect(myRoot)
+local DomainCounter = { active = false, caster = nil, untilT = 0, lastDodge = 0, counted = false }
+function DomainCounter:Detect()
     local now = time()
-    local FeedRef = _G.JJS_Feed
-    if FeedRef and FeedRef.domain and (now - FeedRef.domain.time) < 0.5 then
-        self.caster = FeedRef.domain.char
+    local F = _G.JJS_Feed
+    local M = _G.JJS_Metrics
+    if F and F.domain and (now - F.domain.time) < 0.5 then
+        self.caster = F.domain.char
         self.untilT = now + 10
-        if not self.active then
-            local M = _G.JJS_Metrics
+        if not self.counted then
             if M then M.domainsSeen = M.domainsSeen + 1 end
+            self.counted = true
         end
         self.active = true
     end
     if DomainBarrier.obj and DomainBarrier.obj.Parent then
-        self.active = true; self.untilT = now + 2
+        if not self.active and M then M.domainsSeen = M.domainsSeen + 1 end
+        self.active = true; self.untilT = now + 2; self.counted = true
     end
     if now > self.untilT then
-        if self.active then
-            local M = _G.JJS_Metrics
-            if M and IsAlive(LocalPlayer.Character) then M.domainsSurvived = M.domainsSurvived + 1 end
+        if self.active and M and IsAlive(LocalPlayer.Character) then
+            M.domainsSurvived = M.domainsSurvived + 1
         end
-        self.active = false; self.caster = nil
+        self.active = false; self.caster = nil; self.counted = false
     end
     return self.active
 end
@@ -608,12 +639,16 @@ function DomainCounter:Escape(ctx)
 end
 
 -- ============================================================
--- SMART AWAKENING
+-- SMART AWAKENING (FIX 10: проверка своего пробуждения)
 -- ============================================================
 local Awakening = { isAwakened = false, awakenedAt = 0 }
-function Awakening:Update()
+function Awakening:Update(myChar)
+    -- реальная проверка через атрибут
+    if GetBoolAttr(myChar, "Awakened") or GetBoolAttr(myChar, "Awake") then
+        self.isAwakened = true
+    end
     if self.isAwakened and (time() - self.awakenedAt) > SETTINGS.AwakenDuration then
-        self.isAwakened = false
+        if not GetBoolAttr(myChar, "Awakened") then self.isAwakened = false end
     end
     return self.isAwakened
 end
@@ -633,7 +668,7 @@ local function ScoreAwaken(ctx)
 end
 function Awakening:SmartUpdate(ctx)
     if not SETTINGS.SmartAwaken then return false end
-    self:Update()
+    self:Update(ctx.myChar)
     if ScoreAwaken(ctx) >= SETTINGS.AwakenScoreThreshold then
         Resources:Use("Awaken")
         InputSystem:PressKeySafe(CONFIG.Keys.Awaken, 0.15)
@@ -673,14 +708,12 @@ local COMBO_LIBRARY = {
 }
 local function GetComboSequence(ctx)
     local lib = COMBO_LIBRARY[SETTINGS.MyCharacter] or COMBO_LIBRARY.Default
-    if ctx.enemyStunned or ctx.behindEnemy then
-        return lib[2] or {"M1","M1","M1","M1"}
-    end
+    if ctx.enemyStunned or ctx.behindEnemy then return lib[2] or {"M1","M1","M1","M1"} end
     return lib[1] or {"M1","M1","Skill"}
 end
 
 -- ============================================================
--- COMBAT EXECUTOR (FIX 6: tool:Activate)
+-- COMBAT EXECUTOR
 -- ============================================================
 local CombatExecutor = {}
 function CombatExecutor:M1(ctx)
@@ -689,22 +722,31 @@ function CombatExecutor:M1(ctx)
         local tool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
         if tool then tool:Activate() end
     end)
-    InputSystem:Click(0.08)
+    InputSystem:Click()
 end
 function CombatExecutor:Skill(ctx)
+    if not Resources:IsReady("Skill") then return end   -- FIX 20
+    Resources:Use("Skill")
     InputSystem:PressKeySafe(CONFIG.Keys.Skill, 0.1)
 end
 
 -- ============================================================
--- PLAN EXECUTOR
+-- PLAN EXECUTOR (FIX 21,27: стоп на мёртвом/лежащем)
 -- ============================================================
 local PlanExecutor = { queue = {}, stepAt = 0 }
-function PlanExecutor:StartPattern(seq)
-    self.queue = seq
-    self.stepAt = 0
-end
+function PlanExecutor:Active() return #self.queue > 0 end
+function PlanExecutor:StartPattern(seq) self.queue = seq; self.stepAt = 0 end
 function PlanExecutor:Tick(ctx)
     if #self.queue == 0 then return false end
+    -- FIX 21/27: цель мертва или лежит — прекращаем махать
+    if ctx.target then
+        local th = GetHealth(ctx.target)
+        if not th or th <= 0 then self.queue = {}; return false end
+        local thum = ctx.target:FindFirstChild("Humanoid")
+        if thum and thum:GetState() == Enum.HumanoidStateType.Ragdoll then
+            self.queue = {}; return false
+        end
+    end
     local now = time()
     if now < self.stepAt then return true end
     local step = table.remove(self.queue, 1)
@@ -715,14 +757,14 @@ function PlanExecutor:Tick(ctx)
 end
 
 -- ============================================================
--- STRATEGY
+-- STRATEGY (FIX 41: учитывает CD)
 -- ============================================================
 local Strategy = {}
 function Strategy:Decide(ctx)
     local best = nil; local bestScore = 0
-
     local combo = 0
-    if ctx.dist <= CONFIG.Combat.AttackRange and not ctx.enemyBlocking and not ctx.enemyCountering then
+    if ctx.dist <= CONFIG.Combat.AttackRange and not ctx.enemyBlocking and not ctx.enemyCountering
+       and not ctx.enemyRagdolled then
         combo = 30
         local hit = ConfirmHit(ctx)
         if hit == true then combo = combo + 15 end
@@ -735,29 +777,22 @@ function Strategy:Decide(ctx)
     if combo > bestScore then bestScore = combo; best = "Combo" end
 
     local blockBreak = 0
-    if ctx.enemyBlocking and ctx.dist <= CONFIG.Combat.AttackRange then
-        blockBreak = 40
-    end
+    if ctx.enemyBlocking and ctx.dist <= CONFIG.Combat.AttackRange then blockBreak = 40 end
     if blockBreak > bestScore then bestScore = blockBreak; best = "BlockBreak" end
 
     local skill = 0
-    if ctx.dist <= CONFIG.Combat.SkillRange and ctx.hasLOS and not ctx.enemyCountering then
+    if ctx.dist <= CONFIG.Combat.SkillRange and ctx.hasLOS and not ctx.enemyCountering
+       and Resources:IsReady("Skill") then
         skill = 25
         if ctx.enemyStunned then skill = skill + 10 end
     end
     if skill > bestScore then bestScore = skill; best = "Skill" end
 
-    local chase = 0
-    if ctx.dist > CONFIG.Combat.AttackRange and ctx.dist < CONFIG.Combat.ChaseRange then
-        chase = 15
-    end
-    if chase > bestScore then bestScore = chase; best = "Chase" end
-
     return best
 end
 
 -- ============================================================
--- MOVEMENT
+-- MOVEMENT (FIX 2,4,19: pathfind, стоять в комбо, чередовать орбиту)
 -- ============================================================
 local MovementController = { lastMoveTo = 0, stuckSince = 0, lastPos = nil }
 local function MoveTo(hum, pos)
@@ -782,11 +817,13 @@ function MovementController:Update(ctx, hum)
         return
     end
 
+    -- anti-stuck
     if MovementController.lastPos then
         local moved = (myRoot.Position - MovementController.lastPos).Magnitude
         if moved < 0.5 then
             if MovementController.stuckSince == 0 then MovementController.stuckSince = time() end
             if time() - MovementController.stuckSince > 1 then
+                InputSystem:Jump()
                 local esc = WallAwareness:FindEscapeDirection(myRoot)
                 if esc then MoveTo(hum, myRoot.Position + esc * 8) end
                 MovementController.stuckSince = 0
@@ -800,15 +837,42 @@ function MovementController:Update(ctx, hum)
     if not ctx.target then return end
 
     if ctx.dist > CONFIG.Combat.AttackRange then
-        MoveTo(hum, ctx.tRoot.Position)
+        -- FIX 2: pathfinding если нет LOS
+        if SETTINGS.Pathfind and not ctx.hasLOS
+           and (time() - Pathfinding.lastCompute) > 1 then
+            Pathfinding.lastCompute = time()
+            ComputePath(myRoot.Position, ctx.tRoot.Position)
+        end
+        if SETTINGS.Pathfind and #Pathfinding.points > 0 then
+            FollowPath(hum, myRoot)
+        else
+            MoveTo(hum, ctx.tRoot.Position)
+        end
     else
+        -- FIX 4: стоим и бьём во время комбо
+        if PlanExecutor:Active() then return end
+        -- FIX 19: чередуем направление орбиты
+        State.orbitDir = State.orbitDir * -1
         local toEnemy = ctx.tRoot.Position - myRoot.Position
         toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
         if toEnemy.Magnitude > 0.001 then toEnemy = toEnemy.Unit end
-        local side = Vector3.new(0, 1, 0):Cross(toEnemy).Unit
+        local side = Vector3.new(0, 1, 0):Cross(toEnemy).Unit * State.orbitDir
         local orbitPos = ctx.tRoot.Position - toEnemy * CONFIG.Movement.OrbitDist + side * 3
         MoveTo(hum, orbitPos)
     end
+end
+
+-- ============================================================
+-- HEAL (FIX 29)
+-- ============================================================
+local function TryHeal(ctx)
+    if not SETTINGS.UseHeal then return false end
+    if ctx.myHealthRatio > SETTINGS.HealThreshold then return false end
+    if ctx.incapacitated then return false end
+    if (time() - State.lastHeal) < SETTINGS.HealCD then return false end
+    State.lastHeal = time()
+    InputSystem:PressKeySafe(CONFIG.HealKey, 0.1)
+    return true
 end
 
 -- ============================================================
@@ -866,7 +930,7 @@ local ec = Instance.new("UICorner"); ec.CornerRadius = UDim.new(0,4); ec.Parent 
 local wasAlive = true
 
 -- ============================================================
--- MAIN LOOP (FIX 4: death before early-return; FIX 5: offense gate)
+-- MAIN LOOP
 -- ============================================================
 RunService.Heartbeat:Connect(function(dt)
     pcall(function()
@@ -877,7 +941,6 @@ RunService.Heartbeat:Connect(function(dt)
         local hum0 = myChar and myChar:FindFirstChild("Humanoid")
         local aliveNow = hum0 and hum0.Health > 0
 
-        -- death detect BEFORE early return
         if wasAlive and not aliveNow then
             Metrics.deaths = Metrics.deaths + 1
             FightLog:Record({type = "DEATH"})
@@ -923,9 +986,16 @@ RunService.Heartbeat:Connect(function(dt)
         Perception:UpdateCache(target)
         local cache = Perception.cache
 
-        -- 360 threats
+        -- 360 threats (FIX 22: любой атакующий, не только топ)
         if SETTINGS.ThreatAwareness then
-            local top = ThreatManager:Top(myRoot)
+            local top, all = ThreatManager:Top(myRoot)
+            local anyAttacker = nil
+            for _, t in pairs(all) do
+                if t.attacking and t.dist < 18 then anyAttacker = t; break end
+            end
+            local dodgeSource = top
+            if anyAttacker then dodgeSource = anyAttacker end
+
             if top and (top.attacking or top.predictive) and top.dist < 20 then
                 if SETTINGS.AutoSwitchTarget and top.char ~= target and top.threat > 70
                    and (time() - State.lastTargetSwitch) > 2 then
@@ -934,15 +1004,16 @@ RunService.Heartbeat:Connect(function(dt)
                     Perception:UpdateCache(target)
                     cache = Perception.cache
                 end
-                if SETTINGS.AutoDodge and DoDodgeNow(top.root, top.predictive) then
-                    return
-                end
+            end
+            if dodgeSource and SETTINGS.AutoDodge
+               and (dodgeSource.attacking or dodgeSource.predictive) then
+                if DoDodgeNow(dodgeSource.root, dodgeSource.predictive) then return end
             end
         end
 
         -- context
         local myWall = WallAwareness:GetInfo(myRoot)
-        local enemyWall = tRoot and WallAwareness:GetInfo(tRoot, false) or nil   -- FIX 3
+        local enemyWall = tRoot and WallAwareness:GetInfo(tRoot, false) or nil
         local hasLOS = true
         pcall(function()
             local params = WallParams()
@@ -968,14 +1039,21 @@ RunService.Heartbeat:Connect(function(dt)
             end)(),
             enemyAttacking = cache.attacking, enemyBlocking = cache.blocking,
             enemyDashing = cache.dashing, enemyAwakened = cache.awakened,
-            enemyStunned = cache.stunned, enemyCountering = cache.countering,
+            enemyStunned = cache.stunned, enemyRagdolled = cache.ragdolled,
+            enemyCountering = cache.countering,
             cornered = myWall.cornered, enemyCornered = enemyWall and enemyWall.cornered or false,
             hasLOS = hasLOS, behindEnemy = behindEnemy,
             sideDashReady = Resources:IsReady("SideDash"),
         }
 
+        -- FIX 3: прицел ДО атаки
+        local aim = PredictPosition(tRoot, dist)
+        if aim and not ActionManager:IsMovementLocked() then
+            myRoot.CFrame = MakeLookCFrame(myRoot.Position, aim)
+        end
+
         -- domain
-        if DomainCounter:Detect(myRoot) then
+        if DomainCounter:Detect() then
             DomainCounter:Escape(ctx)
             return
         end
@@ -996,9 +1074,8 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- decide + execute (FIX 5: no offense while evading awakened)
-        if SETTINGS.AutoCombat
-           and not (ctx.enemyAwakened and SETTINGS.EvadeAwakened) then
+        -- decide + execute
+        if SETTINGS.AutoCombat and not (ctx.enemyAwakened and SETTINGS.EvadeAwakened) then
             if PlanExecutor:Tick(ctx) then
                 -- combo running
             else
@@ -1014,24 +1091,23 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
+        -- heal
+        TryHeal(ctx)
+
         -- movement
         MovementController:Update(ctx, hum)
 
-        -- face target
-        if not ActionManager:IsMovementLocked() then
-            local aim = PredictPosition(tRoot, dist)
-            if aim then myRoot.CFrame = MakeLookCFrame(myRoot.Position, aim) end
-        end
-
-        -- kill detect
-        if GetHealth(target) == 0 then
+        -- kill detect (FIX 23: dedupe)
+        local thp = GetHealth(target)
+        if thp == 0 and State.lastKillTarget ~= target then
+            State.lastKillTarget = target
             Metrics.kills = Metrics.kills + 1
             FightLog:Record({type = "KILL", vs = target.Name})
         end
     end)
 end)
 
--- overlay update
+-- overlay
 local lastUpd = 0
 RunService.Heartbeat:Connect(function()
     local now = time()
@@ -1057,14 +1133,13 @@ ExportBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- cleanup
 if _G.JJS_Bot_Cleanup then pcall(_G.JJS_Bot_Cleanup) end
 _G.JJS_Bot_Cleanup = function()
     for _, c in pairs(feedConnections) do pcall(function() c:Disconnect() end) end
     if ScreenGui then ScreenGui:Destroy() end
 end
 
-print("[BOT] v17 assembled ready")
+print("[BOT] v18 assembled ready")
 end)
 
 if not OK then
