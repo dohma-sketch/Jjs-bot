@@ -1,24 +1,65 @@
--- MM2 AutoFarm | Autonomous GUI Edition | Lua 5.1 compatible
--- Автономный автофарм с GUI для Delta
+-- MM2 Autonomous Fly GUI
+-- Lua 5.1 / Delta compatible
+-- Авто-сброс на раунд, полёт к монетам вместо мгновенного телепорта
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
-local LocalPlayer = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local CollectionService = game:GetService("CollectionService")
 
-local UIS = nil
+local CoreGui = nil
 pcall(function()
-    UIS = game:GetService("UserInputService")
+    CoreGui = game:GetService("CoreGui")
 end)
+
+local LocalPlayer = Players.LocalPlayer
 
 local Env = (getgenv and getgenv()) or shared
 if type(Env) ~= "table" then
     Env = {}
 end
 
-------------------------------------------------------------
--- Базовые утилиты совместимости
-------------------------------------------------------------
+-- ==========================
+-- Очистка старой сессии
+-- ==========================
+if type(Env.__MM2FlySession) == "table" then
+    Env.__MM2FlySession.Active = false
+end
 
+if type(Env.__MM2FlyConnections) == "table" then
+    for _, con in ipairs(Env.__MM2FlyConnections) do
+        pcall(function()
+            con:Disconnect()
+        end)
+    end
+end
+
+pcall(function()
+    if Env.__MM2FlyGui ~= nil then
+        Env.__MM2FlyGui:Destroy()
+    end
+end)
+
+local session = {
+    Active = true,
+    Id = (tonumber(Env.__MM2FlySessionId) or 0) + 1
+}
+
+Env.__MM2FlySessionId = session.Id
+Env.__MM2FlySession = session
+
+local connections = {}
+Env.__MM2FlyConnections = connections
+
+local function addConnection(con)
+    connections[#connections + 1] = con
+end
+
+-- ==========================
+-- Совместимость Lua 5.1 / executor
+-- ==========================
 local tickFn = nil
 pcall(function()
     if type(tick) == "function" then
@@ -95,42 +136,39 @@ local function safeSpawn(fn)
     coroutine.resume(co)
 end
 
-------------------------------------------------------------
--- Конфиг
-------------------------------------------------------------
+local function clampNumber(n, min, max)
+    n = tonumber(n)
+    if n == nil then
+        return min
+    end
+    if n < min then
+        return min
+    end
+    if n > max then
+        return max
+    end
+    return n
+end
 
-local DEFAULT_CONFIG = {
-    Enabled = true,
+-- ==========================
+-- Конфиг и состояние
+-- ==========================
+local Config = {
+    FlySpeed = 45,
+    MaxTargetDistance = 2000,
+    StopDistance = 3,
+    HoverY = 0,
 
-    LoopDelay = 0.25,
-    TeleportDelay = 0.18,
+    CoinScanDelay = 0.45,
+    PathRefresh = 1.1,
 
-    MaxDistance = 250,
-    MaxTargetsPerCycle = 8,
+    UsePathfinding = true,
+    UseBodyGyro = false,
+    AutoRoundReset = true,
 
-    ScanDepth = 3,
+    ResetDelay = 1.2,
+    ScanDepth = 2,
     MaxScanParts = 250,
-
-    YOffset = 0,
-
-    HumanizeDelays = true,
-
-    -- Автономность
-    AutoRecover = true,
-    AutonomousDiscovery = true,
-    DeepFallback = true,
-
-    AutonomousScanBudget = 3000,
-    AutonomousScanDepth = 5,
-
-    FallbackScanBudget = 1200,
-    FallbackScanDepth = 4,
-    FallbackCacheTime = 1.5,
-
-    -- GUI
-    GuiVisible = true,
-    GuiAutoRecreate = true,
-
     Debug = false,
 
     ContainerNames = {
@@ -141,126 +179,67 @@ local DEFAULT_CONFIG = {
     }
 }
 
-local function copyArray(arr)
-    local out = {}
-    if type(arr) == "table" then
-        for i = 1, #arr do
-            out[i] = arr[i]
+if type(Env.MM2FlyConfig) == "table" then
+    local userCfg = Env.MM2FlyConfig
+    for k, v in pairs(Config) do
+        if userCfg[k] ~= nil then
+            Config[k] = userCfg[k]
         end
     end
-    return out
 end
 
-local function normalizeConfig(userCfg)
-    local cfg = {}
-
-    for k, v in pairs(DEFAULT_CONFIG) do
-        cfg[k] = v
-    end
-
-    if type(userCfg) == "table" then
-        for k, _ in pairs(DEFAULT_CONFIG) do
-            if userCfg[k] ~= nil then
-                cfg[k] = userCfg[k]
-            end
-        end
-    end
-
-    cfg.Enabled = cfg.Enabled ~= false
-    cfg.HumanizeDelays = cfg.HumanizeDelays == true
-    cfg.AutoRecover = cfg.AutoRecover ~= false
-    cfg.AutonomousDiscovery = cfg.AutonomousDiscovery ~= false
-    cfg.DeepFallback = cfg.DeepFallback ~= false
-    cfg.GuiVisible = cfg.GuiVisible ~= false
-    cfg.GuiAutoRecreate = cfg.GuiAutoRecreate ~= false
-    cfg.Debug = cfg.Debug == true
-
-    cfg.LoopDelay = tonumber(cfg.LoopDelay) or DEFAULT_CONFIG.LoopDelay
-    if cfg.LoopDelay < 0.05 then cfg.LoopDelay = 0.05 end
-    if cfg.LoopDelay > 5 then cfg.LoopDelay = 5 end
-
-    cfg.TeleportDelay = tonumber(cfg.TeleportDelay) or DEFAULT_CONFIG.TeleportDelay
-    if cfg.TeleportDelay < 0 then cfg.TeleportDelay = 0 end
-    if cfg.TeleportDelay > 5 then cfg.TeleportDelay = 5 end
-
-    cfg.MaxDistance = tonumber(cfg.MaxDistance) or DEFAULT_CONFIG.MaxDistance
-    if cfg.MaxDistance < 10 then cfg.MaxDistance = 10 end
-    if cfg.MaxDistance > 1000 then cfg.MaxDistance = 1000 end
-
-    cfg.MaxTargetsPerCycle = tonumber(cfg.MaxTargetsPerCycle) or DEFAULT_CONFIG.MaxTargetsPerCycle
-    if cfg.MaxTargetsPerCycle < 1 then cfg.MaxTargetsPerCycle = 1 end
-    if cfg.MaxTargetsPerCycle > 50 then cfg.MaxTargetsPerCycle = 50 end
-
-    cfg.ScanDepth = tonumber(cfg.ScanDepth) or DEFAULT_CONFIG.ScanDepth
-    if cfg.ScanDepth < 1 then cfg.ScanDepth = 1 end
-    if cfg.ScanDepth > 6 then cfg.ScanDepth = 6 end
-
-    cfg.MaxScanParts = tonumber(cfg.MaxScanParts) or DEFAULT_CONFIG.MaxScanParts
-    if cfg.MaxScanParts < 10 then cfg.MaxScanParts = 10 end
-    if cfg.MaxScanParts > 1000 then cfg.MaxScanParts = 1000 end
-
-    cfg.YOffset = tonumber(cfg.YOffset) or DEFAULT_CONFIG.YOffset
-
-    cfg.AutonomousScanBudget = tonumber(cfg.AutonomousScanBudget) or DEFAULT_CONFIG.AutonomousScanBudget
-    if cfg.AutonomousScanBudget < 500 then cfg.AutonomousScanBudget = 500 end
-    if cfg.AutonomousScanBudget > 10000 then cfg.AutonomousScanBudget = 10000 end
-
-    cfg.AutonomousScanDepth = tonumber(cfg.AutonomousScanDepth) or DEFAULT_CONFIG.AutonomousScanDepth
-    if cfg.AutonomousScanDepth < 2 then cfg.AutonomousScanDepth = 2 end
-    if cfg.AutonomousScanDepth > 7 then cfg.AutonomousScanDepth = 7 end
-
-    cfg.FallbackScanBudget = tonumber(cfg.FallbackScanBudget) or DEFAULT_CONFIG.FallbackScanBudget
-    if cfg.FallbackScanBudget < 100 then cfg.FallbackScanBudget = 100 end
-    if cfg.FallbackScanBudget > 5000 then cfg.FallbackScanBudget = 5000 end
-
-    cfg.FallbackScanDepth = tonumber(cfg.FallbackScanDepth) or DEFAULT_CONFIG.FallbackScanDepth
-    if cfg.FallbackScanDepth < 1 then cfg.FallbackScanDepth = 1 end
-    if cfg.FallbackScanDepth > 6 then cfg.FallbackScanDepth = 6 end
-
-    cfg.FallbackCacheTime = tonumber(cfg.FallbackCacheTime) or DEFAULT_CONFIG.FallbackCacheTime
-    if cfg.FallbackCacheTime < 0.2 then cfg.FallbackCacheTime = 0.2 end
-    if cfg.FallbackCacheTime > 5 then cfg.FallbackCacheTime = 5 end
-
-    local namesSource = DEFAULT_CONFIG.ContainerNames
-    if type(userCfg) == "table" and type(userCfg.ContainerNames) == "table" then
-        namesSource = userCfg.ContainerNames
-    end
-
-    cfg.ContainerNames = copyArray(namesSource)
-
-    if #cfg.ContainerNames == 0 then
-        cfg.ContainerNames = copyArray(DEFAULT_CONFIG.ContainerNames)
-    end
-
-    return cfg
+if type(Config.ContainerNames) ~= "table" then
+    Config.ContainerNames = {
+        "CoinContainer",
+        "Coins",
+        "CoinContainer_Server",
+        "DroppedCoins"
+    }
 end
 
-Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
+Config.FlySpeed = clampNumber(Config.FlySpeed, 8, 200)
+Config.MaxTargetDistance = clampNumber(Config.MaxTargetDistance, 50, 10000)
+Config.StopDistance = clampNumber(Config.StopDistance, 1, 20)
+Config.HoverY = tonumber(Config.HoverY) or 0
+Config.CoinScanDelay = clampNumber(Config.CoinScanDelay, 0.1, 3)
+Config.PathRefresh = clampNumber(Config.PathRefresh, 0.2, 5)
+Config.ResetDelay = clampNumber(Config.ResetDelay, 0, 10)
+Config.ScanDepth = clampNumber(Config.ScanDepth, 1, 5)
+Config.MaxScanParts = clampNumber(Config.MaxScanParts, 10, 1000)
 
-local function getConfig()
-    Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
-    return Env.AutoFarmConfig
-end
+Config.AutoRoundReset = Config.AutoRoundReset ~= false
+Config.UsePathfinding = Config.UsePathfinding ~= false
+Config.UseBodyGyro = Config.UseBodyGyro == true
+Config.Debug = Config.Debug == true
 
-local function log(message)
-    local cfg = Env.AutoFarmConfig
-    if cfg and cfg.Debug then
-        print("[MM2 AutoFarm] " .. tostring(message))
-    end
-end
+Env.MM2FlyConfig = Config
 
-if type(Env.__MM2Stats) ~= "table" then
-    Env.__MM2Stats = {}
-end
+local State = {
+    Enabled = false,
+    PauseUntil = 0,
+    Status = "Idle",
 
-Env.__MM2Stats.Container = Env.__MM2Stats.Container or "нет"
-Env.__MM2Stats.LastCoins = Env.__MM2Stats.LastCoins or 0
-Env.__MM2Stats.LastError = Env.__MM2Stats.LastError or ""
+    CurrentTarget = nil,
+    TargetChangedTime = 0,
 
-------------------------------------------------------------
--- Проверка Instance
-------------------------------------------------------------
+    Waypoints = nil,
+    WaypointIndex = 1,
+    LastPathTime = 0,
 
+    LastCoinScan = 0,
+    CoinCache = {},
+
+    Blacklist = setmetatable({}, { __mode = "k" }),
+
+    LastDistance = nil,
+    StuckTime = 0
+}
+
+Env.MM2FlyState = State
+
+-- ==========================
+-- Утилиты
+-- ==========================
 local function isInstanceValid(inst)
     if inst == nil then
         return false
@@ -273,206 +252,212 @@ local function isInstanceValid(inst)
     return ok and valid == true
 end
 
-------------------------------------------------------------
--- Задержки
-------------------------------------------------------------
-
-local function humanizedDelay(baseDelay, cfg)
-    baseDelay = tonumber(baseDelay) or 0
-
-    if baseDelay <= 0 then
-        return 0
+local function log(msg)
+    if Config.Debug then
+        print("[MM2 Fly] " .. tostring(msg))
     end
-
-    if not cfg or cfg.HumanizeDelays ~= true then
-        return baseDelay
-    end
-
-    local jitter = baseDelay * 0.20
-    local result = baseDelay + ((math.random() - 0.5) * 2 * jitter)
-
-    if result < 0 then
-        result = 0
-    end
-
-    return result
 end
 
-------------------------------------------------------------
--- Поиск контейнера монет
-------------------------------------------------------------
-
-local cachedContainer = nil
-local lastContainerCheck = 0
-local CONTAINER_CACHE_TIME = 5
-
-local heuristicContainer = nil
-local lastHeuristicCheck = 0
-local HEURISTIC_CACHE_TIME = 12
-
-local function isCoinLikeName(name)
-    if type(name) ~= "string" then
-        return false
+local function updateStatus(text)
+    State.Status = tostring(text or "Idle")
+    if type(Env.__MM2FlyStatusChanged) == "function" then
+        pcall(Env.__MM2FlyStatusChanged, State.Status)
     end
-
-    local n = string.lower(name)
-
-    return string.find(n, "coin", 1, true) ~= nil
-        or string.find(n, "pickup", 1, true) ~= nil
-        or string.find(n, "drop", 1, true) ~= nil
 end
 
-local function heuristicScan(root, depth, state)
-    if state.nodes >= state.maxNodes then
-        return
-    end
+-- ==========================
+-- Полёт / движение
+-- ==========================
+local flight = {
+    root = nil,
+    bv = nil,
+    bg = nil
+}
 
-    if depth > state.maxDepth then
-        return
-    end
-
-    state.nodes = state.nodes + 1
+local function clearFlight()
+    pcall(function()
+        if flight.bv then
+            flight.bv:Destroy()
+        end
+    end)
 
     pcall(function()
-        local children = root:GetChildren()
+        if flight.bg then
+            flight.bg:Destroy()
+        end
+    end)
 
-        for i = 1, #children do
-            if state.nodes >= state.maxNodes then
-                break
-            end
+    flight.bv = nil
+    flight.bg = nil
+    flight.root = nil
+end
 
-            local child = children[i]
-
-            if isInstanceValid(child) then
-                local okName, name = pcall(function()
-                    return child.Name
-                end)
-
-                if okName and isCoinLikeName(name) then
-                    local okType, coinLike = pcall(function()
-                        return child:IsA("BasePart") or child:IsA("Model")
-                    end)
-
-                    if okType and coinLike then
-                        local parent = child.Parent
-                        if parent and parent ~= Workspace then
-                            state.scores[parent] = (state.scores[parent] or 0) + 1
-                        end
-                    end
-                end
-
-                heuristicScan(child, depth + 1, state)
-            end
+local function stopVelocity()
+    pcall(function()
+        if flight.bv then
+            flight.bv.Velocity = Vector3.new(0, 0, 0)
         end
     end)
 end
 
-local function findContainerHeuristic(cfg)
-    local now = getTime()
-
-    if isInstanceValid(heuristicContainer) and (now - lastHeuristicCheck) < HEURISTIC_CACHE_TIME then
-        return heuristicContainer
+local function ensureFlight(root)
+    if flight.root ~= root then
+        clearFlight()
     end
 
-    lastHeuristicCheck = now
-    heuristicContainer = nil
-
-    if not cfg.AutonomousDiscovery then
-        return nil
+    if not isInstanceValid(root) then
+        return
     end
 
-    local state = {
-        scores = {},
-        nodes = 0,
-        maxNodes = cfg.AutonomousScanBudget,
-        maxDepth = cfg.AutonomousScanDepth
-    }
+    if flight.bv and not isInstanceValid(flight.bv) then
+        flight.bv = nil
+    end
 
-    heuristicScan(Workspace, 0, state)
+    if flight.bg and not isInstanceValid(flight.bg) then
+        flight.bg = nil
+    end
 
-    local bestParent = nil
-    local bestTotal = 0
-    local bestRaw = 0
-
-    for parent, score in pairs(state.scores) do
-        if score >= 2 and isInstanceValid(parent) then
-            local bonus = 0
-
-            pcall(function()
-                if isCoinLikeName(parent.Name) then
-                    bonus = bonus + 6
-                end
-
-                if parent:IsA("Folder") or parent:IsA("Model") or parent:IsA("Configuration") then
-                    bonus = bonus + 2
-                end
-            end)
-
-            local total = score + bonus
-
-            if total > bestTotal then
-                bestParent = parent
-                bestTotal = total
-                bestRaw = score
+    if not flight.bv then
+        pcall(function()
+            local old = root:FindFirstChild("MM2FlyVelocity")
+            if old then
+                old:Destroy()
             end
-        end
+
+            local bv = Instance.new("BodyVelocity")
+            bv.Name = "MM2FlyVelocity"
+            bv.MaxForce = Vector3.new(1000000, 1000000, 1000000)
+            bv.Velocity = Vector3.new(0, 0, 0)
+            bv.Parent = root
+
+            flight.bv = bv
+        end)
     end
 
-    if bestParent and bestTotal >= 7 and bestRaw >= 2 then
-        heuristicContainer = bestParent
-        return bestParent
+    if Config.UseBodyGyro and not flight.bg then
+        pcall(function()
+            local old = root:FindFirstChild("MM2FlyGyro")
+            if old then
+                old:Destroy()
+            end
+
+            local bg = Instance.new("BodyGyro")
+            bg.Name = "MM2FlyGyro"
+            bg.MaxTorque = Vector3.new(1000000, 1000000, 1000000)
+            bg.P = 10000
+            bg.D = 500
+            bg.CFrame = root.CFrame
+            bg.Parent = root
+
+            flight.bg = bg
+        end)
     end
 
-    return nil
+    flight.root = root
 end
 
-local function getCoinContainer(cfg)
+-- ==========================
+-- Сброс состояния
+-- ==========================
+local lastResetTime = 0
+
+local function resetRoundState(reason, pause)
+    reason = tostring(reason or "Unknown")
+
+    if reason ~= "Manual" and not Config.AutoRoundReset then
+        return
+    end
+
     local now = getTime()
 
-    if isInstanceValid(cachedContainer) and (now - lastContainerCheck) < CONTAINER_CACHE_TIME then
-        return cachedContainer
+    if reason ~= "Manual" and now - lastResetTime < 0.35 then
+        return
+    end
+
+    lastResetTime = now
+
+    State.CurrentTarget = nil
+    State.TargetChangedTime = 0
+
+    State.Waypoints = nil
+    State.WaypointIndex = 1
+    State.LastPathTime = 0
+
+    State.LastCoinScan = 0
+    State.CoinCache = {}
+
+    State.Blacklist = setmetatable({}, { __mode = "k" })
+
+    State.LastDistance = nil
+    State.StuckTime = 0
+
+    State.PauseUntil = getTime() + (tonumber(pause) or Config.ResetDelay)
+
+    stopVelocity()
+    updateStatus("Reset: " .. reason)
+    log("Reset state: " .. reason)
+end
+
+-- ==========================
+-- Поиск монет
+-- ==========================
+local containerCache = nil
+local lastContainerCheck = 0
+
+local function getCoinContainer()
+    local now = getTime()
+
+    if isInstanceValid(containerCache) and now - lastContainerCheck < 5 then
+        return containerCache
     end
 
     lastContainerCheck = now
-    cachedContainer = nil
+    containerCache = nil
 
-    for i = 1, #cfg.ContainerNames do
-        local name = cfg.ContainerNames[i]
+    local roots = { Workspace }
 
-        if type(name) == "string" then
-            local ok, found = pcall(function()
-                return Workspace:FindFirstChild(name)
-            end)
+    local possibleRootNames = {
+        "Map",
+        "Maps",
+        "Game",
+        "Gameplay",
+        "CoinContainers"
+    }
 
-            if ok and found then
-                cachedContainer = found
-                pcall(function()
-                    Env.__MM2Stats.Container = found.Name
+    for _, rootName in ipairs(possibleRootNames) do
+        local ok, root = pcall(function()
+            return Workspace:FindFirstChild(rootName)
+        end)
+
+        if ok and root then
+            roots[#roots + 1] = root
+        end
+    end
+
+    local names = Config.ContainerNames
+    if type(names) ~= "table" then
+        names = { "CoinContainer", "Coins" }
+    end
+
+    for _, root in ipairs(roots) do
+        for i = 1, #names do
+            local name = names[i]
+
+            if type(name) == "string" then
+                local ok, found = pcall(function()
+                    return root:FindFirstChild(name)
                 end)
-                return found
+
+                if ok and found then
+                    containerCache = found
+                    return found
+                end
             end
         end
     end
 
-    if cfg.AutonomousDiscovery then
-        local heuristic = findContainerHeuristic(cfg)
-
-        if heuristic then
-            cachedContainer = heuristic
-            pcall(function()
-                Env.__MM2Stats.Container = heuristic.Name .. " [auto]"
-            end)
-            return heuristic
-        end
-    end
-
-    Env.__MM2Stats.Container = "не найден"
     return nil
 end
-
-------------------------------------------------------------
--- Поиск монет внутри контейнера
-------------------------------------------------------------
 
 local function getTargetPart(obj)
     if obj == nil then
@@ -528,12 +513,12 @@ local function getTargetPart(obj)
     return nil
 end
 
-local function scanCoinParts(obj, cfg, out, depth)
-    if #out >= cfg.MaxScanParts then
+local function scanCoinParts(obj, out, depth)
+    if #out >= Config.MaxScanParts then
         return
     end
 
-    if depth > cfg.ScanDepth then
+    if depth > Config.ScanDepth then
         return
     end
 
@@ -558,1055 +543,858 @@ local function scanCoinParts(obj, cfg, out, depth)
         end
 
         local children = obj:GetChildren()
-
         for i = 1, #children do
-            if #out >= cfg.MaxScanParts then
+            if #out >= Config.MaxScanParts then
                 break
             end
 
-            scanCoinParts(children[i], cfg, out, depth + 1)
+            scanCoinParts(children[i], out, depth + 1)
         end
     end)
 end
 
-local function getAliveRootPart()
-    local character = LocalPlayer.Character
-    if not isInstanceValid(character) then
-        return nil
-    end
+local function getTaggedCoins()
+    local out = {}
 
-    local humanoid = character:FindFirstChild("Humanoid")
-    if not isInstanceValid(humanoid) then
-        return nil
-    end
-
-    local okAlive, alive = pcall(function()
-        return humanoid:IsA("Humanoid") and humanoid.Health > 0
-    end)
-
-    if not okAlive or not alive then
-        return nil
-    end
-
-    local rootPart = character:FindFirstChild("HumanoidRootPart")
-    if not isInstanceValid(rootPart) then
-        return nil
-    end
-
-    local okRoot, isRootPart = pcall(function()
-        return rootPart:IsA("BasePart")
-    end)
-
-    if not okRoot or not isRootPart then
-        return nil
-    end
-
-    return rootPart
-end
-
-local function getCandidates(container, rootPart, cfg)
-    local candidates = {}
-    local parts = {}
-
-    scanCoinParts(container, cfg, parts, 0)
-
-    local okRootPos, rootPos = pcall(function()
-        return rootPart.Position
-    end)
-
-    if not okRootPos then
-        return candidates
-    end
-
-    for i = 1, #parts do
-        local part = parts[i]
-
-        if isInstanceValid(part) then
-            local okDist, dist = pcall(function()
-                return (part.Position - rootPos).Magnitude
-            end)
-
-            if okDist and type(dist) == "number" and dist <= cfg.MaxDistance then
-                candidates[#candidates + 1] = {
-                    part = part,
-                    dist = dist
-                }
-            end
-        end
-    end
-
-    if #candidates > 1 then
-        table.sort(candidates, function(a, b)
-            return a.dist < b.dist
-        end)
-    end
-
-    return candidates
-end
-
-------------------------------------------------------------
--- Запасной автономный поиск, если контейнер не найден
-------------------------------------------------------------
-
-local fallbackCache = {}
-local fallbackCacheTime = 0
-
-local function getFallbackCandidates(rootPart, cfg)
-    local now = getTime()
-
-    if fallbackCache and (now - fallbackCacheTime) < cfg.FallbackCacheTime then
-        return fallbackCache
-    end
-
-    fallbackCacheTime = now
-    fallbackCache = {}
-
-    if not cfg.DeepFallback then
-        return fallbackCache
-    end
-
-    local okRootPos, rootPos = pcall(function()
-        return rootPart.Position
-    end)
-
-    if not okRootPos then
-        return fallbackCache
-    end
-
-    local parts = {}
-    local seen = {}
-
-    local state = {
-        nodes = 0,
-        maxNodes = cfg.FallbackScanBudget,
-        maxDepth = cfg.FallbackScanDepth
+    local tags = {
+        "Coin",
+        "Coins",
+        "CoinPickup",
+        "PickupCoin",
+        "MM2Coin",
+        "Currency"
     }
 
-    local function scan(obj, depth)
-        if state.nodes >= state.maxNodes then
-            return
-        end
+    for _, tag in ipairs(tags) do
+        local ok, objs = pcall(function()
+            return CollectionService:GetTagged(tag)
+        end)
 
-        if depth > state.maxDepth then
-            return
-        end
-
-        state.nodes = state.nodes + 1
-
-        pcall(function()
-            local children = obj:GetChildren()
-
-            for i = 1, #children do
-                if state.nodes >= state.maxNodes then
-                    break
+        if ok and type(objs) == "table" then
+            for i = 1, #objs do
+                if #out >= Config.MaxScanParts then
+                    return out
                 end
 
-                local child = children[i]
+                local obj = objs[i]
 
-                if isInstanceValid(child) then
-                    local okName, name = pcall(function()
-                        return child.Name
-                    end)
-
-                    local okParentName, parentName = pcall(function()
-                        return child.Parent and child.Parent.Name
-                    end)
-
-                    local nameCoin = okName and isCoinLikeName(name)
-                    local parentCoin = okParentName and isCoinLikeName(parentName)
-
-                    if nameCoin or parentCoin then
-                        local target = nil
-
-                        pcall(function()
-                            if child:IsA("BasePart") then
-                                target = child
-                            elseif child:IsA("Model") then
-                                target = getTargetPart(child)
-                            else
-                                target = getTargetPart(child)
-                            end
-                        end)
-
-                        if isInstanceValid(target) and not seen[target] then
-                            local okChar, notChar = pcall(function()
-                                return not target:IsDescendantOf(LocalPlayer.Character)
-                            end)
-
-                            if (not okChar) or notChar then
-                                seen[target] = true
-                                parts[#parts + 1] = target
+                if isInstanceValid(obj) then
+                    pcall(function()
+                        if obj:IsA("BasePart") then
+                            out[#out + 1] = obj
+                        elseif obj:IsA("Model") then
+                            local part = getTargetPart(obj)
+                            if part then
+                                out[#out + 1] = part
                             end
                         end
-                    end
-
-                    scan(child, depth + 1)
+                    end)
                 end
             end
-        end)
+        end
     end
 
-    scan(Workspace, 0)
+    return out
+end
 
-    local candidates = {}
+local function refreshCoinCache(force)
+    local now = getTime()
 
-    for i = 1, #parts do
-        local part = parts[i]
+    if not force and now - State.LastCoinScan < Config.CoinScanDelay then
+        return
+    end
 
-        if isInstanceValid(part) then
+    local parts = {}
+    local container = getCoinContainer()
+
+    if container then
+        scanCoinParts(container, parts, 0)
+    end
+
+    if #parts == 0 then
+        parts = getTaggedCoins()
+    end
+
+    State.CoinCache = parts
+    State.LastCoinScan = now
+end
+
+-- ==========================
+-- Чёрный список / застревание
+-- ==========================
+local function isBlacklisted(part)
+    local untilTime = State.Blacklist[part]
+
+    if untilTime and untilTime > getTime() then
+        return true
+    end
+
+    State.Blacklist[part] = nil
+    return false
+end
+
+local function blacklistPart(part, duration)
+    if part == nil then
+        return
+    end
+
+    State.Blacklist[part] = getTime() + (tonumber(duration) or 5)
+end
+
+-- ==========================
+-- Выбор цели
+-- ==========================
+local function getBestTarget(root)
+    if State.CurrentTarget and isInstanceValid(State.CurrentTarget) and not isBlacklisted(State.CurrentTarget) then
+        local ok, dist = pcall(function()
+            return (State.CurrentTarget.Position - root.Position).Magnitude
+        end)
+
+        if ok and dist <= Config.MaxTargetDistance then
+            return State.CurrentTarget
+        end
+    end
+
+    refreshCoinCache(false)
+
+    local best = nil
+    local bestDist = math.huge
+
+    local okRootPos, rootPos = pcall(function()
+        return root.Position
+    end)
+
+    if not okRootPos then
+        return nil
+    end
+
+    for i = 1, #State.CoinCache do
+        local part = State.CoinCache[i]
+
+        if isInstanceValid(part) and not isBlacklisted(part) then
             local okDist, dist = pcall(function()
                 return (part.Position - rootPos).Magnitude
             end)
 
-            if okDist and type(dist) == "number" and dist <= cfg.MaxDistance then
-                candidates[#candidates + 1] = {
-                    part = part,
-                    dist = dist
-                }
+            if okDist and dist <= Config.MaxTargetDistance and dist < bestDist then
+                best = part
+                bestDist = dist
             end
         end
     end
 
-    if #candidates > 1 then
-        table.sort(candidates, function(a, b)
-            return a.dist < b.dist
+    if best ~= State.CurrentTarget then
+        State.CurrentTarget = best
+        State.TargetChangedTime = getTime()
+
+        State.Waypoints = nil
+        State.WaypointIndex = 1
+        State.LastPathTime = 0
+
+        State.LastDistance = nil
+        State.StuckTime = 0
+    end
+
+    return best
+end
+
+-- ==========================
+-- Pathfinding
+-- ==========================
+local function computePathAsync(startPos, goalPos)
+    local ok, result = pcall(function()
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentCanClimb = false
+        })
+
+        path:ComputeAsync(startPos, goalPos)
+
+        if path.Status == Enum.PathStatus.Success then
+            return path:GetWaypoints()
+        end
+
+        return nil
+    end)
+
+    if ok and result then
+        return result
+    end
+
+    return nil
+end
+
+local function maybeUpdatePath(root, targetPos)
+    if not Config.UsePathfinding then
+        State.Waypoints = nil
+        return
+    end
+
+    local now = getTime()
+
+    if now - State.LastPathTime < Config.PathRefresh then
+        return
+    end
+
+    State.LastPathTime = now
+
+    local waypoints = computePathAsync(root.Position, targetPos)
+
+    if waypoints and #waypoints > 0 then
+        State.Waypoints = waypoints
+        State.WaypointIndex = 2
+        State.LastDistance = nil
+        State.StuckTime = 0
+    else
+        State.Waypoints = nil
+    end
+end
+
+-- ==========================
+-- Основной цикл полёта
+-- ==========================
+local function movementLoop()
+    while session.Active do
+        safeWait(0.05)
+
+        pcall(function()
+            if not State.Enabled or getTime() < State.PauseUntil then
+                stopVelocity()
+
+                if getTime() < State.PauseUntil then
+                    updateStatus("Paused after reset")
+                end
+
+                return
+            end
+
+            local character = LocalPlayer.Character
+            if not isInstanceValid(character) then
+                clearFlight()
+                updateStatus("Waiting for character")
+                return
+            end
+
+            local humanoid = character:FindFirstChild("Humanoid")
+            if not isInstanceValid(humanoid) then
+                clearFlight()
+                updateStatus("No humanoid")
+                return
+            end
+
+            local okAlive, alive = pcall(function()
+                return humanoid:IsA("Humanoid") and humanoid.Health > 0
+            end)
+
+            if not okAlive or not alive then
+                clearFlight()
+                updateStatus("Dead / waiting respawn")
+                return
+            end
+
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if not isInstanceValid(root) then
+                clearFlight()
+                updateStatus("No HumanoidRootPart")
+                return
+            end
+
+            ensureFlight(root)
+
+            local target = getBestTarget(root)
+
+            if not target then
+                stopVelocity()
+                updateStatus("No coins found")
+                return
+            end
+
+            local okTargetPos, targetPos = pcall(function()
+                return target.Position + Vector3.new(0, Config.HoverY, 0)
+            end)
+
+            if not okTargetPos then
+                State.CurrentTarget = nil
+                stopVelocity()
+                return
+            end
+
+            maybeUpdatePath(root, targetPos)
+
+            local goalPos = targetPos
+
+            if Config.UsePathfinding and State.Waypoints and State.WaypointIndex <= #State.Waypoints then
+                local wp = State.Waypoints[State.WaypointIndex]
+
+                if wp and wp.Position then
+                    goalPos = wp.Position + Vector3.new(0, Config.HoverY, 0)
+                end
+
+                local okWpDist, wpDist = pcall(function()
+                    return (goalPos - root.Position).Magnitude
+                end)
+
+                if okWpDist and wpDist < 4 then
+                    State.WaypointIndex = State.WaypointIndex + 1
+                    State.LastDistance = nil
+                    State.StuckTime = 0
+                end
+            end
+
+            local okOffset, offset = pcall(function()
+                return goalPos - root.Position
+            end)
+
+            if not okOffset then
+                stopVelocity()
+                return
+            end
+
+            local dist = offset.Magnitude
+
+            if State.LastDistance and dist >= State.LastDistance - 0.2 then
+                State.StuckTime = State.StuckTime + 0.05
+            else
+                State.StuckTime = 0
+            end
+
+            State.LastDistance = dist
+
+            if State.StuckTime > 5 then
+                blacklistPart(target, 8)
+                State.CurrentTarget = nil
+                State.Waypoints = nil
+                State.LastDistance = nil
+                State.StuckTime = 0
+                stopVelocity()
+                updateStatus("Target blacklisted: stuck")
+                return
+            end
+
+            if dist < Config.StopDistance then
+                if State.StuckTime > 2 then
+                    blacklistPart(target, 6)
+                    State.CurrentTarget = nil
+                    State.Waypoints = nil
+                    State.LastDistance = nil
+                    State.StuckTime = 0
+                    stopVelocity()
+                    updateStatus("Coin unreachable, blacklisted")
+                    return
+                end
+
+                if dist > 0.05 then
+                    pcall(function()
+                        if flight.bv then
+                            flight.bv.Velocity = offset.Unit * math.min(8, Config.FlySpeed * 0.25)
+                        end
+                    end)
+                else
+                    stopVelocity()
+                end
+
+                updateStatus("Collecting coin")
+                return
+            end
+
+            local speed = clampNumber(Config.FlySpeed, 8, 200)
+            local velocity = offset.Unit * math.min(speed, dist * 3)
+
+            pcall(function()
+                if flight.bv then
+                    flight.bv.Velocity = velocity
+                end
+
+                if flight.bg then
+                    flight.bg.CFrame = CFrame.new(root.Position, goalPos)
+                end
+            end)
+
+            updateStatus(string.format("Flying to coin: %.0f studs", dist))
         end)
     end
 
-    if #candidates > 50 then
-        local trimmed = {}
-        for i = 1, 50 do
-            trimmed[i] = candidates[i]
-        end
-        candidates = trimmed
-    end
-
-    fallbackCache = candidates
-    return candidates
+    clearFlight()
 end
 
-------------------------------------------------------------
--- Телепорт и сбор
-------------------------------------------------------------
+-- ==========================
+-- Remotes: сброс на раунд
+-- ==========================
+local serviceMap = {
+    ReplicatedStorage = ReplicatedStorage,
+    Workspace = Workspace
+}
 
-local function teleportToPart(rootPart, part, cfg)
-    local ok = pcall(function()
-        local cf = part.CFrame
-        local yOffset = tonumber(cfg.YOffset) or 0
+pcall(function()
+    serviceMap.ReplicatedFirst = game:GetService("ReplicatedFirst")
+end)
 
-        if yOffset ~= 0 and Vector3 then
-            cf = cf + Vector3.new(0, yOffset, 0)
-        end
-
-        rootPart.CFrame = cf
-    end)
-
-    return ok
-end
-
-local function collectCycle(rootPart, cfg, activeId)
-    local container = getCoinContainer(cfg)
-    local candidates = {}
-
-    if isInstanceValid(container) then
-        candidates = getCandidates(container, rootPart, cfg)
-    end
-
-    if #candidates == 0 and cfg.DeepFallback then
-        candidates = getFallbackCandidates(rootPart, cfg)
-    end
-
-    Env.__MM2Stats.LastCoins = #candidates
-
-    if #candidates == 0 then
-        return false
-    end
-
-    local maxTargets = math.min(#candidates, cfg.MaxTargetsPerCycle)
-
-    for i = 1, maxTargets do
-        local currentCfg = getConfig()
-
-        if not currentCfg.Enabled or Env.__MM2AutoFarmActiveId ~= activeId then
-            break
-        end
-
-        if not isInstanceValid(rootPart) then
-            break
-        end
-
-        local entry = candidates[i]
-        local part = entry and entry.part
-
-        if isInstanceValid(part) then
-            local okDist, distNow = pcall(function()
-                return (part.Position - rootPart.Position).Magnitude
-            end)
-
-            if okDist and type(distNow) == "number" and distNow <= currentCfg.MaxDistance then
-                if teleportToPart(rootPart, part, currentCfg) then
-                    safeWait(humanizedDelay(currentCfg.TeleportDelay, currentCfg))
-                end
-            end
-        end
-    end
-
-    return true
-end
-
-------------------------------------------------------------
--- Управление потоком
-------------------------------------------------------------
-
-local function stopThreadOnly()
-    Env.__MM2AutoFarmActiveId = nil
-end
-
-local function startLoop()
-    if Env.__MM2AutoFarmActiveId ~= nil then
-        return false
-    end
-
-    local id = (tonumber(Env.__MM2AutoFarmId) or 0) + 1
-    Env.__MM2AutoFarmId = id
-    Env.__MM2AutoFarmActiveId = id
-
-    safeSpawn(function()
-        while Env.__MM2AutoFarmActiveId == id do
-            local ok, err = pcall(function()
-                while Env.__MM2AutoFarmActiveId == id do
-                    local cfg = getConfig()
-                    safeWait(cfg.LoopDelay)
-
-                    if cfg.Enabled and Env.__MM2AutoFarmActiveId == id then
-                        pcall(function()
-                            local rootPart = getAliveRootPart()
-
-                            if rootPart then
-                                collectCycle(rootPart, cfg, id)
-                            end
-                        end)
-                    end
-                end
-            end)
-
-            if not ok then
-                Env.__MM2Stats.LastError = tostring(err)
-                log("Loop error: " .. tostring(err))
-
-                local cfg = getConfig()
-                if not cfg.AutoRecover then
-                    Env.__MM2AutoFarmActiveId = nil
-                    break
-                end
-            end
-
-            if Env.__MM2AutoFarmActiveId == id then
-                safeWait(1)
-            end
-        end
-
-        if Env.__MM2AutoFarmActiveId == id then
-            Env.__MM2AutoFarmActiveId = nil
-        end
-    end)
-
-    return true
-end
-
-Env.StartAutoFarm = function()
-    Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
-    Env.AutoFarmConfig.Enabled = true
-    return startLoop()
-end
-
-Env.StopAutoFarm = function()
-    stopThreadOnly()
-    Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
-    Env.AutoFarmConfig.Enabled = false
-end
-
-Env.ToggleAutoFarm = function(state)
-    if state == nil then
-        state = not (Env.AutoFarmConfig and Env.AutoFarmConfig.Enabled)
-    end
-
-    if state then
-        return Env.StartAutoFarm()
-    else
-        Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
-        Env.AutoFarmConfig.Enabled = false
-        return false
-    end
-end
-
-Env.RestartAutoFarm = function()
-    local cfg = getConfig()
-    local wasEnabled = cfg.Enabled
-
-    stopThreadOnly()
-    safeWait(0.05)
-
-    Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
-    Env.AutoFarmConfig.Enabled = wasEnabled
-
-    if wasEnabled then
-        return Env.StartAutoFarm()
-    end
-
-    return false
-end
-
-------------------------------------------------------------
--- GUI
-------------------------------------------------------------
-
-local function newInst(className, props)
-    local ok, inst = pcall(function()
-        return Instance.new(className)
-    end)
-
-    if not ok or not inst then
+local function resolvePath(path)
+    if type(path) ~= "string" then
         return nil
     end
 
-    if props then
-        for k, v in pairs(props) do
-            pcall(function()
-                inst[k] = v
-            end)
-        end
+    local first, rest = path:match("^([%w_]+)%.(.*)$")
+
+    if not first then
+        return nil
     end
 
-    return inst
+    local current = serviceMap[first] or game:FindFirstChild(first)
+
+    if not current then
+        return nil
+    end
+
+    if not rest or rest == "" then
+        return current
+    end
+
+    for name in rest:gmatch("[^%.]+") do
+        local ok, child = pcall(function()
+            return current:FindFirstChild(name)
+        end)
+
+        if not ok or not child then
+            return nil
+        end
+
+        current = child
+    end
+
+    return current
 end
 
-local function attachGui(screenGui)
-    if not screenGui then
+local connectedRemotes = {}
+
+local function connectRemote(path, callback)
+    if connectedRemotes[path] then
+        return true
+    end
+
+    local remote = resolvePath(path)
+
+    if not remote then
         return false
     end
 
-    local ok1 = pcall(function()
-        if type(gethui) == "function" then
-            local h = gethui()
-            if h then
-                screenGui.Parent = h
-            end
+    local okIs, isEvent = pcall(function()
+        return remote:IsA("RemoteEvent")
+    end)
+
+    if okIs and isEvent then
+        local okConnect, con = pcall(function()
+            return remote.OnClientEvent:Connect(callback)
+        end)
+
+        if okConnect and con then
+            addConnection(con)
         end
-    end)
-
-    if ok1 and isInstanceValid(screenGui) then
-        return true
     end
 
-    local ok2 = pcall(function()
-        screenGui.Parent = game:GetService("CoreGui")
-    end)
-
-    if ok2 and isInstanceValid(screenGui) then
-        return true
-    end
-
-    local ok3 = pcall(function()
-        screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-    end)
-
-    if ok3 and isInstanceValid(screenGui) then
-        return true
-    end
-
-    return false
+    connectedRemotes[path] = true
+    return true
 end
 
-local buildGUI
-
-buildGUI = function()
-    pcall(function()
-        if isInstanceValid(Env.__MM2Gui) then
-            Env.__MM2Gui:Destroy()
+local remotesToConnect = {
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.RoundStart",
+        fn = function(...)
+            resetRoundState("RoundStart", Config.ResetDelay)
         end
-    end)
-
-    local guiId = (tonumber(Env.__MM2GuiId) or 0) + 1
-    Env.__MM2GuiId = guiId
-
-    local cfg = getConfig()
-
-    local screenGui = newInst("ScreenGui", {
-        Name = "MM2AutoFarmGUI",
-        ResetOnSpawn = false,
-        DisplayOrder = 999999
-    })
-
-    if not screenGui then
-        return
-    end
-
-    if not attachGui(screenGui) then
-        pcall(function()
-            screenGui:Destroy()
-        end)
-        log("GUI parent failed")
-        return
-    end
-
-    Env.__MM2Gui = screenGui
-
-    pcall(function()
-        screenGui.Enabled = cfg.GuiVisible
-    end)
-
-    local main = newInst("Frame", {
-        Parent = screenGui,
-        Size = UDim2.new(0, 260, 0, 420),
-        Position = UDim2.new(0.5, -130, 0.5, -210),
-        BackgroundColor3 = Color3.fromRGB(20, 20, 26),
-        BorderSizePixel = 0
-    })
-
-    if not main then
-        pcall(function()
-            screenGui:Destroy()
-        end)
-        return
-    end
-
-    newInst("UICorner", {
-        Parent = main,
-        CornerRadius = UDim.new(0, 8)
-    })
-
-    local titleBar = newInst("Frame", {
-        Parent = main,
-        Size = UDim2.new(1, 0, 0, 28),
-        BackgroundColor3 = Color3.fromRGB(30, 30, 40),
-        BorderSizePixel = 0
-    })
-
-    newInst("UICorner", {
-        Parent = titleBar,
-        CornerRadius = UDim.new(0, 8)
-    })
-
-    newInst("TextLabel", {
-        Parent = titleBar,
-        Size = UDim2.new(1, -40, 1, 0),
-        Position = UDim2.new(0, 8, 0, 0),
-        BackgroundTransparency = 1,
-        Text = "MM2 AutoFarm | RightShift",
-        TextColor3 = Color3.fromRGB(230, 230, 230),
-        TextSize = 15,
-        TextXAlignment = Enum.TextXAlignment.Left
-    })
-
-    local closeBtn = newInst("TextButton", {
-        Parent = titleBar,
-        Size = UDim2.new(0, 24, 0, 24),
-        Position = UDim2.new(1, -28, 0, 2),
-        BackgroundColor3 = Color3.fromRGB(70, 35, 35),
-        Text = "X",
-        TextColor3 = Color3.fromRGB(230, 230, 230),
-        TextSize = 14,
-        BorderSizePixel = 0
-    })
-
-    newInst("UICorner", {
-        Parent = closeBtn,
-        CornerRadius = UDim.new(0, 6)
-    })
-
-    local body = newInst("Frame", {
-        Parent = main,
-        Position = UDim2.new(0, 10, 0, 34),
-        Size = UDim2.new(1, -20, 1, -44),
-        BackgroundTransparency = 1
-    })
-
-    newInst("UIListLayout", {
-        Parent = body,
-        Padding = UDim.new(0, 6),
-        SortOrder = Enum.SortOrder.LayoutOrder
-    })
-
-    local guiUpdaters = {}
-
-    local statusLabel = newInst("TextLabel", {
-        Parent = body,
-        LayoutOrder = 1,
-        Size = UDim2.new(1, 0, 0, 58),
-        BackgroundColor3 = Color3.fromRGB(28, 28, 36),
-        BorderSizePixel = 0,
-        Text = "",
-        TextColor3 = Color3.fromRGB(210, 210, 210),
-        TextSize = 13,
-        TextWrapped = true,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top
-    })
-
-    newInst("UICorner", {
-        Parent = statusLabel,
-        CornerRadius = UDim.new(0, 6)
-    })
-
-    newInst("UIPadding", {
-        Parent = statusLabel,
-        PaddingLeft = UDim.new(0, 6),
-        PaddingTop = UDim.new(0, 4),
-        PaddingRight = UDim.new(0, 6),
-        PaddingBottom = UDim.new(0, 4)
-    })
-
-    local function createButton(parent, order, text, onClick)
-        local btn = newInst("TextButton", {
-            Parent = parent,
-            LayoutOrder = order,
-            Size = UDim2.new(1, 0, 0, 28),
-            BackgroundColor3 = Color3.fromRGB(45, 45, 55),
-            Text = text,
-            TextColor3 = Color3.fromRGB(230, 230, 230),
-            TextSize = 15,
-            BorderSizePixel = 0,
-            AutoButtonColor = true
-        })
-
-        if btn then
-            newInst("UICorner", {
-                Parent = btn,
-                CornerRadius = UDim.new(0, 6)
-            })
-
-            btn.MouseButton1Click:Connect(function()
-                pcall(onClick)
-            end)
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.LoadingMap",
+        fn = function(...)
+            resetRoundState("LoadingMap", 3.5)
         end
-
-        return btn
-    end
-
-    local toggleBtn = createButton(body, 2, "Запустить", function()
-        local current = getConfig()
-
-        if current.Enabled and Env.__MM2AutoFarmActiveId ~= nil then
-            Env.StopAutoFarm()
-        else
-            Env.StartAutoFarm()
-        end
-    end)
-
-    createButton(body, 3, "Перезапустить", function()
-        Env.RestartAutoFarm()
-    end)
-
-    createButton(body, 4, "Скрыть GUI", function()
-        pcall(function()
-            screenGui.Enabled = false
-            Env.AutoFarmConfig.GuiVisible = false
-        end)
-    end)
-
-    local function createSettingRow(parent, order, labelText, getCurrentText, onApply)
-        local row = newInst("Frame", {
-            Parent = parent,
-            LayoutOrder = order,
-            Size = UDim2.new(1, 0, 0, 24),
-            BackgroundTransparency = 1
-        })
-
-        newInst("TextLabel", {
-            Parent = row,
-            Size = UDim2.new(1, -84, 1, 0),
-            BackgroundTransparency = 1,
-            Text = labelText,
-            TextColor3 = Color3.fromRGB(210, 210, 210),
-            TextSize = 14,
-            TextXAlignment = Enum.TextXAlignment.Left
-        })
-
-        local box = newInst("TextBox", {
-            Parent = row,
-            Position = UDim2.new(1, -80, 0, 0),
-            Size = UDim2.new(0, 80, 1, 0),
-            BackgroundColor3 = Color3.fromRGB(35, 35, 45),
-            Text = getCurrentText(),
-            TextColor3 = Color3.fromRGB(230, 230, 230),
-            TextSize = 14,
-            BorderSizePixel = 0,
-            ClearTextOnFocus = false
-        })
-
-        if box then
-            newInst("UICorner", {
-                Parent = box,
-                CornerRadius = UDim.new(0, 5)
-            })
-
-            box.FocusLost:Connect(function()
-                pcall(function()
-                    onApply(box.Text)
-                end)
-
-                pcall(function()
-                    box.Text = getCurrentText()
-                end)
-            end)
-        end
-
-        return box
-    end
-
-    local maxDistBox = createSettingRow(
-        body,
-        5,
-        "Дистанция",
-        function()
-            return tostring(getConfig().MaxDistance)
-        end,
-        function(text)
-            local value = tonumber(text)
-            if value then
-                Env.AutoFarmConfig.MaxDistance = value
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.RoleSelect",
+        fn = function(role, ...)
+            if type(role) == "string" then
+                resetRoundState("RoleSelect", Config.ResetDelay)
             end
-            Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
         end
-    )
-
-    local delayBox = createSettingRow(
-        body,
-        6,
-        "Задержка",
-        function()
-            return tostring(getConfig().TeleportDelay)
-        end,
-        function(text)
-            local value = tonumber(text)
-            if value then
-                Env.AutoFarmConfig.TeleportDelay = value
-            end
-            Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.GameOver",
+        fn = function(...)
+            resetRoundState("GameOver", 2.5)
         end
-    )
-
-    local targetsBox = createSettingRow(
-        body,
-        7,
-        "Целей за цикл",
-        function()
-            return tostring(getConfig().MaxTargetsPerCycle)
-        end,
-        function(text)
-            local value = tonumber(text)
-            if value then
-                Env.AutoFarmConfig.MaxTargetsPerCycle = value
-            end
-            Env.AutoFarmConfig = normalizeConfig(Env.AutoFarmConfig)
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.VictoryScreen",
+        fn = function(...)
+            resetRoundState("VictoryScreen", 2.5)
         end
-    )
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.RoundEndFade",
+        fn = function(...)
+            resetRoundState("RoundEndFade", 2.0)
+        end
+    },
+    {
+        path = "ReplicatedStorage.Remotes.Gameplay.CoinsStarted",
+        fn = function(...)
+            State.PauseUntil = 0
+            State.CoinCache = {}
+            State.LastCoinScan = 0
+            updateStatus("Coins started")
+        end
+    }
+}
 
-    local function createToggleRow(parent, order, labelText, getValue, setValue)
-        local row = newInst("Frame", {
-            Parent = parent,
-            LayoutOrder = order,
-            Size = UDim2.new(1, 0, 0, 24),
-            BackgroundTransparency = 1
-        })
+local function startRemoteWatcher()
+    safeSpawn(function()
+        while session.Active do
+            local allConnected = true
 
-        newInst("TextLabel", {
-            Parent = row,
-            Size = UDim2.new(1, -60, 1, 0),
-            BackgroundTransparency = 1,
-            Text = labelText,
-            TextColor3 = Color3.fromRGB(210, 210, 210),
-            TextSize = 14,
-            TextXAlignment = Enum.TextXAlignment.Left
-        })
-
-        local btn = newInst("TextButton", {
-            Parent = row,
-            Position = UDim2.new(1, -54, 0, 0),
-            Size = UDim2.new(0, 54, 1, 0),
-            BackgroundColor3 = Color3.fromRGB(45, 45, 55),
-            Text = getValue() and "ON" or "OFF",
-            TextColor3 = Color3.fromRGB(230, 230, 230),
-            TextSize = 13,
-            BorderSizePixel = 0
-        })
-
-        if btn then
-            newInst("UICorner", {
-                Parent = btn,
-                CornerRadius = UDim.new(0, 5)
-            })
-
-            btn.MouseButton1Click:Connect(function()
-                pcall(function()
-                    local newValue = not getValue()
-                    setValue(newValue)
-                    btn.Text = getValue() and "ON" or "OFF"
-                end)
-            end)
-
-            guiUpdaters[#guiUpdaters + 1] = function()
-                if isInstanceValid(btn) then
-                    pcall(function()
-                        btn.Text = getValue() and "ON" or "OFF"
-                    end)
+            for _, remoteInfo in ipairs(remotesToConnect) do
+                if not connectedRemotes[remoteInfo.path] then
+                    if not connectRemote(remoteInfo.path, remoteInfo.fn) then
+                        allConnected = false
+                    end
                 end
             end
-        end
 
-        return btn
-    end
-
-    createToggleRow(
-        body,
-        8,
-        "Авто-поиск контейнера",
-        function()
-            return getConfig().AutonomousDiscovery
-        end,
-        function(value)
-            getConfig().AutonomousDiscovery = value
-        end
-    )
-
-    createToggleRow(
-        body,
-        9,
-        "Глубокий fallback",
-        function()
-            return getConfig().DeepFallback
-        end,
-        function(value)
-            getConfig().DeepFallback = value
-        end
-    )
-
-    createToggleRow(
-        body,
-        10,
-        "Humanize delays",
-        function()
-            return getConfig().HumanizeDelays
-        end,
-        function(value)
-            getConfig().HumanizeDelays = value
-        end
-    )
-
-    local function addBoxUpdater(box, getCurrentText)
-        guiUpdaters[#guiUpdaters + 1] = function()
-            if isInstanceValid(box) then
-                local ok, focused = pcall(function()
-                    return box:IsFocused()
-                end)
-
-                if not (ok and focused) then
-                    pcall(function()
-                        box.Text = getCurrentText()
-                    end)
-                end
-            end
-        end
-    end
-
-    addBoxUpdater(maxDistBox, function()
-        return tostring(getConfig().MaxDistance)
-    end)
-
-    addBoxUpdater(delayBox, function()
-        return tostring(getConfig().TeleportDelay)
-    end)
-
-    addBoxUpdater(targetsBox, function()
-        return tostring(getConfig().MaxTargetsPerCycle)
-    end)
-
-    guiUpdaters[#guiUpdaters + 1] = function()
-        if isInstanceValid(toggleBtn) then
-            local current = getConfig()
-            local running = current.Enabled and Env.__MM2AutoFarmActiveId ~= nil
-
-            pcall(function()
-                toggleBtn.Text = running and "Остановить" or "Запустить"
-                toggleBtn.BackgroundColor3 = running
-                    and Color3.fromRGB(95, 40, 45)
-                    or Color3.fromRGB(35, 85, 50)
-            end)
-        end
-    end
-
-    guiUpdaters[#guiUpdaters + 1] = function()
-        if isInstanceValid(statusLabel) then
-            local current = getConfig()
-            local running = current.Enabled and Env.__MM2AutoFarmActiveId ~= nil
-
-            local err = tostring(Env.__MM2Stats.LastError or "")
-            if #err > 35 then
-                err = string.sub(err, 1, 35) .. "..."
+            if allConnected then
+                log("All tracked remotes connected/found")
+                break
             end
 
-            pcall(function()
-                statusLabel.Text = string.format(
-                    "Статус: %s | Контейнер: %s\nОбъектов рядом: %s\nОшибка: %s",
-                    running and "ВКЛ" or "ВЫКЛ",
-                    tostring(Env.__MM2Stats.Container or "нет"),
-                    tostring(Env.__MM2Stats.LastCoins or 0),
-                    err
-                )
-            end)
+            safeWait(2)
         end
-    end
+    end)
+end
 
-    -- Drag
-    pcall(function()
-        local dragging = false
-        local dragStart = nil
-        local startPos = nil
-
-        titleBar.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPos = main.Position
+-- ==========================
+-- Респавн персонажа
+-- ==========================
+local function connectCharacterEvents()
+    local ok, con = pcall(function()
+        return LocalPlayer.CharacterAdded:Connect(function(character)
+            if session.Active then
+                clearFlight()
+                resetRoundState("CharacterAdded", 1.0)
             end
         end)
+    end)
 
-        titleBar.InputChanged:Connect(function(input)
-            if dragging and (
-                input.UserInputType == Enum.UserInputType.MouseMovement
-                or input.UserInputType == Enum.UserInputType.Touch
-            ) then
+    if ok and con then
+        addConnection(con)
+    end
+end
+
+-- ==========================
+-- API
+-- ==========================
+Env.MM2FlyStart = function()
+    State.Enabled = true
+    State.PauseUntil = 0
+    updateStatus("Started")
+end
+
+Env.MM2FlyStop = function()
+    State.Enabled = false
+    stopVelocity()
+    updateStatus("Stopped")
+end
+
+Env.MM2FlyToggle = function(value)
+    if value == nil then
+        value = not State.Enabled
+    end
+
+    if value then
+        Env.MM2FlyStart()
+    else
+        Env.MM2FlyStop()
+    end
+
+    return State.Enabled
+end
+
+Env.MM2FlyReset = function()
+    resetRoundState("Manual", 0.35)
+end
+
+Env.MM2FlyUnload = function()
+    session.Active = false
+    State.Enabled = false
+
+    clearFlight()
+
+    for _, con in ipairs(connections) do
+        pcall(function()
+            con:Disconnect()
+        end)
+    end
+
+    pcall(function()
+        if Env.__MM2FlyGui ~= nil then
+            Env.__MM2FlyGui:Destroy()
+        end
+    end)
+
+    Env.__MM2FlyConnections = {}
+    Env.__MM2FlySession = nil
+end
+
+-- ==========================
+-- GUI
+-- ==========================
+local function getGuiParent()
+    local ok, result = pcall(function()
+        if gethui and type(gethui) == "function" then
+            return gethui()
+        end
+        return nil
+    end)
+
+    if ok and result then
+        return result
+    end
+
+    if CoreGui then
+        return CoreGui
+    end
+
+    local okPlayerGui, playerGui = pcall(function()
+        return LocalPlayer:WaitForChild("PlayerGui")
+    end)
+
+    if okPlayerGui and playerGui then
+        return playerGui
+    end
+
+    return nil
+end
+
+local function makeDraggable(frame, handle)
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+
+    local conBegan = handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+
+    local conEnded = handle.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    local conChanged = UserInputService.InputChanged:Connect(function(input)
+        if dragging and dragStart and startPos then
+            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
                 local delta = input.Position - dragStart
-                main.Position = UDim2.new(
+                frame.Position = UDim2.new(
                     startPos.X.Scale,
                     startPos.X.Offset + delta.X,
                     startPos.Y.Scale,
                     startPos.Y.Offset + delta.Y
                 )
             end
-        end)
-
-        titleBar.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = false
-            end
-        end)
+        end
     end)
 
-    -- Close / hide
-    if closeBtn then
-        closeBtn.MouseButton1Click:Connect(function()
+    addConnection(conBegan)
+    addConnection(conEnded)
+    addConnection(conChanged)
+end
+
+local function createGUI()
+    local parent = getGuiParent()
+
+    if not parent then
+        warn("[MM2 Fly] GUI parent not found")
+        return
+    end
+
+    pcall(function()
+        local old = parent:FindFirstChild("MM2AutonomousFly")
+        if old then
+            old:Destroy()
+        end
+    end)
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "MM2AutonomousFly"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = parent
+
+    Env.__MM2FlyGui = gui
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.new(0, 290, 0, 330)
+    main.Position = UDim2.new(0.5, -145, 0.5, -165)
+    main.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Parent = gui
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, 0, 0, 34)
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "MM2 AUTONOMOUS FLY"
+    title.TextColor3 = Color3.fromRGB(235, 235, 235)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 18
+    title.Active = true
+    title.Parent = main
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.new(1, -20, 0, 48)
+    status.Position = UDim2.new(0, 10, 0, 36)
+    status.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+    status.BorderSizePixel = 0
+    status.TextWrapped = true
+    status.TextYAlignment = Enum.TextYAlignment.Top
+    status.Text = "Status: Idle"
+    status.TextColor3 = Color3.fromRGB(210, 210, 210)
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 14
+    status.Parent = main
+
+    local function addButton(text, pos, size, onClick)
+        local btn = Instance.new("TextButton")
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 48)
+        btn.BorderSizePixel = 0
+        btn.Text = text
+        btn.TextColor3 = Color3.fromRGB(230, 230, 230)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 16
+        btn.Position = pos
+        btn.Size = size
+        btn.Parent = main
+
+        btn.MouseButton1Click:Connect(function()
+            pcall(onClick)
+        end)
+
+        return btn
+    end
+
+    local startBtn = addButton(
+        State.Enabled and "STOP" or "START",
+        UDim2.new(0, 10, 0, 92),
+        UDim2.new(1, -20, 0, 34),
+        function()
+            Env.MM2FlyToggle()
+        end
+    )
+
+    addButton(
+        "RESET STATE",
+        UDim2.new(0, 10, 0, 132),
+        UDim2.new(1, -20, 0, 30),
+        function()
+            Env.MM2FlyReset()
+        end
+    )
+
+    local autoResetBtn = addButton(
+        "Auto Reset: " .. (Config.AutoRoundReset and "ON" or "OFF"),
+        UDim2.new(0, 10, 0, 168),
+        UDim2.new(1, -20, 0, 30),
+        function()
+            Config.AutoRoundReset = not Config.AutoRoundReset
+        end
+    )
+
+    local pathfindingBtn = addButton(
+        "Pathfinding: " .. (Config.UsePathfinding and "ON" or "OFF"),
+        UDim2.new(0, 10, 0, 204),
+        UDim2.new(1, -20, 0, 30),
+        function()
+            Config.UsePathfinding = not Config.UsePathfinding
+            State.Waypoints = nil
+            State.WaypointIndex = 1
+            State.LastPathTime = 0
+        end
+    )
+
+    addButton(
+        "-",
+        UDim2.new(0, 10, 0, 240),
+        UDim2.new(0, 60, 0, 30),
+        function()
+            Config.FlySpeed = clampNumber(Config.FlySpeed - 5, 8, 200)
+        end
+    )
+
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.Size = UDim2.new(1, -160, 0, 30)
+    speedLabel.Position = UDim2.new(0, 80, 0, 240)
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Text = "Speed: " .. tostring(math.floor(Config.FlySpeed))
+    speedLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    speedLabel.Font = Enum.Font.Gotham
+    speedLabel.TextSize = 15
+    speedLabel.Parent = main
+
+    addButton(
+        "+",
+        UDim2.new(1, -70, 0, 240),
+        UDim2.new(0, 60, 0, 30),
+        function()
+            Config.FlySpeed = clampNumber(Config.FlySpeed + 5, 8, 200)
+        end
+    )
+
+    addButton(
+        "UNLOAD",
+        UDim2.new(0, 10, 0, 276),
+        UDim2.new(1, -20, 0, 30),
+        function()
+            Env.MM2FlyUnload()
+        end
+    )
+
+    makeDraggable(main, title)
+
+    safeSpawn(function()
+        while session.Active and isInstanceValid(gui) do
             pcall(function()
-                screenGui.Enabled = false
-                Env.AutoFarmConfig.GuiVisible = false
+                status.Text = string.format(
+                    "Status: %s",
+                    tostring(State.Status or "Idle")
+                )
+
+                startBtn.Text = State.Enabled and "STOP" or "START"
+
+                autoResetBtn.Text = "Auto Reset: " .. (Config.AutoRoundReset and "ON" or "OFF")
+                pathfindingBtn.Text = "Pathfinding: " .. (Config.UsePathfinding and "ON" or "OFF")
+
+                speedLabel.Text = "Speed: " .. tostring(math.floor(clampNumber(Config.FlySpeed, 8, 200)))
             end)
-        end)
-    end
 
-    -- Keybind
-    if Env.__MM2KeyConnection then
-        pcall(function()
-            Env.__MM2KeyConnection:Disconnect()
-        end)
-        Env.__MM2KeyConnection = nil
-    end
-
-    if UIS then
-        pcall(function()
-            Env.__MM2KeyConnection = UIS.InputBegan:Connect(function(input, gameProcessed)
-                if gameProcessed then
-                    return
-                end
-
-                local okKey, isKey = pcall(function()
-                    return input.KeyCode == Enum.KeyCode.RightShift
-                end)
-
-                if okKey and isKey then
-                    if isInstanceValid(Env.__MM2Gui) then
-                        pcall(function()
-                            local newState = not Env.__MM2Gui.Enabled
-                            Env.__MM2Gui.Enabled = newState
-                            Env.AutoFarmConfig.GuiVisible = newState
-                        end)
-                    else
-                        pcall(buildGUI)
-                    end
-                end
-            end)
-        end)
-    end
-
-    -- GUI update loop
-    safeSpawn(function()
-        while Env.__MM2GuiId == guiId do
-            if not isInstanceValid(screenGui) then
-                break
-            end
-
-            for i = 1, #guiUpdaters do
-                pcall(guiUpdaters[i])
-            end
-
-            safeWait(0.35)
-        end
-    end)
-
-    -- GUI auto-recreate watchdog
-    safeSpawn(function()
-        while Env.__MM2GuiId == guiId do
-            safeWait(1)
-
-            local current = getConfig()
-
-            if current.GuiAutoRecreate
-                and Env.__MM2GuiId == guiId
-                and not isInstanceValid(Env.__MM2Gui) then
-                pcall(buildGUI)
-                break
-            end
+            safeWait(0.2)
         end
     end)
 end
 
-Env.ShowMM2GUI = function()
-    if isInstanceValid(Env.__MM2Gui) then
-        pcall(function()
-            Env.__MM2Gui.Enabled = true
-            Env.AutoFarmConfig.GuiVisible = true
-        end)
-    else
-        pcall(buildGUI)
-    end
-end
-
-Env.HideMM2GUI = function()
-    if isInstanceValid(Env.__MM2Gui) then
-        pcall(function()
-            Env.__MM2Gui.Enabled = false
-            Env.AutoFarmConfig.GuiVisible = false
-        end)
-    end
-end
-
-Env.ToggleMM2GUI = function()
-    if isInstanceValid(Env.__MM2Gui) then
-        pcall(function()
-            local newState = not Env.__MM2Gui.Enabled
-            Env.__MM2Gui.Enabled = newState
-            Env.AutoFarmConfig.GuiVisible = newState
-        end)
-    else
-        pcall(buildGUI)
-    end
-end
-
-------------------------------------------------------------
+-- ==========================
 -- Запуск
-------------------------------------------------------------
+-- ==========================
+createGUI()
+startRemoteWatcher()
+connectCharacterEvents()
+safeSpawn(movementLoop)
 
-pcall(buildGUI)
-Env.RestartAutoFarm()
+State.Enabled = true
+updateStatus("Loaded")
